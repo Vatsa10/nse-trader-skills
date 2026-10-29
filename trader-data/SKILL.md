@@ -15,12 +15,16 @@ description: >-
   keeps a self-updating NSE holiday calendar (`calendar`, so 2027 and later
   work without a code change), turns the delivery file into delivery
   analytics (`delivery`: delivery quantity, trade size, the institutional
-  money flag), and records real data as test fixtures. Use when the user says "get me
+  money flag), reads NSE corporate actions (`actions`: splits, consolidations,
+  bonus issues, dividends in rupees per share) and rebuilds the split and
+  bonus adjusted `.adj.csv` exactly from them (`adjust`), and records real data
+  as test fixtures. Use when the user says "get me
   RELIANCE history", "update my data", "download prices", "Yahoo is not
   working", "NSE blocked me", "what is the price band / circuit limit",
-  "import this CSV", "is my data fresh", or before a backtest, an
+  "import this CSV", "is my data fresh", "corporate actions", "split",
+  "bonus", "adjust for the split", "ex-date", or before a backtest, an
   investment check or a scan that needs daily bars.
-argument-hint: "[daily|intraday|bands|calendar|delivery|doctor|status] [symbol]"
+argument-hint: "[daily|intraday|bands|calendar|delivery|actions|adjust|doctor|status] [symbol]"
 ---
 
 # trader-data
@@ -47,6 +51,9 @@ python3 "${CLAUDE_SKILL_DIR}/data.py" delivery RELIANCE TCS               # DQ, 
 python3 "${CLAUDE_SKILL_DIR}/data.py" delivery RELIANCE --no-fetch         # from the cached delivery files only
 python3 "${CLAUDE_SKILL_DIR}/data.py" calendar                            # keep the NSE holiday calendar current
 python3 "${CLAUDE_SKILL_DIR}/data.py" calendar --refresh                   # refetch holidays and circulars now
+python3 "${CLAUDE_SKILL_DIR}/data.py" actions RELIANCE TCS                 # splits, bonus, dividends -> actions.json
+python3 "${CLAUDE_SKILL_DIR}/data.py" adjust RELIANCE TCS                  # rebuild RELIANCE.adj.csv from the raw file
+python3 "${CLAUDE_SKILL_DIR}/data.py" adjust RELIANCE --force              # also replace a Yahoo-supplied adj file
 python3 "${CLAUDE_SKILL_DIR}/data.py" status                              # cached, fresh, gaps
 python3 "${CLAUDE_SKILL_DIR}/data.py" record RELIANCE --date 2026-10-23   # real data -> test fixtures
 ```
@@ -66,6 +73,7 @@ Every command takes `--data DIR` (default `trader/data`) and `--now
 | `trader/data/cache_meta.json` | which source filled each file and when | status, record |
 | `trader/data/delivery/<SYM>.csv` | `date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series`, ascending; a value NSE did not publish is an empty cell, never 0 | scanner, invest, `delivery` |
 | `trader/data/delivery/pending.json` | `{"pending": ["2026-10-22"]}`: days whose delivery file was not published yet | data.py only |
+| `trader/data/actions.json` | corporate actions per symbol: splits, bonus, dividends (contract below) | invest, portfolio, entry, backtest, `adjust` |
 | `trader/data/nse_cookies.txt` | the NSE cookie jar (Mozilla format), reused between runs | data.py only |
 | `trader/data/calendar.json` | NSE holidays and special sessions (contract below) | data, alerts, and the skills that load alerts |
 
@@ -199,6 +207,73 @@ Heavy delivery in big tickets is a proxy for institutional buying, a hint to
 look closer and not a signal to trade. `--no-fetch` works from the cache and
 asks NSE for nothing. Exit 1 if any symbol had no usable data.
 
+## Corporate actions and exact adjustment (`actions`, `adjust`)
+
+Only Yahoo supplies an adjusted series; bhavcopy and the NSE API are raw, so a
+split or bonus leaves a fake crash in the cache. `actions` reads NSE's
+corporate-actions feed and `adjust` rebuilds `<SYM>.adj.csv` from it, exactly.
+
+`actions SYM...` (no names: every symbol in the daily cache; `--years N` how
+far back for a symbol with no cache, default 3; `--refresh` refetches the
+whole span) asks `GET /api/corporates-corporateActions?index=equities&symbol=SYM&from_date=DD-MM-YYYY&to_date=DD-MM-YYYY`
+for explicit date ranges in chunks of 365 days, from the first cached bar to
+30 days past today (so an announced ex-date shows up as UPCOMING). The next
+run asks only for what is new: anything before the span already covered, and
+from 7 days before `fetched_through` onward; actions inside a refetched range
+are replaced, not merged, so a withdrawn one disappears. Fetched today already
+means no request. If a symbol's fetch fails its entry stays as it was.
+
+```json
+{"fetched_at": "2026-10-23T13:30:00Z",
+ "symbols": {"RELIANCE": {"from": "2023-10-23", "fetched_through": "2026-10-23", "actions": [
+   {"ex_date": "2024-10-28", "kind": "bonus", "factor": 2.0, "dividend": null,
+    "subject": "Bonus 1:1", "series": "EQ", "isin": "INE002A01018", "face_val": 10.0},
+   {"ex_date": "2026-08-14", "kind": "dividend", "factor": null, "dividend": 5.5,
+    "subject": "Final Dividend - Rs 5.50 Per Share", "series": "EQ", "isin": "INE002A01018", "face_val": 10.0}]}}}
+```
+
+- `kind` is `split`, `bonus`, `split+bonus` (the factors multiply), `dividend`
+  or `unparsed`. `factor` is what older prices are divided by (2.0 for a 1:1
+  bonus or a 2-for-1 split, 0.1 for a 1-for-10 consolidation). `dividend` is
+  rupees per share (keep them: invest and portfolio use them for yield and
+  income). An `unparsed` entry also has `"about": "split" | "bonus" | "dividend"`.
+- Only series EQ, BE, BZ; rights symbols (`-RE`), buy backs, rights issues and
+  rows with no ex-date are left out. Subjects are read after lowercasing:
+  - split, "splt" or "consolidation": from that word on, the first two numbers
+    (decimals allowed) with only letters, spaces, `/`, `-`, `.` between them;
+    factor = first / second (old face value over new);
+  - bonus with a ratio `a:b` (spaces allowed): factor = 1 + a/b. Bonus text
+    that mentions deb, pref, ncrps or dvr is not a share bonus and is skipped;
+  - dividend: the first number after `Rs` or `Re` is rupees per share.
+  A split, bonus or dividend named without a readable number is stored as
+  `unparsed` and printed as "unparsed corporate action"; no factor is guessed.
+
+`adjust SYM...` (no names: every cached symbol that has actions) rebuilds
+`<SYM>.adj.csv` from `<SYM>.csv`; the raw file is never changed.
+
+- For each action with an ex-date inside the cached span, rows dated before it
+  have open, high, low and close divided by the cumulative factor of every
+  later action, rounded to 2 decimals (no snapping to 0.05, which distorts
+  cheap stocks), and volume multiplied by it. An action whose ex-date is after
+  the last bar waits until its bars arrive.
+- Verification, per ex-date: the adjusted close on the ex-date over the adjusted
+  close before it should be 0.67 to 1.5, else "possible adjustment failure"
+  (the file is still written, the warning says check the factor). No bar on the
+  ex-date: "unverified". Duplicate dates in the raw file: refused.
+- All or nothing per symbol: any error (duplicate dates, a price that rounds
+  to 0.00) leaves the existing adj file untouched and writes nothing.
+- It also warns when the actions were fetched more than 7 days before the last
+  bar, or start later than the cache does.
+- Provenance: the adj file's source is kept in `cache_meta.json` under
+  `adjusted` (`yahoo`, `actions`, `import-csv:FILE`, `kite-mcp`; `unknown` for a
+  file from before this was tracked). A file from anything but `actions` is
+  never overwritten unless `--force`, and every run says which source the file
+  came from.
+- `daily` runs `adjust` for you after a non-Yahoo source when actions are known
+  for the symbol (and stays quiet when the adj file is Yahoo's). It never
+  fetches actions itself: run `actions` now and then, or when `daily` warns of
+  a 1/2, 1/5 or 1/10 overnight gap.
+
 ## The NSE calendar (`calendar`, `calendar.json`)
 
 The built-in holiday tables stop at 2026. `data.py calendar` keeps a cache,
@@ -248,7 +323,7 @@ trader-alerts the skills that load it by path.
 ## doctor
 
 Probes Yahoo query1 and query2, the NSE home page and quote API, the NSE
-holiday-master and circulars endpoints (the calendar feeds: a changed shape
+holiday-master, circulars and corporate-actions endpoints (a changed shape
 is reported, not silently empty), the nsearchives bhavcopy, the niftyindices
 Nifty 500 list, Google News RSS and the Kite MCP endpoint, each with a timeout, prints a table (ok / FAIL,
 latency, error and a hint such as "403: NSE blocks this IP (cloud, VPN and

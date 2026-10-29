@@ -12,6 +12,8 @@ saved yourself (Kite MCP JSON, Kite Console / NSE website CSV).
     python3 data.py import-kite kite-quotes.json --kind quotes
     python3 data.py import-csv RELIANCE.csv --symbol RELIANCE [--adjusted]
     python3 data.py calendar [--refresh]
+    python3 data.py actions RELIANCE TCS [--years 3] [--refresh]
+    python3 data.py adjust RELIANCE TCS [--force]
     python3 data.py delivery RELIANCE TCS [--window 30] [--no-fetch]
     python3 data.py doctor
     python3 data.py record RELIANCE [--date 2026-10-23]
@@ -27,6 +29,7 @@ Writes (shared contracts, see PORT_V4_SPEC.md):
   trader/data/calendar.json          {"fetched_at","years","holidays","special_sessions","last_circular_check","warnings"}
   trader/data/delivery/<SYM>.csv     date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series (blank = unknown)
   trader/data/delivery/pending.json  {"pending": [dates whose delivery file is not published yet]}
+  trader/data/actions.json           {"fetched_at","symbols":{SYM:{"from","fetched_through","actions":[...]}}}
 
 NSE requests (www.nseindia.com, nsearchives) retry up to 5 times on a 429, 502, 503, 504
 or a timeout, waiting 2^n seconds with jitter (never over 8 s, or the Retry-After the server
@@ -106,6 +109,16 @@ DELIVERY_WINDOW = 30          # sessions the means are taken over
 DELIVERY_MIN = 5              # fewer delivery values than this is "not enough delivery data"
 IM_LEVEL = 1.2                # institutional money: DQ and TQ both above this
 PENDING_DAYS = 5              # a delivery file still missing after this many days is given up on
+ACTIONS_FILE = "actions.json"
+ACTIONS_REFERER = NSE + "/companies-listing/corporate-filings-actions"
+ACTION_SERIES = ("EQ", "BE", "BZ")
+ACTION_CHUNK_DAYS = 365       # one corporate-actions request covers at most this many days
+ACTION_OVERLAP = 7            # a refetch starts this many days before fetched_through
+ACTION_LOOKAHEAD = 30         # days past today asked for, so announced ex-dates are known early
+ACTIONS_STALE_DAYS = 7        # adjust warns when actions were fetched this long before the last bar
+SPLIT_WORDS = ("split", "splt", "consolidation")
+BONUS_SKIP = ("deb", "pref", "ncrps", "dvr")   # debenture, preference and DVR "bonus" is not a share bonus
+VERIFY_LOW, VERIFY_HIGH = 0.67, 1.5           # the adjusted close on the ex-date over the day before
 
 # ---------------------------------------------------------------- NSE trading calendar
 # 2026 comes from trader-alerts/alerts.py (loaded below, with this copy as the fallback).
@@ -1254,6 +1267,7 @@ def cmd_daily(a):
                 except SourceError as e:
                     errors.append("adjusted refresh: %s" % e)
             write_daily(adj_p, merge_rows(old_adj, adj))
+            note_meta(a.data, "adjusted", sym, {"source": "yahoo", "fetched_at": stamp()})
         elif old_adj:
             # unadjusted bars after the last split equal adjusted ones; flagged if a split shows up
             write_daily(adj_p, merge_rows(old_adj, raw))
@@ -1273,6 +1287,9 @@ def cmd_daily(a):
             print("  dropped bad bar " + b)
         for w in warns:
             print("  warning: " + w)
+        if src != "yahoo":    # Yahoo already sent an adjusted series; any other source needs the actions
+            for line in auto_adjust(a.data, sym):
+                print(line)
     for line in fill_delivery(a.data, bhav, [norm_symbol(x) for x in a.symbols], now.date()):
         print(line)
     return rc
@@ -1715,6 +1732,8 @@ def import_kite_historical(a, doc):
         note_meta(a.data, "daily", sym, {"source": "kite-mcp", "fetched_at": stamp(), "rows": len(merged),
                                          "first": merged[0]["date"], "last": merged[-1]["date"],
                                          "file": os.path.basename(target)})
+        if a.adjusted:
+            note_meta(a.data, "adjusted", sym, {"source": "kite-mcp", "fetched_at": stamp()})
         print("%s: %d daily bar(s) from Kite into %s (%s to %s)." % (sym, len(rows), target, rows[0]["date"],
                                                                      rows[-1]["date"]))
     else:
@@ -1881,6 +1900,8 @@ def cmd_import_csv(a):
     note_meta(a.data, "daily", sym, {"source": "import-csv:" + os.path.basename(a.file), "fetched_at": stamp(),
                                      "rows": len(merged), "first": merged[0]["date"], "last": merged[-1]["date"],
                                      "file": os.path.basename(target)})
+    if a.adjusted:
+        note_meta(a.data, "adjusted", sym, {"source": "import-csv:" + os.path.basename(a.file), "fetched_at": stamp()})
     print("%s: imported %d bar(s) (%s to %s) into %s; %d cached." % (
         sym, len(good), good[0]["date"], good[-1]["date"], target, len(merged)))
     for n in notes + ["dropped bad bar " + b for b in bad]:
@@ -2113,6 +2134,375 @@ def cmd_calendar(a):
     return 1 if errors else 0
 
 
+# ---------------------------------------------------------------- corporate actions and adjustment
+
+NUMBER = re.compile(r"\d+(?:\.\d+)?")
+
+
+def split_factor(subject):
+    """"Face Value Split ... From Rs 10/- To Re 1/-" -> 10.0; a consolidation gives a factor below 1.
+
+    From the split / splt / consolidation word on, the first two numbers (decimals allowed) with
+    only letters, spaces, / - . between them are the old and the new face value; factor = old / new.
+    None when that does not read cleanly, or the factor is 1."""
+    low = str(subject or "").lower()
+    at = [low.find(w) for w in SPLIT_WORDS if w in low]
+    if not at:
+        return None
+    tail = low[min(at):]
+    hits = list(NUMBER.finditer(tail))
+    if len(hits) < 2 or not re.match(r"^[a-z /\-.]*$", tail[hits[0].end():hits[1].start()]):
+        return None
+    old, new = float(hits[0].group()), float(hits[1].group())
+    if old <= 0 or new <= 0 or old == new:
+        return None
+    return old / new
+
+
+def bonus_factor(subject):
+    """"Bonus 2:1" -> 3.0 (a new shares for every b held: older prices divide by 1 + a/b).
+    Debenture, preference, NCRPS and DVR bonus text is not a share bonus: None. So is no ratio."""
+    low = str(subject or "").lower()
+    if "bonus" not in low or any(w in low for w in BONUS_SKIP):
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)", low)
+    if not m or float(m.group(1)) <= 0 or float(m.group(2)) <= 0:
+        return None
+    return 1 + float(m.group(1)) / float(m.group(2))
+
+
+def dividend_amount(subject):
+    """"Interim Dividend - Rs 30 Per Share" -> 30.0, "Re 0.50" -> 0.5 (rupees per share), else None."""
+    low = str(subject or "").lower()
+    m = re.search(r"\b(?:rs|re)\b\.?\s*(\d+(?:\.\d+)?)", low) if "dividend" in low else None
+    return float(m.group(1)) if m and float(m.group(1)) > 0 else None
+
+
+def parse_action(subject):
+    """One corporate action subject -> {"kind", "factor", "dividend"[, "about"]} or None.
+
+    kind is split, bonus, split+bonus (the factors multiply), dividend, or unparsed when a split,
+    bonus or dividend is named but no number could be read: never a guess. Buy backs, rights,
+    debenture or preference bonus and the rest are None."""
+    low = str(subject or "").lower()
+    has_split = any(w in low for w in SPLIT_WORDS)
+    has_bonus = "bonus" in low and not any(w in low for w in BONUS_SKIP)
+    if has_split or has_bonus:
+        parts = ([("split", split_factor(subject))] if has_split else []) + (
+            [("bonus", bonus_factor(subject))] if has_bonus else [])
+        kind = "+".join(k for k, _ in parts)
+        if any(f is None for _, f in parts):
+            return {"kind": "unparsed", "about": kind, "factor": None, "dividend": None}
+        factor = 1.0
+        for _, f in parts:
+            factor *= f
+        return {"kind": kind, "factor": round(factor, 6), "dividend": None}
+    if "dividend" in low:
+        amount = dividend_amount(subject)
+        if amount is None:
+            return {"kind": "unparsed", "about": "dividend", "factor": None, "dividend": None}
+        return {"kind": "dividend", "factor": None, "dividend": amount}
+    return None
+
+
+def parse_actions_doc(doc, sym):
+    """/api/corporates-corporateActions answer -> actions [{ex_date, kind, factor, dividend, subject,
+    series, isin, face_val[, about]}] for the symbol. Series other than EQ, BE, BZ, rights (-RE)
+    symbols and rows without an ex-date are left out. An empty list is a valid answer."""
+    rows = doc.get("data") if isinstance(doc, dict) else doc
+    if not isinstance(rows, list):
+        raise SourceError("nse-api", "corporate actions answered something that is not a list",
+                          "stale cookies or a changed feed; try again, or run doctor")
+    out, seen = [], set()
+    for r in rows:
+        if not isinstance(r, dict) or sym.endswith("-RE"):
+            continue
+        if str(r.get("symbol") or sym).strip().upper() != sym:
+            continue
+        series = str(r.get("series") or "").strip().upper()
+        if series not in ACTION_SERIES:
+            continue
+        try:
+            ex = parse_date(r.get("exDate"))
+        except DataError:
+            continue
+        subject = " ".join(str(r.get("subject") or "").split())
+        got = parse_action(subject)
+        if got is None or (ex.isoformat(), subject) in seen:
+            continue
+        seen.add((ex.isoformat(), subject))
+        item = {"ex_date": ex.isoformat(), "kind": got["kind"], "factor": got["factor"],
+                "dividend": got["dividend"], "subject": subject, "series": series,
+                "isin": str(r.get("isin") or "").strip() or None, "face_val": num(r.get("faceVal"))}
+        if got.get("about"):
+            item["about"] = got["about"]
+        out.append(item)
+    return sorted(out, key=lambda x: (x["ex_date"], x["subject"]))
+
+
+def actions_path(data_dir):
+    return os.path.join(data_dir, ACTIONS_FILE)
+
+
+def load_actions(data_dir):
+    """actions.json -> {"fetched_at", "symbols": {SYM: {"from", "fetched_through", "actions"}}}; a missing
+    or corrupt file is an empty one."""
+    doc = _read_json(actions_path(data_dir), None)
+    doc = doc if isinstance(doc, dict) else {}
+    syms = {}
+    for sym, e in (doc.get("symbols") or {}).items():
+        try:
+            datetime.date.fromisoformat(e["from"])
+            datetime.date.fromisoformat(e["fetched_through"])
+            acts = [x for x in e["actions"] if isinstance(x, dict) and x.get("ex_date")]
+        except (KeyError, TypeError, ValueError):
+            continue
+        syms[sym] = {"from": e["from"], "fetched_through": e["fetched_through"], "actions": acts}
+    return {"fetched_at": doc.get("fetched_at"), "symbols": syms}
+
+
+def chunk_range(lo, hi, days=ACTION_CHUNK_DAYS):
+    """[lo, hi] -> explicit (from, to) date pairs of at most `days` days each."""
+    out = []
+    while lo <= hi:
+        e = min(hi, lo + datetime.timedelta(days=days - 1))
+        out.append((lo, e))
+        lo = e + datetime.timedelta(days=1)
+    return out
+
+
+def action_ranges(entry, start, today, refresh=False):
+    """The date ranges to ask NSE for. First time (or --refresh): start to today plus the lookahead.
+    Later: anything before the span already covered, and from ACTION_OVERLAP days before
+    fetched_through onward. Nothing when it was already fetched today."""
+    end = today + datetime.timedelta(days=ACTION_LOOKAHEAD)
+    if entry is None or refresh:
+        return [(start, end)]
+    have = datetime.date.fromisoformat(entry["from"])
+    through = datetime.date.fromisoformat(entry["fetched_through"])
+    out = []
+    if start < have:
+        out.append((start, have - datetime.timedelta(days=1)))
+    if through < today:
+        out.append((min(end, max(have, through - datetime.timedelta(days=ACTION_OVERLAP))), end))
+    return out
+
+
+def replace_actions(old, new, ranges):
+    """Actions with an ex-date inside a refetched range are replaced by what NSE sent now; the rest stay."""
+    def inside(x):
+        return any(lo.isoformat() <= x["ex_date"] <= hi.isoformat() for lo, hi in ranges)
+    by = dict(((x["ex_date"], x["subject"]), x) for x in old if not inside(x))
+    for x in new:
+        by[(x["ex_date"], x["subject"])] = x
+    return [by[k] for k in sorted(by)]
+
+
+def fetch_actions(sess, sym, lo, hi):
+    path = "/api/corporates-corporateActions?index=equities&symbol=%s&from_date=%s&to_date=%s" % (
+        urllib.parse.quote(sym), lo.strftime("%d-%m-%Y"), hi.strftime("%d-%m-%Y"))
+    return parse_actions_doc(nse_api(sess, path, ACTIONS_REFERER), sym)
+
+
+def daily_symbols(data_dir):
+    dd = os.path.join(data_dir, "daily")
+    return sorted(f[:-4] for f in (os.listdir(dd) if os.path.isdir(dd) else [])
+                  if f.endswith(".csv") and not f.endswith(".adj.csv"))
+
+
+def describe_action(x):
+    if x["kind"] == "dividend":
+        return "dividend Rs %s per share" % fmt(x["dividend"])
+    if x["kind"] == "unparsed":
+        return "UNPARSED %s, no factor applied" % x.get("about", "action")
+    return "%s x%s" % (x["kind"], fmt(x["factor"]))
+
+
+def cmd_actions(a):
+    now = parse_now(a.now)
+    today = now.date()
+    syms = [norm_symbol(s) for s in a.symbols] or daily_symbols(a.data)
+    if not syms:
+        raise DataError("no symbols: name some (actions RELIANCE TCS), or fill the daily cache first")
+    doc, sess, rc = load_actions(a.data), Session(a.data), 0
+    for sym in syms:
+        if sym.endswith("-RE"):
+            print("%s: rights symbol, skipped" % sym)
+            continue
+        cached = read_daily(data_paths(a.data, sym)[0])
+        start = (datetime.date.fromisoformat(cached[0]["date"]) if cached
+                 else today - datetime.timedelta(days=int(round(365.25 * a.years))))
+        entry = doc["symbols"].get(sym)
+        ranges = action_ranges(entry, start, today, a.refresh)
+        if not ranges:
+            print("%s: actions already fetched through %s (%d known)." % (
+                sym, entry["fetched_through"], len(entry["actions"])))
+            continue
+        new, calls = [], 0
+        try:
+            for lo, hi in ranges:
+                for c0, c1 in chunk_range(lo, hi):
+                    new += fetch_actions(sess, sym, c0, c1)
+                    calls += 1
+        except (SourceError, DataError) as e:
+            rc = 1      # this symbol's entry stays as it was
+            print("%s: corporate actions not updated (%s)" % (sym, e))
+            continue
+        acts = replace_actions(entry["actions"] if entry else [], new, ranges)
+        have = min(start, datetime.date.fromisoformat(entry["from"])) if entry else start
+        doc["symbols"][sym] = {"from": have.isoformat(), "fetched_through": today.isoformat(), "actions": acts}
+        doc["fetched_at"] = stamp(now)
+        _write_json(actions_path(a.data), doc)
+        adjusting = [x for x in acts if x["factor"]]
+        print("%s: %d request(s), %d action(s) known from %s: %d split/bonus, %d dividend(s), %d unparsed." % (
+            sym, calls, len(acts), have, len(adjusting), sum(1 for x in acts if x["kind"] == "dividend"),
+            sum(1 for x in acts if x["kind"] == "unparsed")))
+        for x in acts:
+            ahead = x["ex_date"] > today.isoformat()
+            if x["factor"] or x["kind"] == "unparsed" or ahead:
+                print("  %s %s%s  (%s)" % (x["ex_date"], describe_action(x), "  UPCOMING" if ahead else "",
+                                          x["subject"][:70]))
+        for x in acts:
+            if x["kind"] == "unparsed":
+                print("  warning: unparsed corporate action on %s, never guessed: %s" % (
+                    x["ex_date"], x["subject"][:90]))
+        if cached and adjusting:
+            print("  next: data.py adjust %s" % sym)
+    print("Actions file: %s." % actions_path(a.data))
+    return rc
+
+
+def adj_source(data_dir, sym):
+    """Where the existing <SYM>.adj.csv came from: yahoo, actions (our own rebuild), import-csv:FILE,
+    kite-mcp, or unknown when the file predates source tracking."""
+    meta = _read_json(os.path.join(data_dir, "cache_meta.json"), {})
+    got = (meta.get("adjusted") or {}).get(sym)
+    if got and got.get("source"):
+        return str(got["source"])
+    if ((meta.get("daily") or {}).get(sym) or {}).get("source") == "yahoo":
+        return "yahoo"
+    return "unknown"
+
+
+def adjust_rows(rows, acts):
+    """Raw bars + actions -> (adjusted bars, applied [(ex_date, factor, ratio|None, subjects)], warnings).
+
+    Rows before each ex-date have O/H/L/C divided by the cumulative factor of every later action
+    (2 decimals, no snapping) and volume multiplied. An action counts only once its ex-date is in the
+    file's span: a future one waits for its bars. The close on the ex-date over the close before it
+    (both adjusted) should be 0.67 to 1.5; outside that is "possible adjustment failure", and no bar
+    on the ex-date is "unverified"."""
+    dates = [r["date"] for r in rows]
+    if len(set(dates)) != len(dates):
+        dup = sorted(set(d for d in dates if dates.count(d) > 1))
+        raise DataError("duplicate dates in the raw file (%s): fix it before adjusting" % compress(dup, 4))
+    group, subjects, warns, seen = {}, {}, [], set()
+    for x in acts:
+        key = (x["ex_date"], x["subject"])
+        if not (dates[0] < x["ex_date"] <= dates[-1]) or key in seen:
+            continue
+        seen.add(key)
+        if x["kind"] == "unparsed" and x.get("about") != "dividend":
+            warns.append("%s: no number could be read in \"%s\"; not applied, so the series before it may be "
+                         "wrong" % (x["ex_date"], x["subject"][:80]))
+        elif x["factor"]:
+            group[x["ex_date"]] = group.get(x["ex_date"], 1.0) * x["factor"]
+            subjects.setdefault(x["ex_date"], []).append(x["subject"])
+    out, closes = [], []
+    for r in rows:
+        f = 1.0
+        for ex, g in group.items():
+            if ex > r["date"]:
+                f *= g
+        out.append({"date": r["date"], "open": round(r["open"] / f, 2), "high": round(r["high"] / f, 2),
+                    "low": round(r["low"] / f, 2), "close": round(r["close"] / f, 2),
+                    "volume": int(round(r["volume"] * f))})
+        closes.append(r["close"] / f)
+    index = dict((d, i) for i, d in enumerate(dates))
+    applied = []
+    for ex in sorted(group):
+        i, ratio = index.get(ex), None
+        if i is None:
+            warns.append("%s: unverified, no bar on the ex-date (closed that day, or a gap in the file)" % ex)
+        else:
+            ratio = closes[i] / closes[i - 1]
+            if not (VERIFY_LOW <= ratio <= VERIFY_HIGH):
+                warns.append("%s: possible adjustment failure, the adjusted close is %.2fx the day before "
+                             "(expected %s to %s); check the factor x%s" % (
+                                 ex, ratio, VERIFY_LOW, VERIFY_HIGH, fmt(group[ex])))
+        applied.append((ex, group[ex], ratio, "; ".join(subjects[ex])))
+    return out, applied, warns
+
+
+def verdict(ratio):
+    if ratio is None:
+        return "unverified"
+    return ("verified" if VERIFY_LOW <= ratio <= VERIFY_HIGH else "CHECK") + ", ratio %.2f" % ratio
+
+
+def adjust_symbol(data_dir, sym, force=False, auto=False):
+    """Rebuild <SYM>.adj.csv from <SYM>.csv and the known actions; the raw file is never touched.
+    All or nothing: any problem leaves the adj file as it was. -> (exit code, printable lines).
+    A Yahoo, import or Kite adj file is kept unless force. auto (after a daily run) stays quiet when
+    it has nothing to rebuild."""
+    raw_p, adj_p, _ = data_paths(data_dir, sym)
+    rows = read_daily(raw_p)
+    entry = load_actions(data_dir)["symbols"].get(sym)
+    if not rows:
+        return 1, ["%s: no daily cache to adjust (run daily first)" % sym]
+    if entry is None:
+        return 1, ["%s: no corporate actions known: run data.py actions %s first" % (sym, sym)]
+    src = adj_source(data_dir, sym) if os.path.exists(adj_p) else None
+    if src not in (None, "actions") and not force:
+        if auto:
+            return 0, []
+        return 0, ["%s: %s.adj.csv came from %s, kept as it is (--force rebuilds it from the corporate actions)"
+                   % (sym, sym, src)]
+    try:
+        adj, applied, warns = adjust_rows(rows, entry["actions"])
+        warns = warns + write_daily(adj_p, adj)
+    except DataError as e:
+        return 1, ["%s: not adjusted: %s" % (sym, e)]
+    note_meta(data_dir, "adjusted", sym, {"source": "actions", "fetched_at": stamp(), "rows": len(adj),
+                                          "applied": [ex for ex, _, _, _ in applied]})
+    lines = ["%s: %s.adj.csv rebuilt from %s.csv, %d bar(s), %d action(s) applied (source: corporate actions%s)." % (
+        sym, sym, sym, len(adj), len(applied), "" if src in (None, "actions") else "; replaced the %s file" % src)]
+    for ex, factor, ratio, subject in applied:
+        lines.append("  %s x%s  %s  (%s)" % (ex, fmt(factor), verdict(ratio), subject[:70]))
+    last = datetime.date.fromisoformat(rows[-1]["date"])
+    if (last - datetime.date.fromisoformat(entry["fetched_through"])).days > ACTIONS_STALE_DAYS:
+        warns.append("actions were fetched through %s, the cache runs to %s: run data.py actions %s" % (
+            entry["fetched_through"], last, sym))
+    if entry["from"] > rows[0]["date"]:
+        warns.append("actions are known only from %s, the cache starts %s: run data.py actions %s --refresh" % (
+            entry["from"], rows[0]["date"], sym))
+    later = sorted(x["ex_date"] for x in entry["actions"] if x["factor"] and x["ex_date"] > rows[-1]["date"])
+    if later and not auto:
+        lines.append("  not applied yet: ex-date %s is after the last bar %s" % (", ".join(later), rows[-1]["date"]))
+    return 0, lines + ["  warning: " + w for w in warns]
+
+
+def auto_adjust(data_dir, sym):
+    """After a daily run on a non-Yahoo source: rebuild the adjusted file when the actions are known."""
+    if sym not in load_actions(data_dir)["symbols"]:
+        return []
+    return adjust_symbol(data_dir, sym, auto=True)[1]
+
+
+def cmd_adjust(a):
+    known = load_actions(a.data)["symbols"]
+    syms = [norm_symbol(s) for s in a.symbols] or [s for s in daily_symbols(a.data) if s in known]
+    if not syms:
+        raise DataError("no symbols: name some (adjust RELIANCE), or run actions first")
+    rc = 0
+    for sym in syms:
+        code, lines = adjust_symbol(a.data, sym, a.force)
+        rc = max(rc, code)
+        for line in lines:
+            print(line)
+    return rc
+
+
 # ---------------------------------------------------------------- doctor
 
 def probes(now_ist):
@@ -2126,6 +2516,9 @@ def probes(now_ist):
         ("nse-circulars", "cal", NSE + "/api/circulars?from_date=%s&to_date=%s&dept=CMTR" % (
             (now_ist.date() - datetime.timedelta(days=7)).strftime("%d-%m-%Y"), now_ist.strftime("%d-%m-%Y")),
          "circulars"),
+        ("nse-actions", "cal", NSE + "/api/corporates-corporateActions?index=equities&symbol=RELIANCE"
+         "&from_date=%s&to_date=%s" % ((now_ist.date() - datetime.timedelta(days=365)).strftime("%d-%m-%Y"),
+                                       now_ist.strftime("%d-%m-%Y")), "actions"),
         ("nsearchives", "price", bhav_urls(bd)[0], "bhav"),
         ("niftyindices", "list", NIFTY_LIST, "csv"),
         ("google-news", "news", GNEWS, "rss"),
@@ -2149,9 +2542,11 @@ def check_body(kind, code, body):
             return "priceInfo" in json.loads(body), ""
         except ValueError:
             return False, "not JSON (bot wall)"
-    if kind in ("holidays", "circulars"):
+    if kind in ("holidays", "circulars", "actions"):
         try:
             doc = json.loads(body)
+            if kind == "actions":
+                return isinstance(doc, list) or isinstance(doc.get("data"), list), "no list of actions in the answer"
             if kind == "holidays":
                 return bool(isinstance(doc, dict) and doc.get("CM")), "no CM holiday list in the answer"
             return isinstance(doc.get("data"), list), "no data list in the answer"
@@ -2180,8 +2575,9 @@ def cmd_doctor(a):
                 hdr["Range"] = "bytes=0-2047"
             if name == "nse-api":
                 hdr.update({"Accept": "application/json", "Referer": NSE + "/get-quotes/equity?symbol=RELIANCE"})
-            if check in ("holidays", "circulars"):
-                hdr.update({"Accept": "application/json", "Referer": CAL_REFERER, "X-Requested-With": "XMLHttpRequest"})
+            if check in ("holidays", "circulars", "actions"):
+                ref = ACTIONS_REFERER if check == "actions" else CAL_REFERER
+                hdr.update({"Accept": "application/json", "Referer": ref, "X-Requested-With": "XMLHttpRequest"})
             code, body = sess.get(url, hdr, timeout=a.timeout, gap=0, retries=0)   # a probe reports the first answer
             ok, why = check_body(check, code, body)
             if not ok:
@@ -2299,6 +2695,10 @@ def cmd_status(a):
     if tracked:
         print("delivery/: %d symbol file(s); pending days: %s" % (
             len(tracked), ", ".join(d.isoformat() for d in sorted(read_pending(a.data))) or "none"))
+    acts = load_actions(a.data)
+    if acts["symbols"]:
+        n = sum(1 for e in acts["symbols"].values() for x in e["actions"] if x["factor"])
+        print("actions.json: %d symbol(s), %d split/bonus, fetched %s" % (len(acts["symbols"]), n, acts["fetched_at"]))
     cal = _CAL
     if cal:
         print("calendar.json: years %s, %d holiday(s), fetched %s, circulars checked %s" % (
@@ -2379,6 +2779,15 @@ def main(argv=None):
     p = sub.add_parser("calendar", help="refresh the NSE holiday calendar (calendar.json)")
     common(p)
     p.add_argument("--refresh", action="store_true", help="refetch the holiday list and the circulars now")
+    p = sub.add_parser("actions", help="corporate actions (splits, bonus, dividends) into actions.json")
+    common(p)
+    p.add_argument("symbols", nargs="*", help="default: every symbol in the daily cache")
+    p.add_argument("--years", type=years_arg, default=3.0, help="how far back when the symbol has no daily cache")
+    p.add_argument("--refresh", action="store_true", help="refetch the whole span, not only the newer ranges")
+    p = sub.add_parser("adjust", help="rebuild <SYM>.adj.csv from the raw file and actions.json")
+    common(p)
+    p.add_argument("symbols", nargs="*", help="default: every cached symbol that has actions")
+    p.add_argument("--force", action="store_true", help="also replace an adj file that came from Yahoo, Kite or a CSV")
     p = sub.add_parser("doctor", help="probe every source")
     common(p)
     p.add_argument("--timeout", type=float, default=10)
@@ -2400,7 +2809,8 @@ def main(argv=None):
     try:
         return {"daily": cmd_daily, "intraday": cmd_intraday, "bands": cmd_bands, "import-kite": cmd_import_kite,
                 "import-csv": cmd_import_csv, "calendar": cmd_calendar, "delivery": cmd_delivery,
-                "doctor": cmd_doctor, "record": cmd_record, "status": cmd_status}[a.cmd](a)
+                "actions": cmd_actions, "adjust": cmd_adjust, "doctor": cmd_doctor, "record": cmd_record,
+                "status": cmd_status}[a.cmd](a)
     except DataError as e:
         print("data.py: %s" % e, file=sys.stderr)
         return 1

@@ -1354,6 +1354,496 @@ class RecordStatus(Net):
         self.assertIn("4 session(s) behind", out)
 
 
+# ---------------------------------------------------------------- corporate actions and adjustment
+
+class ActionParse(unittest.TestCase):
+    def test_split_factors(self):
+        f = data.split_factor
+        self.assertEqual(f("Face Value Split (Sub-Division) - From Rs 10/- Per Share To Re 1/- Per Share"), 10.0)
+        self.assertEqual(f("Stock Split From Rs.10/- To Rs.2/-"), 5.0)
+        self.assertEqual(f("Sub-Division/ Splt From Rs 5/- Per Share To Rs 2.5/- Per Share"), 2.0)
+        self.assertAlmostEqual(f("Face Value Consolidation From Re 1/- To Rs 10/-"), 0.1)     # reverse split
+        self.assertIsNone(f("Face Value Split"))                                               # no numbers
+        self.assertIsNone(f("Face Value Split (Phase 2, from Rs 10/- to Rs 1/-)"))             # a comma between them
+        self.assertIsNone(f("Face Value Split From Rs 10/- To Rs 10/-"))                       # nothing changes
+        self.assertIsNone(f("Interim Dividend - Rs 5 Per Share"))
+
+    def test_bonus_factors(self):
+        f = data.bonus_factor
+        self.assertEqual(f("Bonus 2:1"), 3.0)
+        self.assertEqual(f("Bonus issue 3 : 2"), 2.5)
+        self.assertEqual(f("Bonus 1:1"), 2.0)
+        for text in ("Bonus 1:1 NCRPS", "Bonus Debentures 1:10", "Bonus on Preference Shares 1:2", "DVR Bonus 1:20"):
+            self.assertIsNone(f(text), text)
+        self.assertIsNone(f("Bonus Issue"))                  # no ratio: never guessed
+        self.assertIsNone(f("Buy Back"))
+
+    def test_dividends_in_rupees_per_share(self):
+        f = data.dividend_amount
+        self.assertEqual(f("Interim Dividend - Rs 30 Per Share"), 30.0)
+        self.assertEqual(f("Interim Dividend - Re 0.50 Per Share"), 0.5)
+        self.assertEqual(f("Special Dividend Rs. 2.5/- per share"), 2.5)
+        self.assertIsNone(f("Dividend - 250%"))
+        self.assertIsNone(f("Buy Back"))
+
+    def test_parse_action(self):
+        got = data.parse_action("Face Value Split From Rs 10/- To Rs 5/- and Bonus 1:1")
+        self.assertEqual((got["kind"], got["factor"]), ("split+bonus", 4.0))        # the factors multiply
+        self.assertEqual(data.parse_action("Bonus 3:2")["factor"], 2.5)
+        self.assertEqual(data.parse_action("Final Dividend - Rs 8 Per Share")["dividend"], 8.0)
+        for text in ("Buy Back", "Rights 1:5 at premium", "Bonus 1:1 NCRPS", "Annual General Meeting"):
+            self.assertIsNone(data.parse_action(text), text)
+        got = data.parse_action("Bonus Issue")
+        self.assertEqual((got["kind"], got["about"], got["factor"]), ("unparsed", "bonus", None))
+        self.assertEqual(data.parse_action("Dividend - 250%")["about"], "dividend")
+        self.assertEqual(data.parse_action("Split of shares")["kind"], "unparsed")
+        self.assertEqual(data.parse_action("Split From Rs 10 To Rs 5 and Bonus Issue")["about"], "split+bonus")
+
+    def test_feed_rows(self):
+        got = data.parse_actions_doc(json.loads(fx("nse-actions-SPLITCO.json")), "SPLITCO")
+        self.assertEqual([(x["ex_date"], x["kind"], x["factor"], x["dividend"]) for x in got],
+                         [("2026-10-06", "dividend", None, 5.0), ("2026-10-08", "split", 10.0, None),
+                          ("2026-10-13", "bonus", 2.5, None)])      # NCRPS, no ex-date, buy back and SM series left out
+        self.assertEqual((got[1]["series"], got[1]["isin"], got[1]["face_val"]), ("EQ", "INE000A01010", 1.0))
+        self.assertEqual(data.parse_actions_doc({"data": []}, "SPLITCO"), [])      # an empty list is valid
+        self.assertEqual(data.parse_actions_doc(json.loads(fx("nse-actions-SPLITCO.json")), "SPLITCO-RE"), [])
+        with self.assertRaises(data.SourceError):
+            data.parse_actions_doc({}, "SPLITCO")                                  # not a list: stale cookies
+
+    def test_ranges(self):
+        D = datetime.date
+        self.assertEqual(data.chunk_range(D(2024, 1, 1), D(2024, 12, 31)), [(D(2024, 1, 1), D(2024, 12, 30)),
+                                                                          (D(2024, 12, 31), D(2024, 12, 31))])
+        self.assertEqual(data.chunk_range(D(2024, 1, 1), D(2024, 1, 10), 4),
+                         [(D(2024, 1, 1), D(2024, 1, 4)), (D(2024, 1, 5), D(2024, 1, 8)), (D(2024, 1, 9), D(2024, 1, 10))])
+        entry = {"from": "2026-10-05", "fetched_through": "2026-10-23", "actions": []}
+        self.assertEqual(data.action_ranges(None, D(2026, 10, 5), D(2026, 10, 23)), [(D(2026, 10, 5), D(2026, 11, 22))])
+        self.assertEqual(data.action_ranges(entry, D(2026, 10, 5), D(2026, 10, 23)), [])
+        self.assertEqual(data.action_ranges(entry, D(2026, 10, 5), D(2026, 10, 30)), [(D(2026, 10, 16), D(2026, 11, 29))])
+        self.assertEqual(data.action_ranges(entry, D(2026, 9, 1), D(2026, 10, 30)),
+                         [(D(2026, 9, 1), D(2026, 10, 4)), (D(2026, 10, 16), D(2026, 11, 29))])
+        self.assertEqual(data.action_ranges(entry, D(2026, 10, 5), D(2026, 10, 30), refresh=True),
+                         [(D(2026, 10, 5), D(2026, 11, 29))])
+
+
+class AdjustRows(unittest.TestCase):
+    def rows(self, closes, start=5):
+        return [data.bar("2026-10-%02d" % (start + i), c, c + 1, c - 1, c, 1000) for i, c in enumerate(closes)]
+
+    def act(self, ex, factor, subject="Split"):
+        return {"ex_date": ex, "kind": "split", "factor": factor, "dividend": None, "subject": subject}
+
+    def test_two_decimals_and_no_snapping_to_0_05(self):
+        rows = [data.bar("2026-10-05", 12.34, 12.4, 12.3, 12.34, 100), data.bar("2026-10-06", 6.2, 6.3, 6.1, 6.2, 200)]
+        out, applied, warns = data.adjust_rows(rows, [self.act("2026-10-06", 2.0)])
+        self.assertEqual(out[0]["close"], 6.17)                 # 12.34 / 2, not snapped to 6.15
+        self.assertEqual((out[0]["open"], out[0]["volume"]), (6.17, 200))
+        self.assertEqual(out[1]["close"], 6.2)
+        self.assertEqual(warns, [])
+        self.assertEqual(applied[0][:2], ("2026-10-06", 2.0))
+
+    def test_consolidation_scales_the_old_prices_up(self):
+        out, _, warns = data.adjust_rows(self.rows([10, 10, 100, 101]), [self.act("2026-10-07", 0.1)])
+        self.assertEqual([r["close"] for r in out], [100.0, 100.0, 100.0, 101.0])
+        self.assertEqual([r["volume"] for r in out], [100, 100, 1000, 1000])
+        self.assertEqual(warns, [])
+
+    def test_a_drop_that_the_factor_does_not_explain_is_flagged(self):
+        out, applied, warns = data.adjust_rows(self.rows([100, 100, 100]), [self.act("2026-10-06", 2.0)])
+        self.assertEqual(out[0]["close"], 50.0)                 # still written: it is a warning
+        self.assertEqual(len(warns), 1)
+        self.assertIn("possible adjustment failure", warns[0])
+        self.assertIn("2.00x", warns[0])
+        self.assertAlmostEqual(applied[0][2], 2.0)
+
+    def test_no_bar_on_the_ex_date_is_unverified(self):
+        rows = self.rows([100, 100, 50, 50], start=8)          # 8, 9, 10, 11 Oct; the 10th is a Saturday
+        rows = [r for r in rows if r["date"] != "2026-10-10"]
+        out, applied, warns = data.adjust_rows(rows, [self.act("2026-10-10", 2.0)])
+        self.assertEqual(len(warns), 1)
+        self.assertIn("unverified", warns[0])
+        self.assertIsNone(applied[0][2])
+        self.assertEqual(out[0]["close"], 50.0)                 # still applied to the rows before it
+
+    def test_outside_the_span_is_not_applied(self):
+        acts = [self.act("2026-10-05", 2.0), self.act("2026-11-05", 2.0)]     # on the first bar; after the last bar
+        out, applied, warns = data.adjust_rows(self.rows([100, 100, 100]), acts)
+        self.assertEqual([r["close"] for r in out], [100.0, 100.0, 100.0])
+        self.assertEqual((applied, warns), ([], []))
+
+    def test_duplicate_dates_are_refused(self):
+        rows = self.rows([100, 100, 100])
+        rows[2]["date"] = rows[1]["date"]
+        with self.assertRaises(data.DataError) as cm:
+            data.adjust_rows(rows, [])
+        self.assertIn("duplicate dates", str(cm.exception))
+
+    def test_unparsed_split_is_a_warning_not_a_guess(self):
+        acts = [{"ex_date": "2026-10-06", "kind": "unparsed", "about": "split", "factor": None, "dividend": None,
+                 "subject": "Split of shares"},
+                {"ex_date": "2026-10-06", "kind": "unparsed", "about": "dividend", "factor": None, "dividend": None,
+                 "subject": "Dividend - 250%"}]
+        out, applied, warns = data.adjust_rows(self.rows([100, 100, 100]), acts)
+        self.assertEqual([r["close"] for r in out], [100.0] * 3)
+        self.assertEqual(applied, [])
+        self.assertEqual(len(warns), 1)                        # the dividend one does not matter here
+        self.assertIn("no number could be read", warns[0])
+
+
+class Adjust(Net):
+    NOW = "2026-10-23 19:00"
+
+    def setUp(self):
+        Net.setUp(self)
+        self.raw_p, self.adj_p, _ = data.data_paths(self.dd, "SPLITCO")
+        os.makedirs(os.path.dirname(self.raw_p))
+        shutil.copyfile(os.path.join(DFIX, "adj-raw-SPLITCO.csv"), self.raw_p)
+
+    def feed(self, body=None, code=200):
+        return self.net([("corporates-corporateActions", code, body if body is not None else fx("nse-actions-SPLITCO.json")),
+                         ("www.nseindia.com/", 200, b"<html>home</html>")])
+
+    def fetch(self, *extra):
+        self.feed()
+        code, out, err = self.run_d("actions", "SPLITCO", "--now", self.NOW, *extra)
+        self.assertEqual(code, 0, out + err)
+        return out
+
+    def meta(self):
+        return json.loads(rd(os.path.join(self.dd, "cache_meta.json")))
+
+    def test_the_eight_row_case(self):
+        self.fetch()
+        before = rd(self.raw_p)
+        code, out, err = self.run_d("adjust", "SPLITCO")
+        self.assertEqual(code, 0, out + err)
+        adj = self.daily("SPLITCO", adj=True)
+        self.assertEqual([r["close"] for r in adj], [40.0, 40.4, 40.8, 40.0, 40.4, 40.8, 40.8, 41.0])
+        # rows 1-3 are original / 10 / 2.5, rows 4-6 original / 2.5, rows 7-8 untouched
+        raw = self.daily("SPLITCO")
+        self.assertEqual([r["close"] for r in adj[:3]], [r["close"] / 10 / 2.5 for r in raw[:3]])
+        self.assertEqual([r["close"] for r in adj[3:6]], [r["close"] / 2.5 for r in raw[3:6]])
+        self.assertEqual((adj[0]["open"], adj[0]["high"], adj[0]["low"]), (39.8, 40.4, 39.6))
+        self.assertEqual((adj[5]["open"], adj[5]["high"], adj[5]["low"]), (40.4, 41.6, 40.0))
+        self.assertEqual([r["volume"] for r in adj], [25000] * 8)             # volume scaled up the same way
+        self.assertEqual(rd(self.raw_p), before)                               # the raw file is never touched
+        self.assertIn("2026-10-08 x10  verified, ratio 0.98", out)
+        self.assertIn("2026-10-13 x2.5  verified, ratio 1.00", out)
+        self.assertIn("2 action(s) applied (source: corporate actions)", out)
+        self.assertNotIn("warning", out)                                       # NCRPS bonus and dividend were ignored
+        self.assertEqual(self.meta()["adjusted"]["SPLITCO"]["source"], "actions")
+        self.assertEqual(self.meta()["adjusted"]["SPLITCO"]["applied"], ["2026-10-08", "2026-10-13"])
+
+    def test_running_it_again_is_the_same_file(self):
+        self.fetch()
+        self.run_d("adjust", "SPLITCO")
+        first = rd(self.adj_p)
+        code, out, _ = self.run_d("adjust", "SPLITCO")                        # our own file needs no --force
+        self.assertEqual(code, 0)
+        self.assertEqual(rd(self.adj_p), first)
+
+    def test_adjust_with_no_name_does_every_cached_symbol_with_actions(self):
+        self.fetch()
+        code, out, _ = self.run_d("adjust")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(os.path.exists(self.adj_p))
+        code, out, _ = self.run_d("adjust", "TCS")
+        self.assertEqual(code, 1)
+        self.assertIn("TCS: no daily cache to adjust", out)
+        self.seed("TCS", "2026-09-30")
+        code, out, _ = self.run_d("adjust", "TCS")
+        self.assertEqual(code, 1)
+        self.assertIn("run data.py actions TCS first", out)
+
+    def test_a_yahoo_adj_file_is_kept_unless_forced(self):
+        self.fetch()
+        yahoo = "date,open,high,low,close,volume\n2026-10-13,1,2,0.5,1.5,7\n"
+        wr(self.adj_p, yahoo)
+        data.note_meta(self.dd, "adjusted", "SPLITCO", {"source": "yahoo", "fetched_at": "x"})
+        code, out, _ = self.run_d("adjust", "SPLITCO")
+        self.assertEqual(code, 0)
+        self.assertIn("SPLITCO.adj.csv came from yahoo, kept as it is", out)
+        self.assertIn("--force", out)
+        self.assertEqual(rd(self.adj_p), yahoo)
+        code, out, _ = self.run_d("adjust", "SPLITCO", "--force")
+        self.assertEqual(code, 0)
+        self.assertIn("replaced the yahoo file", out)
+        self.assertEqual(self.daily("SPLITCO", adj=True)[0]["close"], 40.0)
+        self.assertEqual(self.meta()["adjusted"]["SPLITCO"]["source"], "actions")
+
+    def test_an_adj_file_of_unknown_origin_is_also_kept(self):
+        self.fetch()
+        wr(self.adj_p, "date,open,high,low,close,volume\n2026-10-13,1,2,0.5,1.5,7\n")
+        _, out, _ = self.run_d("adjust", "SPLITCO")
+        self.assertIn("came from unknown", out)
+        self.assertEqual(rd(self.adj_p).count("\n"), 2)
+
+    def test_yahoo_daily_records_where_the_adj_file_came_from(self):
+        self.net([("query1.finance.yahoo.com", 200, fx("yahoo-daily-RELIANCE.json"))])
+        self.run_d("daily", "RELIANCE", "--years", "3", "--now", self.NOW)
+        self.assertEqual(self.meta()["adjusted"]["RELIANCE"]["source"], "yahoo")
+        self.assertEqual(data.adj_source(self.dd, "RELIANCE"), "yahoo")
+
+    def test_imports_record_the_adj_source(self):
+        self.run_d("import-csv", os.path.join(DFIX, "nse-website-RELIANCE.csv"), "--symbol", "RELIANCE", "--adjusted")
+        self.assertEqual(self.meta()["adjusted"]["RELIANCE"]["source"], "import-csv:nse-website-RELIANCE.csv")
+        self.run_d("import-kite", os.path.join(DFIX, "kite-historical-RELIANCE-day.json"), "--kind", "historical",
+                   "--symbol", "RELIANCE", "--adjusted")
+        self.assertEqual(self.meta()["adjusted"]["RELIANCE"]["source"], "kite-mcp")
+
+    def test_a_problem_writes_nothing(self):
+        self.fetch()
+        self.run_d("adjust", "SPLITCO")
+        good = rd(self.adj_p)
+        # a price that rounds to 0.00 after dividing: write_daily refuses, so the old file stays
+        wr(self.raw_p, "date,open,high,low,close,volume\n2026-10-05,0.04,0.04,0.04,0.04,10\n"
+                       "2026-10-06,0.05,0.05,0.05,0.05,10\n2026-10-08,0.5,0.5,0.5,0.5,10\n"
+                       "2026-10-13,0.5,0.5,0.5,0.5,10\n")
+        code, out, _ = self.run_d("adjust", "SPLITCO")
+        self.assertEqual(code, 1)
+        self.assertIn("not adjusted", out)
+        self.assertEqual(rd(self.adj_p), good)
+        # duplicate dates in the raw file: refused as well
+        wr(self.raw_p, rd(os.path.join(DFIX, "adj-raw-SPLITCO.csv")) + "2026-10-14,40.8,42,40.6,41,25000\n")
+        code, out, _ = self.run_d("adjust", "SPLITCO")
+        self.assertEqual(code, 1)
+        self.assertIn("duplicate dates", out)
+        self.assertEqual(rd(self.adj_p), good)
+
+    def test_the_first_run_with_a_bad_file_makes_no_adj_file(self):
+        self.fetch()
+        wr(self.raw_p, rd(self.raw_p) + "2026-10-14,1,1,1,1,1\n")
+        code, _, _ = self.run_d("adjust", "SPLITCO")
+        self.assertEqual(code, 1)
+        self.assertFalse(os.path.exists(self.adj_p))
+
+    def test_a_future_ex_date_waits_for_its_bars(self):
+        body = json.loads(fx("nse-actions-SPLITCO.json"))
+        body.append({"symbol": "SPLITCO", "series": "EQ", "subject": "Bonus 1:1", "exDate": "05-Nov-2026"})
+        self.feed(json.dumps(body).encode())
+        _, out, _ = self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        self.assertIn("2026-11-05 bonus x2  UPCOMING", out)
+        _, out, _ = self.run_d("adjust", "SPLITCO")
+        self.assertIn("not applied yet: ex-date 2026-11-05 is after the last bar 2026-10-14", out)
+        self.assertEqual(self.daily("SPLITCO", adj=True)[-1]["close"], 41.0)
+
+    def test_an_unparsed_split_is_reported_and_not_applied(self):
+        self.feed(b'[{"symbol": "SPLITCO", "series": "EQ", "subject": "Bonus Issue", "exDate": "13-Oct-2026"},'
+                  b' {"symbol": "SPLITCO", "series": "EQ", "subject": "Dividend - 250%", "exDate": "06-Oct-2026"}]')
+        code, out, _ = self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        self.assertIn("warning: unparsed corporate action on 2026-10-13, never guessed: Bonus Issue", out)
+        self.assertIn("0 split/bonus, 0 dividend(s), 2 unparsed", out)
+        saved = json.loads(rd(os.path.join(self.dd, "actions.json")))["symbols"]["SPLITCO"]["actions"]
+        self.assertEqual([(x["kind"], x["about"], x["factor"]) for x in saved],
+                         [("unparsed", "dividend", None), ("unparsed", "bonus", None)])
+        _, out, _ = self.run_d("adjust", "SPLITCO")
+        self.assertIn("no number could be read in \"Bonus Issue\"", out)
+        self.assertEqual([r["close"] for r in self.daily("SPLITCO", adj=True)], [r["close"] for r in self.daily("SPLITCO")])
+
+    def test_stale_actions_are_called_out(self):
+        self.fetch()
+        far = json.loads(rd(os.path.join(self.dd, "actions.json")))
+        far["symbols"]["SPLITCO"]["fetched_through"] = "2026-10-01"
+        far["symbols"]["SPLITCO"]["from"] = "2026-10-07"
+        data._write_json(os.path.join(self.dd, "actions.json"), far)
+        _, out, _ = self.run_d("adjust", "SPLITCO")
+        self.assertIn("warning: actions were fetched through 2026-10-01", out)
+        self.assertIn("warning: actions are known only from 2026-10-07", out)
+
+    def test_daily_on_a_non_yahoo_source_rebuilds_the_adj_file(self):
+        self.seed("RELIANCE", "2026-10-21")
+        data._write_json(os.path.join(self.dd, "actions.json"), {"fetched_at": "x", "symbols": {"RELIANCE": {
+            "from": "2026-09-01", "fetched_through": "2026-10-23", "actions": [
+                {"ex_date": "2026-10-22", "kind": "split", "factor": 2.0, "dividend": None, "subject": "Split",
+                 "series": "EQ", "isin": None, "face_val": None},
+                {"ex_date": "2026-09-10", "kind": "dividend", "factor": None, "dividend": 5.0, "subject": "Dividend",
+                 "series": "EQ", "isin": None, "face_val": None}]}}})
+
+        def bhav(url):
+            name = url.rsplit("/", 1)[-1]
+            return (200, fx(name)) if os.path.exists(os.path.join(DFIX, name)) else (404, b"")
+        self.net([("sec_bhavdata_full", None, bhav), ("yahoo.com", 403, b""), ("nseindia.com", 404, b"")])
+        code, out, _ = self.run_d("daily", "RELIANCE", "--source", "bhavcopy", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertIn("RELIANCE: RELIANCE.adj.csv rebuilt from RELIANCE.csv", out)
+        self.assertIn("1 action(s) applied (source: corporate actions)", out)
+        self.assertIn("2026-10-22 x2  CHECK", out)           # the made-up bars do not halve: the check says so
+        adj = self.daily("RELIANCE", adj=True)
+        self.assertEqual((adj[0]["date"], adj[0]["close"], adj[-1]["date"]), ("2026-09-01", 592.5, "2026-10-23"))
+        self.assertEqual(self.daily("RELIANCE")[0]["close"], 1185.0)
+
+    def test_daily_without_known_actions_makes_no_adj_file(self):
+        self.seed("RELIANCE", "2026-10-21")
+        self.net([("sec_bhavdata_full_22102026", 200, fx("sec_bhavdata_full_22102026.csv")),
+                  ("sec_bhavdata_full_23102026", 200, fx("sec_bhavdata_full_23102026.csv")),
+                  ("yahoo.com", 403, b""), ("nseindia.com", 404, b"")])
+        _, out, _ = self.run_d("daily", "RELIANCE", "--source", "bhavcopy", "--now", self.NOW)
+        self.assertNotIn("rebuilt", out)
+        self.assertFalse(os.path.exists(data.data_paths(self.dd, "RELIANCE")[1]))
+
+    def test_daily_from_yahoo_never_runs_adjust(self):
+        data._write_json(os.path.join(self.dd, "actions.json"), {"fetched_at": "x", "symbols": {"RELIANCE": {
+            "from": "2023-01-01", "fetched_through": "2026-10-23", "actions": [
+                {"ex_date": "2026-01-05", "kind": "split", "factor": 9.0, "dividend": None, "subject": "Split",
+                 "series": "EQ", "isin": None, "face_val": None}]}}})
+        self.net([("query1.finance.yahoo.com", 200, fx("yahoo-daily-RELIANCE.json"))])
+        _, out, _ = self.run_d("daily", "RELIANCE", "--years", "3", "--now", self.NOW)
+        self.assertNotIn("rebuilt", out)
+        self.assertEqual(self.daily("RELIANCE", adj=True)[-1]["date"], "2024-11-08")     # Yahoo's own file
+        self.assertEqual(data.adj_source(self.dd, "RELIANCE"), "yahoo")
+
+
+class ActionsCommand(Net):
+    NOW = "2026-10-23 19:00"
+
+    def feed(self, body=None, code=200):
+        return self.net([("corporates-corporateActions", code, body if body is not None else fx("nse-actions-SPLITCO.json")),
+                         ("www.nseindia.com/", 200, b"<html>home</html>")])
+
+    def cache(self, first="2026-10-05"):
+        rows = [data.bar(first, 100, 101, 99, 100, 10), data.bar("2026-10-14", 100, 101, 99, 100, 10)]
+        data.write_daily(data.data_paths(self.dd, "SPLITCO")[0], rows)
+
+    def saved(self):
+        return json.loads(rd(os.path.join(self.dd, "actions.json")))
+
+    @staticmethod
+    def window(url):
+        return tuple(url.split(k + "=")[1].split("&")[0] for k in ("from_date", "to_date"))
+
+    def test_writes_the_contract(self):
+        self.cache()
+        f = self.feed()
+        code, out, err = self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        self.assertEqual(code, 0, out + err)
+        doc = self.saved()
+        self.assertEqual(sorted(doc), ["fetched_at", "symbols"])
+        self.assertEqual(doc["fetched_at"], "2026-10-23T13:30:00Z")
+        e = doc["symbols"]["SPLITCO"]
+        self.assertEqual((e["from"], e["fetched_through"]), ("2026-10-05", "2026-10-23"))
+        self.assertEqual(sorted(e["actions"][0]), ["dividend", "ex_date", "face_val", "factor", "isin", "kind", "series",
+                                                    "subject"])
+        self.assertEqual([(x["ex_date"], x["kind"], x["factor"], x["dividend"]) for x in e["actions"]],
+                         [("2026-10-06", "dividend", None, 5.0), ("2026-10-08", "split", 10.0, None),
+                          ("2026-10-13", "bonus", 2.5, None)])
+        self.assertEqual(len(f.urls("corporates-corporateActions")), 1)
+        url = f.urls("corporates-corporateActions")[0]
+        self.assertIn("index=equities&symbol=SPLITCO&from_date=05-10-2026&to_date=22-11-2026", url)   # explicit dates
+        hdr = [h for u, h in f.calls if "corporateActions" in u][0]
+        self.assertEqual(hdr["Accept"], "application/json, text/plain, */*")
+        self.assertIn("corporate-filings-actions", hdr["Referer"])
+        self.assertIn("2 split/bonus, 1 dividend(s), 0 unparsed", out)
+        self.assertIn("2026-10-08 split x10", out)
+        self.assertIn("2026-10-13 bonus x2.5", out)
+        self.assertIn("next: data.py adjust SPLITCO", out)
+        self.assertNotIn("NCRPS", out)
+
+    def test_long_spans_go_in_explicit_chunks(self):
+        f = self.feed(b"[]")
+        code, out, _ = self.run_d("actions", "SPLITCO", "--years", "3", "--now", self.NOW)     # no daily cache
+        self.assertEqual(code, 0, out)
+        wins = [self.window(u) for u in f.urls("corporateActions")]
+        self.assertEqual(len(wins), 4)
+        fmt = lambda s: datetime.datetime.strptime(s, "%d-%m-%Y").date()    # noqa: E731
+        self.assertEqual((fmt(wins[0][1]) - fmt(wins[0][0])).days, 364)
+        for a, b in zip(wins, wins[1:]):
+            self.assertEqual(fmt(b[0]) - fmt(a[1]), datetime.timedelta(days=1))   # contiguous, no holes
+        self.assertEqual(wins[-1][1], "22-11-2026")
+        self.assertEqual(self.saved()["symbols"]["SPLITCO"]["actions"], [])        # empty is a valid answer
+
+    def test_a_later_run_asks_only_for_the_newer_range(self):
+        self.cache()
+        self.feed()
+        self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        # same day: nothing to ask
+        f = self.net([])
+        code, out, _ = self.run_d("actions", "SPLITCO", "--now", "2026-10-23 21:00")
+        self.assertEqual((code, f.calls), (0, []))
+        self.assertIn("already fetched through 2026-10-23", out)
+        # next week: the last 7 days again, plus the lookahead, and a new action is added
+        new = [{"symbol": "SPLITCO", "series": "EQ", "subject": "Bonus 1:1", "exDate": "28-Oct-2026"}]
+        f = self.feed(json.dumps(new).encode())
+        code, out, _ = self.run_d("actions", "SPLITCO", "--now", "2026-10-30 19:00")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([self.window(u) for u in f.urls("corporateActions")], [("16-10-2026", "29-11-2026")])
+        acts = self.saved()["symbols"]["SPLITCO"]["actions"]
+        self.assertEqual([x["ex_date"] for x in acts], ["2026-10-06", "2026-10-08", "2026-10-13", "2026-10-28"])
+        self.assertEqual(self.saved()["symbols"]["SPLITCO"]["fetched_through"], "2026-10-30")
+        # the refetched range is replaced, not merged: NSE no longer lists the 28 Oct bonus
+        self.feed(b"[]")
+        self.run_d("actions", "SPLITCO", "--now", "2026-11-06 19:00")
+        acts = self.saved()["symbols"]["SPLITCO"]["actions"]
+        self.assertEqual([x["ex_date"] for x in acts], ["2026-10-06", "2026-10-08", "2026-10-13"])
+
+    def test_an_older_cache_start_fetches_the_older_range(self):
+        self.cache()
+        self.feed()
+        self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        self.cache(first="2026-10-01")
+        f = self.feed(b"[]")
+        code, _, _ = self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        self.assertEqual(code, 0)
+        self.assertEqual([self.window(u) for u in f.urls("corporateActions")], [("01-10-2026", "04-10-2026")])
+        self.assertEqual(self.saved()["symbols"]["SPLITCO"]["from"], "2026-10-01")
+        self.assertEqual(len(self.saved()["symbols"]["SPLITCO"]["actions"]), 3)     # the rest kept
+
+    def test_a_failed_fetch_leaves_the_symbol_as_it_was(self):
+        self.cache()
+        self.feed()
+        self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        before = rd(os.path.join(self.dd, "actions.json"))
+        self.feed(b"Access Denied", code=403)
+        code, out, _ = self.run_d("actions", "SPLITCO", "--now", "2026-10-30 19:00")
+        self.assertEqual(code, 1)
+        self.assertIn("corporate actions not updated", out)
+        self.assertIn("403", out)
+        self.assertEqual(rd(os.path.join(self.dd, "actions.json")), before)
+        # an object where a list belongs (stale cookies) and a bot wall page are failures too
+        for body in (b"{}", b"<html>wall</html>"):
+            self.feed(body)
+            code, out, _ = self.run_d("actions", "SPLITCO", "--now", "2026-10-30 19:00")
+            self.assertEqual(code, 1, body)
+            self.assertEqual(rd(os.path.join(self.dd, "actions.json")), before)
+
+    def test_one_bad_symbol_does_not_stop_the_others(self):
+        self.cache()
+        data.write_daily(data.data_paths(self.dd, "OKCO")[0], [data.bar("2026-10-05", 5, 6, 4, 5, 1)])
+
+        def by_symbol(url):
+            return (500, b"boom") if "symbol=SPLITCO" in url else (200, b"[]")
+        self.net([("corporateActions", None, by_symbol), ("www.nseindia.com/", 200, b"home")])
+        code, out, _ = self.run_d("actions", "--now", self.NOW)             # no names: the whole daily cache
+        self.assertEqual(code, 1)
+        self.assertIn("SPLITCO: corporate actions not updated", out)
+        self.assertEqual(list(self.saved()["symbols"]), ["OKCO"])
+
+    def test_rights_symbols_and_empty_cache(self):
+        f = self.net([])
+        code, out, _ = self.run_d("actions", "ABC-RE", "--now", self.NOW)
+        self.assertIn("rights symbol, skipped", out)
+        self.assertEqual(f.calls, [])
+        code, _, err = self.run_d("actions")
+        self.assertEqual(code, 1)
+        self.assertIn("no symbols", err)
+
+    def test_status_and_doctor_know_about_actions(self):
+        self.cache()
+        self.feed()
+        self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        _, out, _ = self.run_d("status", "--now", self.NOW)
+        self.assertIn("actions.json: 1 symbol(s), 2 split/bonus", out)
+        f = self.net([("corporateActions", 200, fx("nse-actions-SPLITCO.json")), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertTrue(s["nse-actions"]["ok"])
+        self.assertIn("from_date=23-10-2025&to_date=23-10-2026", f.urls("corporateActions")[0])
+        self.net([("corporateActions", 200, b'{"not": "a list"}'), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertFalse(s["nse-actions"]["ok"])
+        self.assertIn("no list of actions", s["nse-actions"]["error"])
+
+
 class Style(unittest.TestCase):
     def test_no_em_dash_and_skill_frontmatter(self):
         for f in ("data.py", "SKILL.md"):
