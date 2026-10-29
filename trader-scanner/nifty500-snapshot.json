@@ -1,0 +1,11 @@
+{
+  "file": "nifty500-snapshot.csv",
+  "what": "Nifty 500 constituents, NSE Indices' ind_nifty500list.csv format (Company Name,Industry,Symbol,Series,ISIN Code), 501 rows",
+  "as_of": "2026-07-13",
+  "short": "trader-scanner/nifty500-snapshot.csv, NSE Indices list via a GitHub mirror",
+  "source": "NSE Indices ind_nifty500list.csv as mirrored by github.com/pkjmesra/PKScreener (branch actions-data-download, results/Indices/ind_nifty500list.csv, last changed in commit 833af69 on 2026-07-13)",
+  "url": "https://raw.githubusercontent.com/pkjmesra/PKScreener/actions-data-download/results/Indices/ind_nifty500list.csv",
+  "upstream": "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv",
+  "fetched": "2026-10-29",
+  "note": "Offline fallback only, used when niftyindices.com is unreachable. Index constituents change at the semi-annual rebalances (March, September): refresh with `python3 trader-scanner/scan.py universe` when the site answers."
+}
