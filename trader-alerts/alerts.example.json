@@ -1,0 +1,9 @@
+{
+  "rules": [
+    {"id": "opening-bell", "type": "opening_bell"},
+    {"id": "hindcopper-plan-stop", "symbol": "HINDCOPPER", "type": "stop", "price": 308.1, "note": "plan stop: opening-range midpoint", "date": "2026-10-19"},
+    {"id": "hindcopper-plan-target", "symbol": "HINDCOPPER", "type": "target", "price": 320.5, "note": "plan target: 1R (one times the risk)", "date": "2026-10-19"},
+    {"id": "hindcopper-flat-by", "symbol": "HINDCOPPER", "type": "time", "at": "15:15", "label": "flat by 15:15", "date": "2026-10-19"},
+    {"id": "reliance-move-3", "symbol": "RELIANCE", "type": "pct_move", "pct": 3}
+  ]
+}
