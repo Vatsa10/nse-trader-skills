@@ -491,7 +491,142 @@ class Deals(unittest.TestCase):
         notes = [n for n in data["notes"] if "bulk/block" in n]
         self.assertEqual(len(notes), 1)
         self.assertIn("keeps refusing", notes[0])
-        self.assertEqual(len(calls), 1)                              # and NSE was not asked twice more
+        self.assertEqual(len([c for c in calls if "bulk-block-short-deals" in c]), 1)   # asked once, not three times
+        self.assertEqual(len([n for n in data["notes"] if "board meetings" in n]), 1)
+        self.assertEqual(len(calls), 2)                              # deals once, meetings once, then stop
+
+
+class Calendar(unittest.TestCase):
+    """Results and board-meeting dates: hand-made JSON shaped as NSE's corporate-board-meetings answer.
+    NOW is Wednesday 2026-10-14 IST."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        self.saved = (news.Fetcher.get, news.Fetcher.nse_json)
+        self.dir = os.path.join(DIR, "calendar")
+        self.base = ["--offline", self.dir, "--state", "s.json", "--now", NOW, "--no-moves", "--no-deals",
+                     "--portfolio", "x", "--watchlist", "x", "--plan", "x", "--dry-run"]
+
+    def tearDown(self):
+        news.Fetcher.get, news.Fetcher.nse_json = self.saved
+        os.chdir(self.cwd)
+        self.tmp.cleanup()
+
+    def write_calendar(self, **doc):
+        with open("calendar.json", "w") as fh:
+            json.dump(doc, fh)
+        return "calendar.json"
+
+    def test_sessions_count_weekends_out(self):
+        d = datetime.date
+        self.assertEqual(news.sessions_between(d(2026, 10, 14), d(2026, 10, 14)), 0)
+        self.assertEqual(news.sessions_between(d(2026, 10, 14), d(2026, 10, 16)), 2)
+        self.assertEqual(news.sessions_between(d(2026, 10, 16), d(2026, 10, 19)), 1)    # Friday to Monday
+        self.assertEqual(news.sessions_between(d(2026, 10, 16), d(2026, 10, 20)), 2)
+        self.assertEqual(news.sessions_between(d(2026, 10, 17), d(2026, 10, 18)), 0)    # Saturday to Sunday
+        self.assertEqual(news.sessions_between(d(2026, 10, 19), d(2026, 10, 16)), -1)
+
+    def test_sessions_use_the_calendar_holidays_and_special_sessions(self):
+        d = datetime.date
+        path = self.write_calendar(years=[2026], holidays={"2026-10-15": "Test holiday"},
+                                   special_sessions={"2026-10-17": "Special Saturday"})
+        cal = news.load_calendar(path)
+        self.assertEqual(news.sessions_between(d(2026, 10, 14), d(2026, 10, 16), cal), 1)   # Thursday is shut
+        self.assertEqual(news.sessions_between(d(2026, 10, 16), d(2026, 10, 19), cal), 2)   # Saturday is open
+        self.assertFalse(news.is_session(d(2026, 10, 15), cal))
+        self.assertTrue(news.is_session(d(2026, 10, 17), cal))
+        self.assertIsNone(news.load_calendar("none.json"))
+        with open("bad.json", "w") as fh:
+            fh.write("{not json")
+        with self.assertRaises(news.NewsError):
+            news.load_calendar("bad.json")
+
+    def test_parse_meetings(self):
+        rows = news.parse_meetings(raw(os.path.join("calendar", "meetings-HINDCOPPER.json")), "HINDCOPPER")
+        self.assertEqual([(m["date"].isoformat(), m["results"], m["dividend"]) for m in rows],
+                         [("2026-10-16", True, True), ("2026-11-20", False, False), ("2026-10-01", True, False)])
+        tcs = news.parse_meetings(raw(os.path.join("calendar", "meetings-TCS.json")), "TCS")
+        self.assertEqual((tcs[0]["results"], tcs[0]["dividend"]), (True, True))      # "Financial Results/Dividend"
+        self.assertEqual(news.parse_meetings(b'{"data": []}', "INFY"), [])
+        with self.assertRaises(news.NewsError):
+            news.parse_meetings(b"<html>Access Denied</html>", "INFY")
+
+    def test_results_soon_within_two_sessions(self):
+        f = news.Fetcher(offline=self.dir)
+        watch = {"HINDCOPPER": None, "RELIANCE": None, "TCS": None, "WIPRO": None, "INFY": None}
+        now = news.parse_now(NOW)
+        events = news.collect_calendar(f, watch, now)
+        by = {e["ticker"]: e for e in events}
+        self.assertEqual(sorted(by), ["HINDCOPPER", "RELIANCE", "TCS", "WIPRO"])     # INFY: empty list, nothing
+        self.assertEqual((by["TCS"]["sessions_away"], by["TCS"]["soon"]), (0, True))
+        self.assertEqual((by["HINDCOPPER"]["sessions_away"], by["HINDCOPPER"]["soon"]), (2, True))
+        self.assertTrue(by["HINDCOPPER"]["results"] and by["HINDCOPPER"]["dividend"])   # both tags
+        self.assertEqual((by["RELIANCE"]["sessions_away"], by["RELIANCE"]["soon"]), (3, False))   # Thu, Fri, Mon
+        self.assertEqual((by["WIPRO"]["dividend"], by["WIPRO"]["results"], by["WIPRO"]["soon"]), (True, False, False))
+        self.assertEqual([e["ticker"] for e in events], ["TCS", "HINDCOPPER", "RELIANCE", "WIPRO"])   # by date
+        self.assertEqual(len([e for e in events if e["ticker"] == "HINDCOPPER"]), 1)   # past and fund-raising dropped
+
+    def test_briefing_opens_with_the_warning(self):
+        code, out, err = run(["--tickers", "HINDCOPPER", "RELIANCE", "TCS", "WIPRO", "INFY"] + self.base)
+        lines = out.splitlines()
+        self.assertRegex(lines[0], r"^RESULTS SOON  TCS\s+results and dividend board date 2026-10-14 \(Wed\), today: gap risk")
+        self.assertRegex(lines[1], r"^RESULTS SOON  HINDCOPPER\s+results and dividend board date 2026-10-16 \(Fri\), "
+                                   r"2 sessions away: gap risk, an overnight gap can jump past an intraday stop")
+        self.assertRegex(lines[2], r"^coming up\s+RELIANCE\s+results 2026-10-19 \(Mon\), 3 sessions away$")
+        self.assertRegex(lines[3], r"^coming up\s+WIPRO\s+dividend board date 2026-10-30 \(Fri\), 12 sessions away$")
+        self.assertEqual(lines[4], "")
+        self.assertNotIn("INFY", "\n".join(lines[:4]))
+        self.assertNotIn(chr(0x2014), out)
+        code, out, err = run(["--tickers", "RELIANCE", "TCS", "--json"] + self.base)
+        data = json.loads(out)
+        self.assertEqual(data["results_soon"], ["TCS"])
+        self.assertEqual([e["date"] for e in data["calendar"]], ["2026-10-14", "2026-10-19"])
+
+    def test_holidays_from_the_calendar_file_pull_results_closer(self):
+        args = ["--tickers", "RELIANCE", "--json"] + self.base
+        self.assertEqual(json.loads(run(args)[1])["results_soon"], [])               # weekends only: 3 sessions
+        path = self.write_calendar(years=[2026], holidays={"2026-10-15": "Test holiday"})
+        data = json.loads(run(args + ["--calendar", path])[1])
+        self.assertEqual(data["results_soon"], ["RELIANCE"])                         # Thursday shut: 2 sessions
+        self.assertEqual(data["calendar"][0]["sessions_away"], 2)
+        self.assertEqual([n for n in data["notes"] if "holiday calendar" in n], [])
+
+    def test_calendar_that_misses_the_year_says_so_and_counts_weekends(self):
+        path = self.write_calendar(years=[2025], holidays={"2026-10-15": "Would be shut"})
+        data = json.loads(run(["--tickers", "RELIANCE", "--json", "--calendar", path] + self.base)[1])
+        self.assertEqual(data["calendar"][0]["sessions_away"], 3)
+        self.assertEqual(len([n for n in data["notes"] if "does not cover 2026" in n]), 1)
+
+    def test_the_morning_briefing_still_has_the_news(self):
+        code, out, err = run(["--tickers", "HINDCOPPER", "--hours", "6", "--now", "2026-10-19T10:15:00+05:30",
+                              "--offline", DIR, "--state", "s.json", "--no-moves", "--no-deals", "--dry-run",
+                              "--portfolio", "x", "--watchlist", "x", "--plan", "x"])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("RESULTS SOON", out)                        # no meetings file: nothing to warn about
+        self.assertIn("2026-10-19 09:40 IST  HINDCOPPER", out)
+
+    def test_bot_wall_is_one_note_and_the_news_stays(self):
+        calls = []
+
+        def walled(self_, url, name, ticker):
+            calls.append(url)
+            raise news.NewsError("NSE keeps refusing (a block page or HTTP 401/403 even after a fresh session)")
+        def feeds(self_, url, name):
+            if not os.path.isfile(os.path.join(DIR, name)):
+                raise news.NewsError("HTTP 404 for %s" % url)
+            return raw(name)
+        news.Fetcher.nse_json = walled
+        news.Fetcher.get = feeds
+        code, out, err = run(["--tickers", "RELIANCE", "TCS", "--hours", "24", "--state", "s.json", "--now", NOW,
+                              "--no-moves", "--no-deals", "--portfolio", "x", "--watchlist", "x", "--plan", "x"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Reliance Industries Q2 net profit rises 9%", out)
+        self.assertEqual(len([l for l in out.splitlines() if l.startswith("note: NSE board meetings")]), 1)
+        self.assertIn("results dates not checked", out)
+        self.assertNotIn("RESULTS SOON", out)
+        self.assertEqual(len([c for c in calls if "corporate-board-meetings" in c]), 1)   # TCS was not tried
 
 
 if __name__ == "__main__":

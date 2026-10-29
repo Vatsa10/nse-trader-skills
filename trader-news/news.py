@@ -532,6 +532,95 @@ def fetch_deals(fetcher, watch, now, days=DEAL_DAYS, errors=None):
     return rows
 
 
+def load_calendar(path):
+    """trader/data/calendar.json ({"years": [..], "holidays": {"YYYY-MM-DD": name},
+    "special_sessions": {..}}, from trader-data) -> {"years", "holidays", "special"} or None if absent."""
+    try:
+        doc = load_json(path)
+    except (OSError, ValueError):
+        raise NewsError("%s is not valid JSON; counting weekends only" % path)
+    if not isinstance(doc, dict):
+        return None
+    return {"years": {str(y) for y in doc.get("years") or []}, "holidays": set(doc.get("holidays") or {}),
+            "special": set(doc.get("special_sessions") or {})}
+
+
+def is_session(day, cal=None):
+    """Is NSE open that day? Weekends are shut and so are the calendar's holidays, unless
+    the calendar lists the day as a special session."""
+    if cal and day.isoformat() in cal["special"]:
+        return True
+    return day.weekday() < 5 and not (cal and day.isoformat() in cal["holidays"])
+
+
+def sessions_between(start, end, cal=None):
+    """NSE sessions after start up to and including end: 0 for the same day, 1 for the next
+    session. Negative when end is before start."""
+    if end < start:
+        return -sessions_between(end, start, cal)
+    return sum(1 for i in range(1, (end - start).days + 1) if is_session(start + _dt.timedelta(days=i), cal))
+
+
+def parse_meetings(data, ticker):
+    """NSE corporate-board-meetings JSON -> [{"ticker", "date", "purpose", "results", "dividend"}].
+    A purpose with "financial results" is a results date, one with "dividend" a dividend board date."""
+    out = []
+    for r in _rows(data, "board meetings for %s" % ticker):
+        sym = str(r.get("bm_symbol") or ticker).strip().upper()
+        when = parse_date(r.get("bm_date"))
+        if sym != ticker or when is None:
+            continue
+        purpose = " ".join(str(r.get("bm_purpose") or r.get("bm_desc") or "").split())
+        low = purpose.lower()
+        out.append({"ticker": ticker, "date": when, "purpose": purpose,
+                    "results": "financial results" in low, "dividend": "dividend" in low})
+    return out
+
+
+def collect_calendar(fetcher, watch, now, cal=None, errors=None):
+    """Results and dividend board dates from today on, for your symbols, soonest first. A results
+    date within RESULTS_SOON sessions is "soon". If NSE blocks: one note, the rest is skipped."""
+    errors = [] if errors is None else errors
+    today = to_ist(now).date()
+    if cal and cal["years"] and str(today.year) not in cal["years"]:
+        errors.append("holiday calendar does not cover %s; counting weekends only for results dates" % today.year)
+        cal = None
+    out = []
+    for t in sorted(watch):
+        try:
+            meetings = parse_meetings(fetcher.nse_json(NSE_MEETINGS % urllib.parse.quote(t), "meetings-%s.json" % t, t), t)
+        except NewsError as exc:
+            if fetcher.offline and "no file" in str(exc):
+                continue
+            errors.append("NSE board meetings: %s; results dates not checked, the rest is unaffected" % exc)
+            break
+        for m in meetings:
+            if m["date"] < today or not (m["results"] or m["dividend"]):
+                continue
+            away = sessions_between(today, m["date"], cal)
+            m = dict(m, sessions_away=away, soon=m["results"] and away <= RESULTS_SOON)
+            if m["soon"] or (m["date"] - today).days <= CALENDAR_DAYS:
+                out.append(m)
+    out.sort(key=lambda m: (m["date"], m["ticker"]))
+    return out
+
+
+def render_calendar(events):
+    """RESULTS SOON lines first (gap risk), then the other dates coming up."""
+    out = []
+    for m in sorted(events, key=lambda m: (not m["soon"], m["date"], m["ticker"])):
+        what = " and ".join((["results"] if m["results"] else []) + (["dividend board date"] if m["dividend"] else []))
+        away = m["sessions_away"]
+        when = "%s (%s), %s" % (m["date"].isoformat(), m["date"].strftime("%a"),
+                                "today" if away == 0 else "%d session%s away" % (away, "" if away == 1 else "s"))
+        if m["soon"]:
+            out.append("RESULTS SOON  %-11s %s %s: gap risk, an overnight gap can jump past an intraday stop" % (
+                m["ticker"], what, when))
+        else:
+            out.append("coming up     %-11s %s %s" % (m["ticker"], what, when))
+    return out
+
+
 def manual_links(ticker):
     q = urllib.parse.quote(ticker)
     return ("open by hand: %s (NSE announcements), https://finance.yahoo.com/quote/%s.NS/news, "
@@ -771,9 +860,13 @@ def render_flow(flow):
     return out
 
 
-def render(items, errors, now, moves=None, move_pct=MOVE_PCT, flow=None):
-    out = render_moves(moves or [], move_pct)
+def render(items, errors, now, moves=None, move_pct=MOVE_PCT, flow=None, calendar=None):
+    out = render_calendar(calendar or [])
     if out:
+        out.append("")
+    moved = render_moves(moves or [], move_pct)
+    out += moved
+    if moved:
         out.append("")
     if not items:
         out.append("Nothing new.")
@@ -823,6 +916,9 @@ def main(argv=None):
     ap.add_argument("--no-deals", action="store_true", help="skip NSE bulk, block and short-selling deals")
     ap.add_argument("--deal-days", type=int, default=DEAL_DAYS,
                     help="deals window in days, also the net buy/sell window (max 365)")
+    ap.add_argument("--no-calendar", action="store_true", help="skip NSE board meetings (results dates)")
+    ap.add_argument("--calendar", default=os.path.join(DATA_DIR, "calendar.json"),
+                    help="trader-data holiday calendar, used to count sessions (default: weekends only)")
     ap.add_argument("--cache", action="store_true",
                     help="moves from the trader-data cache (trader/data/intraday, then daily), not Yahoo")
     ap.add_argument("--now", help="ISO time, for reproducible runs (no offset = IST)")
@@ -860,13 +956,23 @@ def main(argv=None):
     flow_shown = [f for f in flow if args.all or any(
         i["kind"] == "deal" and i["ticker"] == f["symbol"] for i in shown)]
     moves = [] if args.no_moves else collect_moves(fetcher, watch, errors, cache=args.cache)
+    events = []
+    if not args.no_calendar:
+        try:
+            cal = load_calendar(args.calendar)
+        except NewsError as exc:
+            cal = None
+            errors.append(str(exc))
+        events = collect_calendar(fetcher, watch, now, cal, errors)
     if args.json:
         mv = [dict(m, time=m["time"].isoformat() if m.get("time") else None,
                    moving=abs(m["pct"]) >= args.move_pct) for m in moves]
-        print(json.dumps({"checked": now.isoformat(), "moves": mv, "items": _json_ready(shown),
-                          "deal_flow": flow, "notes": errors}, indent=2, ensure_ascii=False))
+        ev = [dict(e, date=e["date"].isoformat()) for e in events]
+        print(json.dumps({"checked": now.isoformat(), "results_soon": [e["ticker"] for e in events if e["soon"]],
+                          "calendar": ev, "moves": mv, "items": _json_ready(shown), "deal_flow": flow,
+                          "notes": errors}, indent=2, ensure_ascii=False))
     else:
-        sys.stdout.write(render(shown, errors, now, moves, args.move_pct, flow_shown))
+        sys.stdout.write(render(shown, errors, now, moves, args.move_pct, flow_shown, events))
     if not args.dry_run:
         remember(items, state, now)
         folder = os.path.dirname(args.state)
