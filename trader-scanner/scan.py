@@ -14,6 +14,7 @@
     python3 scan.py longterm --screen near_52w_low --near-low 10
     python3 scan.py patterns                          # VCP, double bottom, flag, triangle, inverse H&S, support
     python3 scan.py patterns --pattern vcp --state coiled
+    python3 scan.py breadth                           # market breadth -> trader/data/breadth.csv
 
 universe  Downloads an NSE symbol list and writes one SYMBOL|Name a line.
           Default (--source nifty500): niftyindices.com's Nifty 500 constituents
@@ -63,6 +64,12 @@ longterm  Long-term screen of the trader-data daily cache
                            last 252 sessions, 5 % retrace filter, stable after 40
                            bars): the change-of-character level (swing_coc) has held
             swing_reversal_up  the engine's trend turned up on the last bar
+            rs_positive    Mansfield relative strength over the Nifty is above zero and
+                           above its value 5 sessions ago (needs a benchmark: below)
+          mansfield_rs = (RS / its 22-day average - 1) x 100 with RS = stock close /
+          index close x 100 on the common dates. Benchmark: trader/data/index/
+          nifty-50.csv, else trader/data/daily/NIFTYBEES.adj.csv, else NIFTYBEES.csv;
+          none = mansfield_rs null and a note.
           Each hit carries swing_trend, swing_coc (a closing-basis structural stop),
           swing_event and swing_bars_since.
           --screen NAME keeps only that screen (default: any). Liquidity:
@@ -82,6 +89,15 @@ patterns  Chart patterns in the trader-data daily cache (real highs and lows, th
           target (a measured move, null for vcp and rising_support), anchor_date,
           pivots, vol_x, vol_dry and first_seen. Writes trader/watchlist.json
           (mode patterns). Daily bars only: no intraday patterns. No network.
+
+breadth   Market breadth from the adjusted daily cache (<SYMBOL>.adj.csv), the
+          last 500 dates: percent of stocks above their 50- and 200-day
+          averages, net new highs (over the 252 sessions before), the A/D line
+          (a ratio line) and the McClellan oscillator (19 and 39 EMAs of the net
+          advance ratio, each seeded with the plain average of its first n
+          values). Writes trader/data/breadth.csv; when that file exists the
+          other scans print a one-line regime note. Current constituents only,
+          so the history is survivorship-biased (said every time).
 
 orb       Opening-range breakouts, 5-minute bars. The session is 09:15 to
           15:30 IST (75 five-minute bars). The range is the first
@@ -166,6 +182,16 @@ SWING_RETRACE = 5.0   # daily swing engine: pullbacks under this percent of the 
 SWING_MIN_BARS = 40   # the engine's trend counts as stable only after this many bars (SwingTrend docs: feed 60+)
 SWING_FEED = YEAR_BARS   # bars fed to the engine for the long-term tags: a fixed warm-up window
 SWING_PULLBACK_MIN, SWING_PULLBACK_MAX = 3, 15   # swing_pullback: bars since the swing high formed (ours)
+MANSFIELD_DAILY = 22     # Mansfield relative strength: the average of the ratio over this many daily bars (eod2 notes)
+MANSFIELD_RISE_BARS = 5  # rs_positive wants the Mansfield value above what it was this many sessions ago (ours)
+BREADTH_FAST, BREADTH_SLOW = 19, 39   # McClellan EMA lengths
+BREADTH_SMA = (50, 200)  # the moving averages "percent above" counts
+BREADTH_HIGH_BARS = YEAR_BARS   # a new high beats the highest high of the 252 sessions before it
+BREADTH_DAYS = 500       # dates written to breadth.csv (about two years); 0 = every date in the cache (ours)
+BREADTH_STRONG, BREADTH_WEAK = 60.0, 40.0   # percent above the 200-day: broad strength / weak (ours)
+BREADTH_COLUMNS = ["date", "pct_50", "pct_200", "net_new_highs", "ad_line", "mcclellan_osc", "net_adv_ratio",
+                   "fast_ema", "slow_ema"]
+BREADTH_CAVEAT = "current constituents only, so the history is survivorship-biased"
 NIFTY500_FILE = "ind_nifty500list.csv"
 NIFTY500_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 EQUITY_FILE = "EQUITY_L.csv"
@@ -1729,6 +1755,146 @@ def fallback_list(why=None):
     raise ScanError("%sno trader/data/universe.csv and no bundled snapshot. Next: %s" % (lead, DATA_HINT))
 
 
+# ---------------------------------------------------------------- relative strength
+
+def mansfield_series(stock, bench, n=MANSFIELD_DAILY):
+    """stock: [(date, close)] ascending, bench: {date: close}. Joined on the common dates:
+    Dorsey RS = stock / index x 100, Mansfield RS = (RS / mean of the last n RS - 1) x 100.
+    -> [(date, dorsey, mansfield or None)]; Mansfield starts at the n-th common date."""
+    rs = [(d, c / bench[d] * 100.0) for d, c in stock if bench.get(d)]
+    out = []
+    for i, (d, v) in enumerate(rs):
+        m = None
+        if i >= n - 1:
+            avg = sum(x for _, x in rs[i - n + 1:i + 1]) / n
+            m = (v / avg - 1) * 100.0 if avg else None
+        out.append((d, v, m))
+    return out
+
+
+def read_benchmark(data_dir=None):
+    """The relative-strength benchmark's closes -> ({date: close}, name, note). trader/data/index/nifty-50.csv
+    (trader-data), else NIFTYBEES (.adj.csv first) in trader/data/daily, else none and a note saying so."""
+    base = data_dir or DATA_DIR
+    for name, path in (("Nifty 50 index", os.path.join(base, "index", "nifty-50.csv")),
+                       ("NIFTYBEES", daily_cache_path("NIFTYBEES", base))):
+        if not os.path.exists(path):
+            continue
+        try:
+            rows = read_daily_csv(path)
+        except OSError:
+            continue
+        if rows:
+            return {r[0]: r[4] for r in rows}, name, ""
+    return {}, None, ("no benchmark (neither %s nor NIFTYBEES in %s): mansfield_rs is null and rs_positive is off"
+                      % (os.path.join(base, "index", "nifty-50.csv"), os.path.join(base, "daily")))
+
+
+# ---------------------------------------------------------------- market breadth
+
+def ema_series(values, n):
+    """EMA with alpha 2 / (n + 1), seeded with the plain average of the first n values and first given on the n-th
+    value. -> a list the length of `values`, None before the seed."""
+    out, prev = [], None
+    alpha = 2.0 / (n + 1)
+    for i, x in enumerate(values):
+        if i + 1 < n:
+            out.append(None)
+            continue
+        prev = sum(values[:n]) / float(n) if i + 1 == n else prev + alpha * (x - prev)
+        out.append(prev)
+    return out
+
+
+def breadth_series(rows_by_sym, sma=BREADTH_SMA, high_bars=BREADTH_HIGH_BARS, fast=BREADTH_FAST, slow=BREADTH_SLOW,
+                   days=0):
+    """Market breadth from daily rows ({SYM: [(date, o, h, l, c, v)]}): one dict per date with a bar.
+    pct_50 / pct_200: percent of the symbols (that have the history) closing above their moving average. A new high is
+    a high over the highest high of the `high_bars` sessions before it (today excluded), a new low likewise;
+    net_new_highs is the running sum of highs minus lows. A symbol advances when it closes over its own previous
+    close; net_adv_ratio = (advances - declines) / symbols with a previous close x 100, ad_line its running sum
+    divided by 100 (a ratio line, not counts). fast and slow EMAs of net_adv_ratio (seeded with the plain average
+    of the first n); mcclellan_osc = fast - slow. Dates with no symbol that has a previous close are skipped.
+    `days` keeps only the last N dates (0 = all)."""
+    all_dates = sorted({r[0] for rows in rows_by_sym.values() for r in rows})
+    first = all_dates[-days] if days and len(all_dates) > days else None
+    acc = {}
+    for rows in rows_by_sym.values():
+        c, hs, ls = [r[4] for r in rows], [r[2] for r in rows], [r[3] for r in rows]
+        pre = [0.0]
+        for x in c:
+            pre.append(pre[-1] + x)
+        for i, r in enumerate(rows):
+            if first is not None and r[0] < first:
+                continue
+            a = acc.setdefault(r[0], [0, 0, 0, 0, 0, 0, 0, 0, 0])
+            for k, n in enumerate(sma):
+                if i + 1 >= n:
+                    a[2 * k] += 1
+                    if c[i] > (pre[i + 1] - pre[i + 1 - n]) / n:
+                        a[2 * k + 1] += 1
+            if i >= high_bars:
+                if hs[i] > max(hs[i - high_bars:i]):
+                    a[4] += 1
+                if ls[i] < min(ls[i - high_bars:i]):
+                    a[5] += 1
+            if i >= 1:
+                a[8] += 1
+                if c[i] > c[i - 1]:
+                    a[6] += 1
+                elif c[i] < c[i - 1]:
+                    a[7] += 1
+    dates = [d for d in sorted(acc) if acc[d][8]]
+    ratios = [(acc[d][6] - acc[d][7]) * 100.0 / acc[d][8] for d in dates]
+    fast_ema, slow_ema = ema_series(ratios, fast), ema_series(ratios, slow)
+    out, nnh, ad = [], 0, 0.0
+    for i, d in enumerate(dates):
+        a = acc[d]
+        nnh += a[4] - a[5]
+        ad += ratios[i] / 100.0
+        out.append({"date": d.isoformat(), "pct_50": round(a[1] * 100.0 / a[0], 2) if a[0] else None,
+                    "pct_200": round(a[3] * 100.0 / a[2], 2) if a[2] else None, "net_new_highs": nnh,
+                    "ad_line": round(ad, 4),
+                    "mcclellan_osc": round(fast_ema[i] - slow_ema[i], 4) if slow_ema[i] is not None else None,
+                    "net_adv_ratio": round(ratios[i], 2),
+                    "fast_ema": round(fast_ema[i], 4) if fast_ema[i] is not None else None,
+                    "slow_ema": round(slow_ema[i], 4) if slow_ema[i] is not None else None})
+    return out
+
+
+def write_breadth(path, series):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(BREADTH_COLUMNS)
+        for r in series:
+            w.writerow(["" if r[k] is None else r[k] for k in BREADTH_COLUMNS])
+
+
+def regime_note(data_dir=None):
+    """One line about the market from the newest row of breadth.csv, or '' when there is no such file."""
+    path = os.path.join(data_dir or DATA_DIR, "breadth.csv")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        r = rows[-1]
+
+        def num(k):
+            return float(r[k]) if (r.get(k) or "").strip() else None
+        p50, p200, mc = num("pct_50"), num("pct_200"), num("mcclellan_osc")
+        gauge = p200 if p200 is not None else p50
+        if gauge is None:
+            return ""
+    except (OSError, ValueError, IndexError, KeyError):
+        return ""
+    word = "broad strength" if gauge >= BREADTH_STRONG else "weak" if gauge <= BREADTH_WEAK else "mixed"
+    return "Market breadth %s: %s (%s above the 200-day average, %s above the 50-day%s)." % (
+        r["date"], word, ("%.0f%%" % p200) if p200 is not None else "-", ("%.0f%%" % p50) if p50 is not None else "-",
+        (", McClellan %+.1f" % mc) if mc is not None else "")
+
+
 # ---------------------------------------------------------------- long-term screen
 
 LT_SCREENS = [
@@ -1738,12 +1904,14 @@ LT_SCREENS = [
     ("oversold", "oversold (RSI under 30)"),
     ("swing_up", "swing structure up (change-of-character level holding)"),
     ("swing_reversal_up", "swing trend just reversed up"),
+    ("rs_positive", "relative strength over the Nifty positive and rising (Mansfield)"),
 ]
 LT_LABEL = dict(LT_SCREENS)
 
 
-def longterm_metrics(rows):
-    """Daily rows (ascending, >= LT_BARS) -> the numbers the long-term screen reads."""
+def longterm_metrics(rows, bench=None):
+    """Daily rows (ascending, >= LT_BARS) -> the numbers the long-term screen reads. `bench` is {date: close} of
+    the relative-strength benchmark (None or empty = mansfield_rs is None)."""
     c = [r[4] for r in rows]
     yr = rows[-YEAR_BARS:]
     last = c[-1]
@@ -1754,7 +1922,10 @@ def longterm_metrics(rows):
     vol20 = sum(r[5] for r in rows[-20:]) / float(min(20, len(rows)))
     r = rsi(c[-120:])
     sw = swing_info([(x[2], x[3], x[4]) for x in rows[-SWING_FEED:]])
-    return {"close": last, "dma50": dma50, "dma200": dma200, "vs_200dma_pct": (last / dma200 - 1) * 100,
+    ms = [x[2] for x in mansfield_series([(x[0], x[4]) for x in rows[-SWING_FEED:]], bench)] if bench else []
+    ms = [v for v in ms if v is not None]
+    return {"close": last, "mansfield_rs": ms[-1] if ms else None,
+            "mansfield_prev": ms[-1 - MANSFIELD_RISE_BARS] if len(ms) > MANSFIELD_RISE_BARS else None, "dma50": dma50, "dma200": dma200, "vs_200dma_pct": (last / dma200 - 1) * 100,
             "high52": hi, "low52": lo, "from_high_pct": (last / hi - 1) * 100,
             "above_low_pct": (last / lo - 1) * 100 if lo > 0 else None, "rsi": r, "avg_volume20": vol20,
             "ret_1y_pct": (last / yr[0][4] - 1) * 100 if yr[0][4] else None, "bars": len(rows),
@@ -1773,12 +1944,16 @@ def longterm_tags(m, near_high=5.0, near_low=10.0):
     if m["rsi"] is not None and m["rsi"] < 30:
         tags.append("oversold")
     tags.extend(swing_tag_list(m["swing_trend"], m["swing_event"], m["swing_stable"]))
+    if m["mansfield_rs"] is not None and m["mansfield_prev"] is not None and 0 < m["mansfield_rs"] and \
+            m["mansfield_rs"] > m["mansfield_prev"]:
+        tags.append("rs_positive")
     return tags
 
 
 def scan_longterm(rows_by_sym, symbols, min_price=20.0, min_volume=100000, screen=None, near_high=5.0,
-                  near_low=10.0):
-    """Pure. rows_by_sym = {SYM: daily rows}. Returns (hits, counts, last_date)."""
+                  near_low=10.0, benchmark=None):
+    """Pure. rows_by_sym = {SYM: daily rows}; benchmark = {date: close} for the relative-strength columns.
+    Returns (hits, counts, last_date)."""
     counts = {"requested": len(symbols), "cached": 0, "short": 0, "illiquid": 0, "scanned": 0}
     hits, dates = [], {}
     for sym in symbols:
@@ -1789,7 +1964,7 @@ def scan_longterm(rows_by_sym, symbols, min_price=20.0, min_volume=100000, scree
         if len(rows) < LT_BARS:
             counts["short"] += 1
             continue
-        m = longterm_metrics(rows)
+        m = longterm_metrics(rows, benchmark)
         if m["close"] < min_price or m["avg_volume20"] < min_volume:
             counts["illiquid"] += 1
             continue
@@ -1811,7 +1986,8 @@ def scan_longterm(rows_by_sym, symbols, min_price=20.0, min_volume=100000, scree
                      "avg_volume20": int(m["avg_volume20"]), "full_year": m["full_year"],
                      "swing_trend": m["swing_trend"],
                      "swing_coc": round(m["swing_coc"], 2) if m["swing_coc"] is not None else None,
-                     "swing_event": m["swing_event"], "swing_bars_since": m["swing_bars_since"]})
+                     "swing_event": m["swing_event"], "swing_bars_since": m["swing_bars_since"],
+                     "mansfield_rs": round(m["mansfield_rs"], 2) if m["mansfield_rs"] is not None else None})
     if screen == "near_52w_low":
         hits.sort(key=lambda h: (h["above_low_pct"], h["symbol"]))
     else:
@@ -1938,6 +2114,9 @@ def cmd_daily(a):
         doc["cache_note"] = cnote
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
+    regime = regime_note(DATA_DIR)
+    if regime:
+        doc["regime"] = regime
     if not a.no_write:
         write_json(a.out, doc)
     if a.json:
@@ -1948,6 +2127,8 @@ def cmd_daily(a):
         local.strftime("%a %Y-%m-%d %H:%M"), last_date.isoformat() if last_date else "nothing",
         {"yahoo": "Yahoo spark, daily closes only", "cache": "trader-data cache, highs and lows",
          "yahoo+cache": "Yahoo spark + trader-data cache"}[source]))
+    if regime:
+        print(regime)
     note_out(a, cnote)
     print("Fetched %s of %s charts%s. %s passed the liquidity filter (₹%s+ and %s+ shares)%s; "
           "%s scanned." % (indian(counts["fetched"]), indian(len(symbols)),
@@ -2084,6 +2265,9 @@ def cmd_orb(a):
         doc["cache_note"] = cnote
     if tfilter:
         doc["trend_filter"] = tfilter
+    regime = regime_note(a.data_dir or DATA_DIR)
+    if regime:
+        doc["regime"] = regime
     if not a.no_write:
         write_json(a.out, doc)
     if a.json:
@@ -2093,6 +2277,8 @@ def cmd_orb(a):
     print("Opening-range breakout scan, %s %s IST: %d-minute range (9:15 to %s), 5-minute bars, %s."
           % (day_label(day), clock_label(cutoff), a.or_minutes, clock_label(slot(day, a.or_minutes // BAR_MIN)),
              {"cache": "trader-data cache", "yahoo+cache": "Yahoo + trader-data cache"}.get(source, "Yahoo")))
+    if regime:
+        print(regime)
     print("Fetched %s of %s charts%s; %s usable%s; %s candidates, %s confirmed with real highs and lows."
           % (indian(counts["fetched"]), indian(len(symbols)),
              (" (%s failed or had no data)" % indian(nfailed)) if nfailed else "",
@@ -2173,18 +2359,24 @@ def cmd_longterm(a):
     if not rows:
         raise ScanError("no daily cache in %s for these symbols. Next: run `python3 trader-data/data.py daily "
                         "SYMBOL [SYMBOL ...]`, or %s" % (daily_dir, DATA_HINT))
+    bench, bench_name, bench_note = read_benchmark(data_dir)
     hits, counts, last_date = scan_longterm(rows, symbols, a.min_price, a.min_volume, a.screen, a.near_high,
-                                            a.near_low)
+                                            a.near_low, bench)
     lasts = [r[-1][0] for r in rows.values() if r]
     cnote = cache_note("daily", len(rows), lasts)
     stale = last_date and (to_ist(now).date() - last_date).days > 5
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "longterm",
            "as_of": ("%s close" % last_date.isoformat()) if last_date else None, "universe": len(symbols),
            "scanned": counts["scanned"], "missing": len(missing), "source": "cache", "cache_note": cnote,
-           "screen": a.screen or "any",
+           "screen": a.screen or "any", "benchmark": bench_name,
            "filters": {"min_price": a.min_price, "min_volume": a.min_volume, "near_high_pct": a.near_high,
                        "near_low_pct": a.near_low},
            "note": NOTE + " Not financial advice.", "hits": hits}
+    if bench_note:
+        doc["benchmark_note"] = bench_note
+    regime = regime_note(data_dir)
+    if regime:
+        doc["regime"] = regime
     if not a.no_write:
         write_json(a.out, doc)
     if a.json:
@@ -2192,7 +2384,10 @@ def cmd_longterm(a):
         return 0 if hits else 1
     print("Long-term screen, closes through %s (trader-data daily cache)." % (
         last_date.isoformat() if last_date else "nothing"))
+    if regime:
+        print(regime)
     note_out(a, cnote)
+    note_out(a, bench_note)
     if stale:
         print("Note: the newest close is %s, more than 5 days old: refresh with `python3 trader-data/data.py "
               "daily SYMBOL`." % last_date.isoformat())
@@ -2208,14 +2403,15 @@ def cmd_longterm(a):
     if hits:
         per = [(k, sum(1 for h in hits if k in h["setups"])) for k, _ in LT_SCREENS]
         print("%d matched: %s." % (len(hits), ", ".join("%d %s" % (n, LT_LABEL[k]) for k, n in per if n)))
-        print("  %-10s %12s %12s %8s %12s %8s %12s %8s %6s %-14s  %s" % (
-            "SYMBOL", "CLOSE", "200-DMA", "VS 200", "52W HIGH", "OFF HI", "52W LOW", "OVER LO", "RSI", "SWING COCH",
-            "SCREENS"))
+        print("  %-10s %12s %12s %8s %12s %8s %12s %8s %6s %7s %-14s  %s" % (
+            "SYMBOL", "CLOSE", "200-DMA", "VS 200", "52W HIGH", "OFF HI", "52W LOW", "OVER LO", "RSI", "RS",
+            "SWING COCH", "SCREENS"))
         for h in hits[:a.show]:
-            print("  %-10s %12s %12s %+7.1f%% %12s %+7.1f%% %12s %+7.1f%% %6s %-14s  %s" % (
+            print("  %-10s %12s %12s %+7.1f%% %12s %+7.1f%% %12s %+7.1f%% %6s %7s %-14s  %s" % (
                 h["symbol"], money(h["price"]), money(h["dma200"]), h["vs_200dma_pct"], money(h["high52"]),
                 h["from_high_pct"], money(h["low52"]), h["above_low_pct"] or 0.0,
-                ("%.1f" % h["rsi"]) if h["rsi"] is not None else "-", swing_text(h),
+                ("%.1f" % h["rsi"]) if h["rsi"] is not None else "-",
+                ("%+.1f" % h["mansfield_rs"]) if h["mansfield_rs"] is not None else "-", swing_text(h),
                 ", ".join(LT_LABEL[t] for t in h["setups"])))
         if len(hits) > a.show:
             print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, a.out))
@@ -2256,6 +2452,9 @@ def cmd_patterns(a):
            "pattern": a.pattern or "any", "state": a.state,
            "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
            "note": NOTE + " Not financial advice.", "hits": hits}
+    regime = regime_note(data_dir)
+    if regime:
+        doc["regime"] = regime
     if not a.no_write:
         write_json(a.out, doc)
     if a.json:
@@ -2263,6 +2462,8 @@ def cmd_patterns(a):
         return 0 if hits else 1
     print("Pattern scan, closes through %s (trader-data daily cache)." % (
         last_date.isoformat() if last_date else "nothing"))
+    if regime:
+        print(regime)
     note_out(a, cnote)
     if stale:
         print("Note: the newest close is %s, more than 5 days old: refresh with `python3 trader-data/data.py "
@@ -2295,6 +2496,73 @@ def cmd_patterns(a):
         print("Wrote %s (mode patterns, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
     print(NOTE + " Not financial advice. Next: /trader-news SYMBOL, then /trader-entry SYMBOL for the level.")
     return 0 if hits else 1
+
+
+def cmd_breadth(a):
+    now = parse_now(a.now)
+    data_dir = a.data_dir or DATA_DIR
+    daily_dir = os.path.join(data_dir, "daily")
+    symbols = read_symbols(a, cache_symbols(a, data_dir) or None)
+    rows, missing, unadjusted = {}, {}, []
+    for sym in symbols:
+        adj = os.path.join(daily_dir, "%s.adj.csv" % sym)
+        if not os.path.exists(adj) and not a.unadjusted:
+            if os.path.exists(daily_cache_path(sym, data_dir)):
+                unadjusted.append(sym)
+            else:
+                missing[sym] = adj
+            continue
+        path = daily_cache_path(sym, data_dir)
+        if not os.path.exists(path):
+            missing[sym] = path
+            continue
+        try:
+            got = read_daily_csv(path)
+        except OSError as e:
+            missing[sym] = "%s (%s)" % (path, e)
+            continue
+        if got:
+            rows[sym] = got
+    if not rows:
+        raise ScanError("no adjusted daily cache (<SYMBOL>.adj.csv) in %s for these symbols%s. Next: run `python3 "
+                        "trader-data/data.py daily SYMBOL [SYMBOL ...]`, or %s" % (
+                            daily_dir, (" (%s have only an unadjusted .csv: --unadjusted uses them, but a split "
+                                        "then fakes a new low)" % indian(len(unadjusted))) if unadjusted else "",
+                            DATA_HINT))
+    series = breadth_series(rows, days=BREADTH_DAYS if a.days is None else a.days)
+    out = a.out or os.path.join(data_dir, "breadth.csv")
+    if not a.no_write:
+        write_breadth(out, series)
+    last = series[-1] if series else None
+    doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "breadth",
+           "symbols": len(rows), "skipped_unadjusted": len(unadjusted), "missing": len(missing),
+           "rows": len(series), "out": None if a.no_write else out, "last": last, "caveat": BREADTH_CAVEAT,
+           "unadjusted_included": bool(a.unadjusted)}
+    if a.json:
+        print(json.dumps(doc, indent=2))
+        return 0 if series else 1
+    print("Market breadth from %s symbols in the trader-data daily cache%s." % (
+        indian(len(rows)), "" if a.unadjusted else " (adjusted .adj.csv files only)"))
+    if unadjusted:
+        print("Skipped %s with only an unadjusted .csv (a split would fake a new low): --unadjusted uses them."
+              % indian(len(unadjusted)))
+    if missing:
+        print("%s not in the cache: `python3 trader-data/data.py daily SYMBOL`." % indian(len(missing)))
+    if last:
+        print("%d dates, %s to %s. Latest %s:" % (len(series), series[0]["date"], last["date"], last["date"]))
+        print("  above the 50-day average  %s" % (("%.1f%%" % last["pct_50"]) if last["pct_50"] is not None else "-"))
+        print("  above the 200-day average %s" % (("%.1f%%" % last["pct_200"]) if last["pct_200"] is not None else
+                                                  "- (under 200 sessions of history)"))
+        print("  net new highs (running)   %+d" % last["net_new_highs"])
+        print("  A/D line (ratio, running) %+.2f" % last["ad_line"])
+        print("  McClellan oscillator      %s" % (("%+.2f" % last["mcclellan_osc"]) if last["mcclellan_osc"] is not None
+                                                  else "- (needs %d dates)" % BREADTH_SLOW))
+    else:
+        print("No dates with a previous close to compare.")
+    print("Caveat: %s." % BREADTH_CAVEAT)
+    if not a.no_write:
+        print("Wrote %s (%d rows). The other scans print a one-line regime note from it." % (out, len(series)))
+    return 0 if series else 1
 
 
 def main(argv=None):
@@ -2380,13 +2648,28 @@ def main(argv=None):
     p.add_argument("--no-write", action="store_true")
     p.add_argument("--show", type=int, default=50)
     p.add_argument("--json", action="store_true")
+    p = sub.add_parser("breadth", help="market breadth from the trader-data daily cache -> trader/data/breadth.csv")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--symbols", help="comma-separated NSE symbols instead of the universe")
+    g.add_argument("--watchlist", metavar="FILE", help="a watchlist.json (hits) or a text file of NSE symbols")
+    p.add_argument("--universe", help="symbol list (default %s; without it, every stock in the cache)"
+                   % DEFAULT_UNIVERSE)
+    p.add_argument("--limit", type=int)
+    p.add_argument("--unadjusted", action="store_true",
+                   help="also use symbols that have only an unadjusted <SYMBOL>.csv (a split fakes a new low)")
+    p.add_argument("--days", type=int, help="dates to write (%d; 0 = every date in the cache)" % BREADTH_DAYS)
+    p.add_argument("--data-dir", help="the trader-data folder (default %s)" % DATA_DIR)
+    p.add_argument("--now", help='pretend it is this time ("2026-10-29 08:30" IST)')
+    p.add_argument("--out", help="default <data-dir>/breadth.csv")
+    p.add_argument("--no-write", action="store_true")
+    p.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
         return 1
     try:
         return {"universe": cmd_universe, "daily": cmd_daily, "orb": cmd_orb, "longterm": cmd_longterm,
-                "patterns": cmd_patterns}[a.cmd](a)
+                "patterns": cmd_patterns, "breadth": cmd_breadth}[a.cmd](a)
     except ScanError as e:
         print("scan.py: %s" % e, file=sys.stderr)
         return 1

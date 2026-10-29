@@ -17,7 +17,10 @@ description: >-
   screen of the trader-data daily cache (above the 200-day average, near the
   52-week high, near the 52-week low as a value screen, RSI, and market
   structure: swing up with a change-of-character stop level, or a swing
-  reversal up). Free Yahoo data
+  reversal up; relative strength over the Nifty, Mansfield), and a market
+  breadth reading from the same cache (percent of stocks above their 50- and
+  200-day averages, net new highs, advance-decline line, McClellan oscillator)
+  that adds a one-line regime note to every scan. Free Yahoo data
   (SYMBOL.NS), bar by bar, with the trader-data cache as the fallback when
   Yahoo or NSE block the download. Use when the user says "scan the market", "find
   me setups", "what is breaking out on NSE", "opening range breakouts", "scan
@@ -27,9 +30,10 @@ description: >-
   swing uptrend", "swing reversal", "pullback in an uptrend", "change of
   character level", "only breakouts in an uptrend", "find VCP setups",
   "double bottoms", "chart patterns", "pole and flag", "inverse head and
-  shoulders", "stocks coiling under resistance", or at the start of a
-  trading day before /trader-news.
-argument-hint: "[universe | daily | orb | longterm | patterns] [--at HH:MM] [--cache] [--trend-filter]"
+  shoulders", "stocks coiling under resistance", "market breadth", "is the
+  market healthy", "McClellan", "relative strength vs Nifty", or at the start
+  of a trading day before /trader-news.
+argument-hint: "[universe | daily | orb | longterm | patterns | breadth] [--at HH:MM] [--cache] [--trend-filter]"
 ---
 
 # trader-scanner
@@ -58,6 +62,7 @@ python3 "${CLAUDE_SKILL_DIR}/scan.py" longterm                       # long-term
 python3 "${CLAUDE_SKILL_DIR}/scan.py" longterm --screen near_52w_low --near-low 10
 python3 "${CLAUDE_SKILL_DIR}/scan.py" patterns                       # chart patterns -> trader/watchlist.json
 python3 "${CLAUDE_SKILL_DIR}/scan.py" patterns --pattern vcp --state coiled
+python3 "${CLAUDE_SKILL_DIR}/scan.py" breadth                        # market breadth -> trader/data/breadth.csv
 ```
 
 Flags: `--min-price 50` (rupees) and `--min-volume` (daily 500,000, orb 0),
@@ -81,6 +86,8 @@ scanner asks Yahoo for `SYMBOL.NS` (with `&` sent as `%26`) and drops a
 | `trader/data/daily/<SYMBOL>.csv` | read by `daily --cache`, `longterm`, and `daily` when Yahoo fails (written by trader-data; `<SYMBOL>.adj.csv` wins when present) |
 | `trader/data/intraday/<SYMBOL>-5m.json` | read by `orb --cache` and `orb` when Yahoo fails (written by trader-data, Yahoo v8 shape) |
 | `trader/data/universe.csv` | read by `universe` when niftyindices.com refuses (written by trader-data) |
+| `trader/data/index/nifty-50.csv` | read by `longterm` as the relative-strength benchmark when it exists (written by trader-data: `date,open,high,low,close,volume,pe,pb,div_yield`); else `trader/data/daily/NIFTYBEES.adj.csv`, else `NIFTYBEES.csv`; none means `mansfield_rs` is null, with a note |
+| `trader/data/breadth.csv` | written by `breadth`: `date,pct_50,pct_200,net_new_highs,ad_line,mcclellan_osc,net_adv_ratio,fast_ema,slow_ema`. When it exists every scan prints one regime line from its newest row (and puts it in the file as `regime`) |
 | `trader/data/calendar.json` | read for the trading calendar when it exists (written by trader-data): `years`, `holidays`, `special_sessions`. Missing or unreadable means the built-in 2026 table |
 | `nifty500-snapshot.csv` (+ `.json`) | bundled with this skill: the Nifty 500 list as of 2026-07-13, the last fallback |
 | `trader/watchlist.json` (patterns) | written by `patterns`: `mode: "patterns"`, per hit `pattern`, `state`, `level`, `stop`, `risk_pct`, `target`, `anchor_date`, `pivots`, `vol_x`, `vol_dry`, `first_seen`. It replaces the file the other scans wrote |
@@ -164,6 +171,7 @@ is no universe file. A stock needs at least 200 sessions. Per stock:
 | over the low | last close / 52-week low - 1, in percent |
 | RSI 14 | Wilder, on the last 120 closes |
 | swing trend, `swing_coc` | a market-structure engine (below) over the last 252 sessions |
+| `mansfield_rs` | Mansfield relative strength over the Nifty: (RS / its 22-session average - 1) x 100, with RS = stock close / index close x 100 on the dates both have; null without a benchmark |
 
 | screen | the rule |
 | --- | --- |
@@ -173,6 +181,7 @@ is no universe file. A stock needs at least 200 sessions. Per stock:
 | `oversold` | RSI 14 under 30 |
 | `swing_up` | the swing trend is up and stable (more than 40 bars fed) |
 | `swing_reversal_up` | the swing trend turned up on the last bar |
+| `rs_positive` | `mansfield_rs` is above zero and above what it was 5 sessions ago (`MANSFIELD_RISE_BARS`): outperforming and still gaining on the index |
 
 The swing engine is a one-pass, bar-by-bar market-structure tracker on
 highs, lows and closes. In an uptrend the first bar that fails to make a new
@@ -197,6 +206,35 @@ written to `trader/longterm.json`. The cache is as fresh as the last
 used and warns when the newest close is more than 5 days old. A screen is a
 starting list for reading annual reports and filings, not a list of stocks
 to buy. Not financial advice.
+
+## Market breadth and the regime line (no network)
+
+`breadth` builds a market-health series from the same cache. It reads only
+the split and bonus adjusted `<SYMBOL>.adj.csv` files (a split in an
+unadjusted file fakes a new 52-week low) for the universe, `--symbols`, or
+every stock in the cache, says how many unadjusted ones it skipped, and
+`--unadjusted` includes them anyway. It writes the last 500 dates
+(`--days 0` for all) to `trader/data/breadth.csv`. Per date, over the stocks
+that have a bar that day:
+
+| column | meaning |
+| --- | --- |
+| `pct_50`, `pct_200` | percent of stocks closing above their 50- and 200-day average (only stocks with that many sessions are counted) |
+| `net_new_highs` | running sum of new highs minus new lows, a new high being a high over the highest high of the 252 sessions before it |
+| `ad_line` | running sum of (advances - declines) / stocks with a previous close; a ratio line, not a count |
+| `net_adv_ratio` | (advances - declines) / stocks with a previous close x 100 |
+| `fast_ema`, `slow_ema` | 19- and 39-day EMAs of `net_adv_ratio`, each seeded with the plain average of its first 19 (39) values and first written on that date |
+| `mcclellan_osc` | `fast_ema` - `slow_ema`, first written on the 39th date |
+
+Every run prints the caveat: current constituents only, so the history is
+survivorship-biased (a stock that was delisted is not in it). Running sums
+(`net_new_highs`, `ad_line`) start at the first date written, so only their
+changes mean anything. The regime line the other scans print reads the
+newest row: 60 % or more above the 200-day average is "broad strength", 40 %
+or less "weak", between is "mixed" (`BREADTH_STRONG`, `BREADTH_WEAK`; ours).
+It is context for a human, not a gate: none of the scans uses it to drop a
+hit. If a scan shows no regime line, there is no `breadth.csv`: run `breadth`
+after a `trader-data daily` refresh.
 
 ## The chart-pattern scan (no network)
 
@@ -323,7 +361,10 @@ cache, under 41 daily bars, or no trend yet stays in the list, marked
    Give the counts, the dates of the closes, and the hits with state, level,
    stop and risk. A pattern is a shape on a chart, not a forecast; say when a
    hit is a `breakout` that has already moved. Never say "buy".
-7. For long-term ideas (no day trade): `scan.py longterm` after a
+7. For the market's health, `scan.py breadth` after a refresh. Give the
+   latest percent above the 200-day average and the McClellan reading, say it
+   is survivorship-biased, and never turn it into a call on the index.
+8. For long-term ideas (no day trade): `scan.py longterm` after a
    `trader-data daily` refresh. Give the counts, the dates of the closes, and
    the hits with their distance from the 52-week high and low; never call a
    52-week-low stock "cheap enough to buy".

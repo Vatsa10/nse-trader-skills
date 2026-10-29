@@ -1530,6 +1530,254 @@ class PatternsCli(unittest.TestCase):
         self.assertIn("trader-data/data.py daily", err)
 
 
+def flat_rows(closes, start=D(2026, 1, 5)):
+    """High = low = close, one calendar day apart: hand-countable breadth."""
+    return [(start + datetime.timedelta(days=i), c, c, c, c, 1000.0) for i, c in enumerate(closes)]
+
+
+class Breadth(unittest.TestCase):
+    """eod2.md ideas 5 and 6: breadth from the cache, and Mansfield relative strength."""
+
+    def test_ema_seed_and_update(self):
+        self.assertEqual(scan.ema_series([0, 30, 0], 2), [None, 15.0, 5.0])           # seed = mean of the first 2
+        self.assertEqual(scan.ema_series([0, 30, 0], 3), [None, None, 10.0])
+        self.assertEqual(scan.ema_series([1.0], 2), [None])
+
+    def test_three_symbols_four_days_by_hand(self):
+        rows = {"A": flat_rows([10, 11, 12, 11]), "B": flat_rows([20, 19, 18, 19]), "C": flat_rows([30, 30, 31, 31])}
+        out = scan.breadth_series(rows, sma=(2, 3), high_bars=2, fast=2, slow=3)
+        # day 1 has no previous close: skipped. Day 2: A up, B down, C unchanged; 1 of 3 over its 2-day average
+        self.assertEqual([r["date"] for r in out], ["2026-01-06", "2026-01-07", "2026-01-08"])
+        self.assertEqual(out[0], {"date": "2026-01-06", "pct_50": 33.33, "pct_200": None, "net_new_highs": 0,
+                                  "ad_line": 0.0, "mcclellan_osc": None, "net_adv_ratio": 0.0, "fast_ema": None,
+                                  "slow_ema": None})
+        # day 3: A and C up, B down: ratio (2 - 1) / 3; 2 of 3 over both averages; highs A and C, low B: net +1
+        self.assertEqual(out[1], {"date": "2026-01-07", "pct_50": 66.67, "pct_200": 66.67, "net_new_highs": 1,
+                                  "ad_line": 0.3333, "mcclellan_osc": None, "net_adv_ratio": 33.33,
+                                  "fast_ema": 16.6667, "slow_ema": None})     # the fast seed: (0 + 33.33) / 2
+        # day 4: A down, B up, C unchanged: ratio 0; the fast EMA moves 2/3 of the way to 0; the slow seed is the
+        # mean of the three ratios; the oscillator is fast - slow
+        self.assertEqual(out[2], {"date": "2026-01-08", "pct_50": 33.33, "pct_200": 66.67, "net_new_highs": 1,
+                                  "ad_line": 0.3333, "mcclellan_osc": -5.5556, "net_adv_ratio": 0.0,
+                                  "fast_ema": 5.5556, "slow_ema": 11.1111})
+        out = scan.breadth_series(rows, sma=(2, 3), high_bars=2, fast=2, slow=3, days=2)
+        self.assertEqual([r["date"] for r in out], ["2026-01-07", "2026-01-08"])      # the last two dates only
+        self.assertEqual(out[0]["fast_ema"], None)                                    # the series starts again there
+
+    def test_a_symbol_without_the_history_is_not_counted(self):
+        rows = {"OLD": flat_rows([10, 11, 12, 13, 14]), "NEW": flat_rows([5, 6], start=D(2026, 1, 8))}
+        out = scan.breadth_series(rows, sma=(3, 4), high_bars=2, fast=2, slow=3)
+        by = {r["date"]: r for r in out}
+        self.assertEqual(by["2026-01-09"]["pct_50"], 100.0)     # only OLD has 3 bars; it closes over its average
+        self.assertEqual(by["2026-01-09"]["net_adv_ratio"], 100.0)    # NEW has a previous close on the 9th: 2 of 2 up
+
+    def test_defaults_are_the_documented_ones(self):
+        self.assertEqual((scan.BREADTH_FAST, scan.BREADTH_SLOW, scan.BREADTH_SMA, scan.BREADTH_HIGH_BARS),
+                         (19, 39, (50, 200), 252))
+
+    def test_regime_note(self):
+        d = tempfile.mkdtemp()
+        try:
+            self.assertEqual(scan.regime_note(d), "")
+            rows = [{"date": "2026-10-28", "pct_50": 62.0, "pct_200": 66.67, "net_new_highs": 3, "ad_line": 1.0,
+                     "mcclellan_osc": 12.34, "net_adv_ratio": 5.0, "fast_ema": 1.0, "slow_ema": 1.0}]
+            scan.write_breadth(os.path.join(d, "breadth.csv"), rows)
+            with open(os.path.join(d, "breadth.csv"), encoding="utf-8") as fh:
+                text = fh.read()
+            self.assertEqual(text.splitlines()[0],
+                             "date,pct_50,pct_200,net_new_highs,ad_line,mcclellan_osc,net_adv_ratio,fast_ema,slow_ema")
+            self.assertEqual(scan.regime_note(d), "Market breadth 2026-10-28: broad strength (67% above the 200-day "
+                                                  "average, 62% above the 50-day, McClellan +12.3).")
+            for p200, word in ((40.0, "weak"), (50.0, "mixed"), (60.0, "broad strength")):
+                rows[0]["pct_200"] = p200
+                scan.write_breadth(os.path.join(d, "breadth.csv"), rows)
+                self.assertIn(": %s (" % word, scan.regime_note(d))
+            rows[0]["pct_200"], rows[0]["mcclellan_osc"] = None, None             # a young cache: only the 50-day
+            scan.write_breadth(os.path.join(d, "breadth.csv"), rows)
+            self.assertEqual(scan.regime_note(d), "Market breadth 2026-10-28: broad strength (- above the 200-day "
+                                                  "average, 62% above the 50-day).")
+            with open(os.path.join(d, "breadth.csv"), "w") as fh:
+                fh.write("not,a,breadth,file\n")
+            self.assertEqual(scan.regime_note(d), "")
+            with open(os.path.join(d, "breadth.csv"), "w") as fh:
+                fh.write("")
+            self.assertEqual(scan.regime_note(d), "")
+        finally:
+            shutil.rmtree(d)
+
+    # ---- Mansfield and Dorsey
+
+    def test_mansfield_and_dorsey(self):
+        stock = [(D(2026, 1, 5), 100.0), (D(2026, 1, 6), 110.0), (D(2026, 1, 7), 121.0)]
+        flat = {D(2026, 1, 5): 100.0, D(2026, 1, 6): 100.0, D(2026, 1, 7): 100.0}
+        out = scan.mansfield_series(stock, flat, 2)
+        self.assertEqual([round(r[1], 6) for r in out], [100.0, 110.0, 121.0])         # Dorsey
+        self.assertIsNone(out[0][2])
+        self.assertAlmostEqual(out[2][2], 4.76, places=2)                              # (121 / 115.5 - 1) x 100
+        self.assertAlmostEqual(out[1][2], (110 / 105.0 - 1) * 100, places=6)
+        del flat[D(2026, 1, 6)]                                                        # joined on the common dates
+        self.assertEqual([r[0] for r in scan.mansfield_series(stock, flat, 2)], [D(2026, 1, 5), D(2026, 1, 7)])
+        self.assertEqual(scan.MANSFIELD_DAILY, 22)
+
+    def test_rs_positive_means_positive_and_rising(self):
+        idx = {r[0]: 100.0 for r in long_rows([100.0] * 260)}
+        convex = long_rows([100 * (1 + 0.00001 * i * i) for i in range(260)])       # outperforming, and speeding up
+        linear = long_rows([100 + 0.5 * i for i in range(260)])             # outperforming, but the edge is fading
+        weak = long_rows([200 - 0.2 * i for i in range(260)])               # underperforming
+        no = scan.longterm_tags(scan.longterm_metrics(convex))
+        self.assertNotIn("rs_positive", no)                                 # no benchmark: the tag is off
+        self.assertIsNone(scan.longterm_metrics(convex)["mansfield_rs"])
+        for name, rows, tagged in (("convex", convex, True), ("linear", linear, False), ("weak", weak, False)):
+            m = scan.longterm_metrics(rows, idx)
+            self.assertEqual("rs_positive" in scan.longterm_tags(m), tagged, name)
+        self.assertGreater(scan.longterm_metrics(linear, idx)["mansfield_rs"], 0)         # positive, not rising
+        self.assertLess(scan.longterm_metrics(weak, idx)["mansfield_rs"], 0)
+        hits, _, _ = scan.scan_longterm({"CVX": convex, "LIN": linear}, ["CVX", "LIN"], screen="rs_positive",
+                                        benchmark=idx)
+        self.assertEqual([h["symbol"] for h in hits], ["CVX"])
+        want = scan.mansfield_series([(r[0], r[4]) for r in convex], idx)[-1][2]
+        self.assertEqual(hits[0]["mansfield_rs"], round(want, 2))
+        hits, _, _ = scan.scan_longterm({"CVX": convex}, ["CVX"])
+        self.assertIsNone(hits[0]["mansfield_rs"])
+
+    def test_the_benchmark_order(self):
+        d = tempfile.mkdtemp()
+        try:
+            self.assertEqual(scan.read_benchmark(d)[1:2], (None,))
+            self.assertIn("no benchmark", scan.read_benchmark(d)[2])
+            os.makedirs(os.path.join(d, "daily"))
+            os.makedirs(os.path.join(d, "index"))
+
+            def put(path, close):
+                with open(os.path.join(d, path), "w") as fh:
+                    fh.write("date,open,high,low,close,volume,pe,pb,div_yield\n2026-01-05,1,1,1,%s,0,,,\n" % close)
+            put(os.path.join("daily", "NIFTYBEES.csv"), 1)
+            self.assertEqual(scan.read_benchmark(d)[0], {D(2026, 1, 5): 1.0})
+            self.assertEqual(scan.read_benchmark(d)[1], "NIFTYBEES")
+            put(os.path.join("daily", "NIFTYBEES.adj.csv"), 2)
+            self.assertEqual(scan.read_benchmark(d)[0], {D(2026, 1, 5): 2.0})        # .adj.csv wins
+            put(os.path.join("index", "nifty-50.csv"), 3)
+            bench, name, note = scan.read_benchmark(d)
+            self.assertEqual((bench, name, note), ({D(2026, 1, 5): 3.0}, "Nifty 50 index", ""))   # the index wins
+        finally:
+            shutil.rmtree(d)
+
+    # ---- the commands
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        os.chdir(self.d)
+        os.makedirs(os.path.join("trader", "data", "daily"))
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def put_daily(self, sym, closes, adj=True, start=D(2025, 6, 2), folder="daily"):
+        path = os.path.join("trader", "data", folder)
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, sym + (".adj.csv" if adj else ".csv")), "w") as fh:
+            fh.write("date,open,high,low,close,volume,pe,pb,div_yield\n" if folder == "index"
+                     else "date,open,high,low,close,volume\n")
+            for i, c in enumerate(closes):
+                day = start + datetime.timedelta(days=i)
+                tail = ",,," if folder == "index" else ""
+                fh.write("%s,%.2f,%.2f,%.2f,%.2f,200000%s\n" % (day.isoformat(), c, c + 0.5, c - 0.5, c, tail))
+
+    def test_the_breadth_command(self):
+        self.put_daily("UPS", [100 + i for i in range(60)])
+        self.put_daily("DNS", [200 - i for i in range(60)])
+        self.put_daily("ZIG", [100 + (i % 2) * 3 for i in range(60)])
+        self.put_daily("RAW", [100 + i for i in range(60)], adj=False)          # only an unadjusted file
+        code, text, err = run(["breadth"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("3 symbols", text)
+        self.assertIn("adjusted .adj.csv files only", text)
+        self.assertIn("Skipped 1 with only an unadjusted .csv", text)
+        self.assertIn("survivorship-biased", text)
+        self.assertIn("above the 50-day average", text)
+        self.assertIn("under 200 sessions of history", text)
+        path = os.path.join("trader", "data", "breadth.csv")
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        self.assertEqual(lines[0], "date,pct_50,pct_200,net_new_highs,ad_line,mcclellan_osc,net_adv_ratio,"
+                                   "fast_ema,slow_ema")
+        self.assertEqual(len(lines), 1 + 59)                                  # 60 dates, the first has no previous close
+        first, last = lines[1].split(","), lines[-1].split(",")
+        self.assertEqual(first[0], "2025-06-03")
+        self.assertEqual(first[1], "")                                        # under 50 bars: no 50-day average yet
+        self.assertEqual(first[7], "")                                        # no EMA before the 19th date
+        self.assertNotEqual(last[1], "")                                      # 60 bars: the 50-day exists
+        self.assertEqual(last[2], "")                                         # the 200-day does not
+        self.assertNotEqual(last[5], "")                                      # 59 dates: the oscillator exists
+        # UPS up, DNS down, ZIG alternates: the ratio is +/-33.33 on ZIG's days
+        ratios = {float(l.split(",")[6]) for l in lines[1:]}
+        self.assertEqual(ratios, {33.33, -33.33})
+        code, text, err = run(["breadth", "--unadjusted", "--json", "--no-write"])
+        doc = json.loads(text)
+        self.assertEqual((doc["symbols"], doc["skipped_unadjusted"], doc["rows"]), (4, 0, 59))
+        self.assertEqual(doc["caveat"], scan.BREADTH_CAVEAT)
+        self.assertEqual(doc["last"]["date"], last[0])
+        code, text, _ = run(["breadth", "--days", "10", "--no-write", "--json"])
+        self.assertEqual(json.loads(text)["rows"], 10)
+        code, _, err = run(["breadth", "--symbols", "RAW", "--no-write"])
+        self.assertEqual(code, 1)
+        self.assertIn("unadjusted", err)
+        self.assertIn("trader-data/data.py daily", err)
+        code, _, err = run(["breadth", "--symbols", "GONE", "--no-write"])
+        self.assertEqual(code, 1)
+
+    def test_other_scans_print_the_regime_line_once_breadth_exists(self):
+        self.put_daily("UPS", [100 + i for i in range(60)])
+        for argv in (["longterm", "--symbols", "UPS", "--now", "2026-12-01 08:30", "--no-write"],
+                     ["daily", "--cache", "--symbols", "UPS", "--now", "2026-12-01 08:30", "--no-write",
+                      "--min-price", "0", "--min-volume", "0"],
+                     ["patterns", "--symbols", "UPS", "--now", "2026-12-01 08:30", "--no-write"]):
+            code, text, _ = run(argv)
+            self.assertNotIn("Market breadth", text, argv[0])
+        scan.write_breadth(os.path.join("trader", "data", "breadth.csv"), [
+            {"date": "2026-10-28", "pct_50": 30.0, "pct_200": 35.0, "net_new_highs": -4, "ad_line": -1.0,
+             "mcclellan_osc": -7.5, "net_adv_ratio": -2.0, "fast_ema": 0.0, "slow_ema": 0.0}])
+        want = "Market breadth 2026-10-28: weak (35% above the 200-day average, 30% above the 50-day, McClellan -7.5)."
+        for argv in (["longterm", "--symbols", "UPS", "--now", "2026-12-01 08:30", "--no-write"],
+                     ["daily", "--cache", "--symbols", "UPS", "--now", "2026-12-01 08:30", "--no-write",
+                      "--min-price", "0", "--min-volume", "0"],
+                     ["patterns", "--symbols", "UPS", "--now", "2026-12-01 08:30", "--no-write"],
+                     ["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--no-write"]):
+            code, text, _ = run(argv)
+            self.assertIn(want, text, argv[0])
+        code, text, _ = run(["longterm", "--symbols", "UPS", "--now", "2026-12-01 08:30", "--no-write", "--json"])
+        self.assertEqual(json.loads(text)["regime"], want)
+        code, text, _ = run(["daily", "--cache", "--symbols", "UPS", "--now", "2026-12-01 08:30", "--no-write",
+                             "--min-price", "0", "--min-volume", "0", "--json"])
+        self.assertEqual(json.loads(text)["regime"], want)
+
+    def test_longterm_rs_with_and_without_a_benchmark(self):
+        stock = [100 * (1 + 0.00001 * i * i) for i in range(260)]
+        self.put_daily("OUT", stock, adj=False)
+        self.put_daily("OUT2", [100.0] * 260, adj=False)
+        code, text, err = run(["longterm", "--symbols", "OUT", "--now", "2026-12-01 08:30", "--no-write"])
+        self.assertIn("Note: no benchmark", text)
+        code, text, _ = run(["longterm", "--symbols", "OUT", "--now", "2026-12-01 08:30", "--no-write", "--json"])
+        doc = json.loads(text)
+        self.assertIsNone(doc["benchmark"])
+        self.assertIn("no benchmark", doc["benchmark_note"])
+        self.assertIsNone(doc["hits"][0]["mansfield_rs"])
+        self.put_daily("nifty-50", [100.0] * 260, adj=False, folder="index")
+        code, text, _ = run(["longterm", "--symbols", "OUT,OUT2", "--screen", "rs_positive", "--now",
+                             "2026-12-01 08:30", "--no-write", "--json"])
+        doc = json.loads(text)
+        self.assertEqual(doc["benchmark"], "Nifty 50 index")
+        self.assertNotIn("benchmark_note", doc)
+        self.assertEqual([h["symbol"] for h in doc["hits"]], ["OUT"])
+        self.assertGreater(doc["hits"][0]["mansfield_rs"], 0)
+        code, text, _ = run(["longterm", "--symbols", "OUT", "--screen", "rs_positive", "--now", "2026-12-01 08:30",
+                             "--no-write"])
+        self.assertIn("relative strength over the Nifty positive and rising", text)
+        self.assertNotIn("Note: no benchmark", text)
+
+
 CAL = os.path.join(SDIR, "calendar-2027.json")
 
 
