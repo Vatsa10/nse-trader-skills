@@ -6,6 +6,8 @@
     "name": "Jake Schincariol",
     "url": "https://opusjake.ai"
   },
+  "homepage": "https://github.com/Vatsa10/nse-trader-skills",
+  "repository": "https://github.com/Vatsa10/nse-trader-skills",
   "license": "MIT",
   "keywords": [
     "backtest",
