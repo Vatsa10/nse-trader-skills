@@ -1,0 +1,16 @@
+{
+  "years": [
+    2026,
+    2027
+  ],
+  "holidays": {
+    "2027-01-26": "Republic Day",
+    "2027-03-29": "Holi",
+    "2027-04-02": "Good Friday",
+    "2027-10-20": "Dussehra"
+  },
+  "special_sessions": {
+    "2027-10-31": "Diwali Laxmi Pujan"
+  },
+  "fetched_at": "2026-10-29T08:00:00Z"
+}

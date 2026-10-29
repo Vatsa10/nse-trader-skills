@@ -8,9 +8,13 @@
     python3 scan.py orb                               # after 9:35 AM IST: opening-range breakouts so far
     python3 scan.py orb --at 10:00 --or-minutes 15    # cut the clock at 10:00 AM IST
     python3 scan.py orb --offline wall5m.json.gz --now "2026-10-19 10:00" --min-price 0
+    python3 scan.py orb --trend-filter                # drop names whose daily swing trend is down
     python3 scan.py daily --cache                     # daily closes from trader/data/daily (trader-data)
     python3 scan.py longterm                          # long-term screen of the daily cache
     python3 scan.py longterm --screen near_52w_low --near-low 10
+    python3 scan.py patterns                          # VCP, double bottom, flag, triangle, inverse H&S, support
+    python3 scan.py patterns --pattern vcp --state coiled
+    python3 scan.py breadth                           # market breadth -> trader/data/breadth.csv
 
 universe  Downloads an NSE symbol list and writes one SYMBOL|Name a line.
           Default (--source nifty500): niftyindices.com's Nifty 500 constituents
@@ -26,7 +30,7 @@ universe  Downloads an NSE symbol list and writes one SYMBOL|Name a line.
           characters (RELIANCE, M&M, BAJAJ-AUTO).
 
 daily     Pre-market scan of daily CLOSES (Yahoo spark: 20 symbols a request,
-          3 months of 1-day bars, closes only). Liquidity from the spark meta:
+          6 months of 1-day bars, closes only). Liquidity from the spark meta:
           regularMarketPrice >= --min-price (50) and regularMarketVolume >=
           --min-volume (500,000). Setups, from closes only:
             breakout_20d     the last close is above every close of the 20 before it
@@ -35,6 +39,17 @@ daily     Pre-market scan of daily CLOSES (Yahoo spark: 20 symbols a request,
             reclaim_ma20     closed under the 20-day average, then closed above it
             oversold         RSI 14 (Wilder) under 30
             oversold_bounce  RSI 14 was under 30 yesterday and today closed up
+            swing_pullback   the swing engine (see longterm) says up and stable, a swing
+                             high is pending, the close is over the change-of-character
+                             level and the swing high formed 3 to 15 bars ago
+            swing_reversal_up  the swing trend turned up on the last bar
+            delivery_spike delivery quantity and quantity per trade both over 1.2 x their
+                           30-session average on the latest day (daily --cache only)
+          The swing engine runs on closes alone with Yahoo spark (high = low =
+          close, a closing-basis structure) and on real highs and lows with
+          --cache. Each hit carries level (the pending swing high, what
+          trader-entry's watchlist --setup level reads), coc (the structural
+          stop reference), swing_trend and swing_basis.
           Today's daily bar is dropped until the session's close (15:30 IST).
 
 longterm  Long-term screen of the trader-data daily cache
@@ -47,9 +62,48 @@ longterm  Long-term screen of the trader-data daily cache
             near_52w_low   within --near-low (10) percent above the 52-week
                            low (a value screen: cheap, not necessarily good)
             oversold       RSI 14 under 30
+            swing_up       market structure is up (a SwingTrend-style engine on the
+                           last 252 sessions, 5 % retrace filter, stable after 40
+                           bars): the change-of-character level (swing_coc) has held
+            swing_reversal_up  the engine's trend turned up on the last bar
+            rs_positive    Mansfield relative strength over the Nifty is above zero and
+                           above its value 5 sessions ago (needs a benchmark: below)
+          mansfield_rs = (RS / its 22-day average - 1) x 100 with RS = stock close /
+          index close x 100 on the common dates. Benchmark: trader/data/index/
+          nifty-50.csv, else trader/data/daily/NIFTYBEES.adj.csv, else NIFTYBEES.csv;
+          none = mansfield_rs null and a note.
+            delivery_spike the daily scan's delivery reading, from
+                           trader/data/delivery/<SYMBOL>.csv (trader-data; absent = no
+                           tag, dq null)
+          Each hit carries dq (the latest delivery quantity over its 30-session
+          mean), swing_trend, swing_coc (a closing-basis structural stop),
+          swing_event and swing_bars_since.
           --screen NAME keeps only that screen (default: any). Liquidity:
           --min-price (20) and 20-day average volume >= --min-volume (1,00,000).
           Writes trader/longterm.json. No network.
+
+patterns  Chart patterns in the trader-data daily cache (real highs and lows, the
+          last 260 sessions, at least 50). Pivots are bars higher (lower) than
+          the 5 before and not lower than the 5 after, so a pattern is seen
+          5 sessions late and no future bar is used. Patterns: vcp (shrinking
+          pullbacks under one base high, in a Minervini-style uptrend, 200+
+          sessions), double_bottom, flag (pole and flag), ascending_triangle,
+          inverse_head_shoulders, rising_support (a retest of a line through 3
+          pivot lows). State: coiled (formed, no close over its trigger yet)
+          or breakout (the first close over it, at most 5 % over). Each hit has
+          level (trigger + one tick, what trader-entry reads), stop, risk_pct,
+          target (a measured move, null for vcp and rising_support), anchor_date,
+          pivots, vol_x, vol_dry and first_seen. Writes trader/watchlist.json
+          (mode patterns). Daily bars only: no intraday patterns. No network.
+
+breadth   Market breadth from the adjusted daily cache (<SYMBOL>.adj.csv), the
+          last 500 dates: percent of stocks above their 50- and 200-day
+          averages, net new highs (over the 252 sessions before), the A/D line
+          (a ratio line) and the McClellan oscillator (19 and 39 EMAs of the net
+          advance ratio, each seeded with the plain average of its first n
+          values). Writes trader/data/breadth.csv; when that file exists the
+          other scans print a one-line regime note. Current constituents only,
+          so the history is survivorship-biased (said every time).
 
 orb       Opening-range breakouts, 5-minute bars. The session is 09:15 to
           15:30 IST (75 five-minute bars). The range is the first
@@ -64,14 +118,21 @@ orb       Opening-range breakouts, 5-minute bars. The session is 09:15 to
           so when it stops short. A chart is usable only when every 5-minute
           bar from 09:15 to the cutoff is there (a missing bar is a halt, a
           circuit lock or no trades). Floors: --min-price 50 (last close),
-          --min-volume 0.
+          --min-volume 0. --trend-filter drops hits whose daily swing trend
+          (the engine on the trader-data daily cache, bars before the session
+          day) is down; a name with no cache or no stable trend stays, flagged
+          "trend unknown" in daily_trend and trend_note.
 
 Bars: null closes are dropped, a bar off the 5-minute grid (the live tick,
 like 10:49:45) is dropped, and a bar counts only once it is complete
 (start + 5 minutes <= the clock). Times are India time (IST, UTC+05:30, no
 daylight saving). --now pins the clock ("2026-10-19 10:00", IST; ...Z for UTC).
-Market days: Monday to Friday minus the NSE holiday list (2026 only; other
-years get a warning). The Muhurat session is treated as closed.
+Market days: Monday to Friday minus the NSE holiday list. trader/data/calendar.json
+(trader-data's shared calendar: "years", "holidays", "special_sessions") wins
+when it exists and parses: a special session is open, a listed holiday is
+closed, a year it covers is open. Otherwise the built-in list (2026 only;
+other years get a warning). Without a special-session entry the Muhurat
+session is treated as closed.
 
 Symbols are NSE symbols (RELIANCE, HDFCBANK); Yahoo is asked for SYMBOL.NS.
 A trailing .NS typed by the user is dropped. Option-looking symbols are refused.
@@ -123,6 +184,24 @@ DATA_HINT = ("run `python3 trader-data/data.py doctor`; or call Kite MCP get_his
              "`python3 trader-data/data.py import-kite`")
 LT_BARS = 200       # the 200-day average needs 200 sessions
 YEAR_BARS = 252     # about a year of NSE sessions
+SWING_RETRACE = 5.0   # daily swing engine: pullbacks under this percent of the swing high do not move the stop (ours)
+SWING_MIN_BARS = 40   # the engine's trend counts as stable only after this many bars (SwingTrend docs: feed 60+)
+SWING_FEED = YEAR_BARS   # bars fed to the engine for the long-term tags: a fixed warm-up window
+SWING_PULLBACK_MIN, SWING_PULLBACK_MAX = 3, 15   # swing_pullback: bars since the swing high formed (ours)
+MANSFIELD_DAILY = 22     # Mansfield relative strength: the average of the ratio over this many daily bars (eod2 notes)
+MANSFIELD_RISE_BARS = 5  # rs_positive wants the Mansfield value above what it was this many sessions ago (ours)
+BREADTH_FAST, BREADTH_SLOW = 19, 39   # McClellan EMA lengths
+BREADTH_SMA = (50, 200)  # the moving averages "percent above" counts
+BREADTH_HIGH_BARS = YEAR_BARS   # a new high beats the highest high of the 252 sessions before it
+BREADTH_DAYS = 500       # dates written to breadth.csv (about two years); 0 = every date in the cache (ours)
+BREADTH_STRONG, BREADTH_WEAK = 60.0, 40.0   # percent above the 200-day: broad strength / weak (ours)
+BREADTH_COLUMNS = ["date", "pct_50", "pct_200", "net_new_highs", "ad_line", "mcclellan_osc", "net_adv_ratio",
+                   "fast_ema", "slow_ema"]
+BREADTH_CAVEAT = "current constituents only, so the history is survivorship-biased"
+DELIVERY_BARS = 30       # sessions in the delivery average, the latest one included
+DELIVERY_MIN = 5         # fewer delivery values than this in the window: no reading, no tag
+DELIVERY_RATIO = 1.2     # delivery_spike: delivery quantity and quantity per trade both over 1.2 x their average
+DELIVERY_T2T = ("BE", "BZ")   # trade-to-trade series: delivery is the whole volume, so it says nothing
 NIFTY500_FILE = "ind_nifty500list.csv"
 NIFTY500_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 EQUITY_FILE = "EQUITY_L.csv"
@@ -158,6 +237,7 @@ NSE_HOLIDAYS = {  # NSE equity segment, weekday holidays
 }
 NSE_EARLY_CLOSE = {}  # NSE has no early closes (the Muhurat session is treated as closed)
 CALENDAR_YEARS = (2026,)
+CALENDAR_FILE = os.path.join(DATA_DIR, "calendar.json")   # trader-data's shared trading calendar, when it exists
 IST_OFFSET = datetime.timedelta(hours=5, minutes=30)  # fixed, India has no DST
 OPEN = datetime.time(9, 15)
 CLOSE = datetime.time(15, 30)
@@ -171,6 +251,9 @@ SETUPS = [
     ("reclaim_ma20", "reclaimed the 20-day average"),
     ("oversold", "oversold (RSI under 30)"),
     ("oversold_bounce", "oversold bounce"),
+    ("delivery_spike", "delivery spike (institutional-size trades, high delivery)"),
+    ("swing_pullback", "swing pullback (uptrend, pending swing high)"),
+    ("swing_reversal_up", "swing trend just reversed up"),
 ]
 LABEL = dict(SETUPS)
 
@@ -223,11 +306,54 @@ def parse_hhmm(text, flag="--at"):
     return datetime.time(int(m.group(1)), int(m.group(2)))
 
 
+def _calendar_dates(doc):
+    """{"YYYY-MM-DD": name} from a calendar.json section; bad keys are skipped."""
+    out = {}
+    if isinstance(doc, dict):
+        for k, v in doc.items():
+            try:
+                out[datetime.date.fromisoformat(str(k)).isoformat()] = str(v or "")
+            except ValueError:
+                continue
+    return out
+
+
+def load_calendar(path=None):
+    """trader/data/calendar.json -> {"years": set, "holidays": {...}, "special": {...}}, or None when the
+    file is missing or not the shape this tool knows (the built-in table then answers)."""
+    try:
+        with open(path or CALENDAR_FILE, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    years = set()
+    ys = doc.get("years")
+    for y in (list(ys) if isinstance(ys, (list, tuple, dict)) else []):
+        try:
+            years.add(int(y))
+        except (TypeError, ValueError):
+            continue
+    return {"years": years, "holidays": _calendar_dates(doc.get("holidays")),
+            "special": _calendar_dates(doc.get("special_sessions"))}
+
+
 def trading_day(d):
-    """(is_trading_day, reason). Weekends and the NSE holiday list."""
+    """(is_trading_day, reason). A special session is open; then weekends, the shared calendar.json
+    (its holidays, then any year it covers is open), then the built-in NSE holiday list."""
+    cal = load_calendar()
+    iso = d.isoformat()
+    if cal and iso in cal["special"]:
+        return True, ""
     if d.weekday() >= 5:
         return False, "weekend"
-    name = NSE_HOLIDAYS.get(d.isoformat())
+    if cal:
+        if iso in cal["holidays"]:
+            return False, "NSE holiday: " + (cal["holidays"][iso] or "closed")
+        if d.year in cal["years"]:
+            return True, ""
+    name = NSE_HOLIDAYS.get(iso)
     if name:
         return False, "NSE holiday: " + name
     return True, ""
@@ -242,8 +368,11 @@ def session(d):
 
 
 def calendar_note(d):
-    """A warning when the holiday list does not cover the date's year."""
+    """A warning when neither calendar.json nor the built-in holiday list covers the date's year."""
     if d.year in CALENDAR_YEARS:
+        return ""
+    cal = load_calendar()
+    if cal and d.year in cal["years"]:
         return ""
     return "holiday list covers 2026 only: check nseindia.com"
 
@@ -525,6 +654,116 @@ def build_universe(texts, source="nifty500"):
     return sorted(kept.items()), counts, used
 
 
+# --- swing engine: keep byte-identical in scan.py, backtest.py, invest.py and exit.py (tests/test_repo.py checks) ---
+# Market structure, one bar at a time, closing basis. In an uptrend the first bar that fails to make a new high
+# freezes that high as the pending swing high (pivot); a close above it is a break of structure (bos) and the
+# lowest low of the pullback becomes the change-of-character level (coc), a structural trailing stop. A close
+# beyond coc reverses the trend. Pullbacks shallower than `retrace` percent of the pivot do not move coc.
+# Downtrends are the mirror image. Causal: no future bars, so it is safe to replay in a backtest.
+
+def swing_new(retrace=5.0, sideways=20, min_bars=40):
+    return {"trend": None, "hi": None, "lo": None, "pivot": None, "coc": None, "bars_since": 0, "total": 0,
+            "legs": 0, "last_bos": None, "retrace": retrace or 0.0, "sideways_n": sideways, "min_bars": min_bars}
+
+
+def _swing_shallow(s, depth, pivot):
+    # depth / pivot < retrace %, cross-multiplied so an exact tie (3 / 30 vs 10 %) confirms
+    return s["retrace"] > 0 and depth * 100 < s["retrace"] * pivot
+
+
+def swing_step(s, h, l, c):
+    """Feed one bar (high, low, close). Returns the bar's event: start_up, start_down, bos, reversal or None."""
+    if h is None or l is None or c is None:
+        return None
+    s["total"] += 1
+    if s["trend"] is None:
+        if s["hi"] is None:
+            s["hi"], s["lo"] = h, l
+            return None
+        ev = None
+        if c > s["hi"]:
+            s["trend"], s["coc"], s["hi"], ev = "up", s["lo"], h, "start_up"
+        elif c < s["lo"]:
+            s["trend"], s["coc"], s["lo"], ev = "down", s["hi"], l, "start_down"
+        s["hi"], s["lo"] = max(s["hi"], h), min(s["lo"], l)
+        return ev
+    s["bars_since"] += 1
+    if s["trend"] == "up":
+        if s["pivot"] is not None:
+            if h > s["hi"]:
+                s["hi"], s["bars_since"] = h, 0
+            s["lo"] = min(s["lo"], l)
+        elif h > s["hi"]:
+            s["hi"], s["lo"], s["bars_since"] = h, l, 0
+        else:
+            s["pivot"], s["lo"], s["bars_since"] = s["hi"], l, 1
+        if c < s["coc"]:   # checked on every bar, a new-high bar included
+            s.update(trend="down", coc=s["hi"], hi=None, pivot=None, lo=l, bars_since=0, legs=0)
+            return "reversal"
+        if s["pivot"] is not None and c > s["pivot"]:
+            pivot, s["pivot"], s["bars_since"] = s["pivot"], None, 0
+            if _swing_shallow(s, pivot - s["lo"], pivot):
+                return None
+            s["coc"], s["last_bos"] = s["lo"], pivot
+            s["legs"] += 1
+            return "bos"
+        return None
+    if s["pivot"] is not None:
+        if l < s["lo"]:
+            s["lo"], s["bars_since"] = l, 0
+        s["hi"] = max(s["hi"], h)
+    elif l < s["lo"]:
+        s["lo"], s["hi"], s["bars_since"] = l, h, 0
+    else:
+        s["pivot"], s["hi"], s["bars_since"] = s["lo"], h, 1
+    if c > s["coc"]:
+        s.update(trend="up", coc=s["lo"], lo=None, pivot=None, hi=h, bars_since=0, legs=0)
+        return "reversal"
+    if s["pivot"] is not None and c < s["pivot"]:
+        pivot, s["pivot"], s["bars_since"] = s["pivot"], None, 0
+        if _swing_shallow(s, s["hi"] - pivot, pivot):
+            return None
+        s["coc"], s["last_bos"] = s["hi"], pivot
+        s["legs"] += 1
+        return "bos"
+    return None
+
+
+def swing_snapshot(s):
+    out = {k: s[k] for k in ("trend", "coc", "pivot", "last_bos", "hi", "lo", "bars_since", "legs")}
+    out["sideways"] = s["trend"] is not None and s["bars_since"] > s["sideways_n"]
+    out["stable"] = s["total"] > s["min_bars"]
+    return out
+
+
+def swing_run(bars, retrace=5.0, sideways=20, min_bars=40):
+    """bars: (high, low, close) oldest first. Returns (final snapshot, one event per bar)."""
+    s = swing_new(retrace, sideways, min_bars)
+    events = [swing_step(s, h, l, c) for h, l, c in bars]
+    return swing_snapshot(s), events
+# --- end swing engine ---
+
+
+def swing_info(bars, retrace=SWING_RETRACE, min_bars=SWING_MIN_BARS):
+    """bars (high, low, close) oldest first -> the engine's snapshot plus `event`, the last bar's event."""
+    snap, events = swing_run(bars, retrace, min_bars=min_bars)
+    snap["event"] = events[-1] if events else None
+    return snap
+
+
+def swing_tag_list(trend, event, stable):
+    """The long-term swing tags. A trend reading counts only once the engine is stable; a trend that
+    just turned up is swing_reversal_up, not swing_up."""
+    if not stable or trend != "up":
+        return []
+    return ["swing_reversal_up"] if event == "reversal" else ["swing_up"]
+
+
+def swing_tags(bars, retrace=SWING_RETRACE, min_bars=SWING_MIN_BARS):
+    sw = swing_info(bars, retrace, min_bars)
+    return swing_tag_list(sw["trend"], sw["event"], sw["stable"])
+
+
 # ---------------------------------------------------------------- daily setups
 
 def rsi(closes, n=14):
@@ -540,22 +779,32 @@ def rsi(closes, n=14):
     return 100 - 100 / (1 + ag / al) if al else 100.0
 
 
-def daily_closes(series, now_utc):
-    """[(date, close)] of COMPLETE daily bars: null closes dropped, today's bar dropped
-    until the session closes, anything dated after the clock dropped."""
+def daily_hlc(series, now_utc):
+    """[(date, high, low, close)] of COMPLETE daily bars: null closes dropped, today's bar dropped
+    until the session closes, anything dated after the clock dropped. A bar with no high or low
+    (spark has closes only) takes its close for both."""
     now = to_ist(now_utc)
     today = now.date()
     s = session(today)
     today_done = s is None or now.time() >= s[1]
+    hs, ls = series.get("h"), series.get("l")
     out = {}
-    for ts, c in zip(series["t"], series["c"]):
+    for i, (ts, c) in enumerate(zip(series["t"], series["c"])):
         if c is None:
             continue
         d = ts_to_ist(ts).date()
         if d > today or (d == today and not today_done):
             continue
-        out[d] = float(c)  # one bar a day: a late duplicate (the live tick) wins
-    return sorted(out.items())
+        h = hs[i] if hs and i < len(hs) else None
+        lo = ls[i] if ls and i < len(ls) else None
+        c = float(c)
+        out[d] = (float(h) if h is not None else c, float(lo) if lo is not None else c, c)  # a late duplicate wins
+    return [(d,) + out[d] for d in sorted(out)]
+
+
+def daily_closes(series, now_utc):
+    """[(date, close)] of COMPLETE daily bars (see daily_hlc)."""
+    return [(b[0], b[3]) for b in daily_hlc(series, now_utc)]
 
 
 def find_setups(closes):
@@ -584,8 +833,29 @@ def find_setups(closes):
                   "run_pct": run * 100, "range5_pct": rng5 * 100}
 
 
-def scan_daily(data, symbols, now_utc, min_price, min_volume):
-    """Pure. data = {SYM: series}. Returns (hits, counts, last_date)."""
+def find_swing(bars, retrace=SWING_RETRACE, min_bars=SWING_MIN_BARS):
+    """bars (high, low, close) oldest first -> (setup tags, numbers). The engine runs on the last SWING_FEED
+    bars and counts only once it is stable. swing_pullback: trend up, a swing high pending, the change-of-
+    character level under the close, and SWING_PULLBACK_MIN to SWING_PULLBACK_MAX bars since the swing high
+    formed. swing_reversal_up: the trend turned up on the last bar. `level` is the pending swing high (the
+    high of the leg when none is pending), `coc` the structural stop; both None unless the trend is up."""
+    sw = swing_info(bars[-SWING_FEED:], retrace, min_bars)
+    up = sw["trend"] == "up" and sw["stable"]
+    tags = []
+    if up:
+        if sw["event"] == "reversal":
+            tags.append("swing_reversal_up")
+        elif (sw["pivot"] is not None and sw["coc"] < bars[-1][2]
+              and SWING_PULLBACK_MIN <= sw["bars_since"] <= SWING_PULLBACK_MAX):
+            tags.append("swing_pullback")
+    return tags, {"trend": sw["trend"] if sw["stable"] else None, "bars_since": sw["bars_since"],
+                  "level": (sw["pivot"] if sw["pivot"] is not None else sw["hi"]) if up else None,
+                  "coc": sw["coc"] if up else None}
+
+
+def scan_daily(data, symbols, now_utc, min_price, min_volume, delivery=None):
+    """Pure. data = {SYM: series}; delivery = {SYM: delivery rows} for the dq number and the delivery_spike tag.
+    Returns (hits, counts, last_date)."""
     hits, dates = [], {}
     counts = {"requested": len(symbols), "fetched": 0, "illiquid": 0, "short": 0, "scanned": 0}
     for sym in symbols:
@@ -593,7 +863,8 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume):
         if not s:
             continue
         counts["fetched"] += 1
-        bars = daily_closes(s, now_utc)
+        hlc = daily_hlc(s, now_utc)
+        bars = [(b[0], b[3]) for b in hlc]
         meta = s.get("meta") or {}
         price = meta.get("regularMarketPrice")
         if price is None and bars:
@@ -610,10 +881,21 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume):
         dates[d_last] = dates.get(d_last, 0) + 1
         closes = [c for _, c in bars]
         tags, nums = find_setups(closes)
+        stags, sw = find_swing([b[1:] for b in hlc])   # highs and lows when the series has them, else closes
+        tags = tags + stags
+        dr = delivery_reading((delivery or {}).get(sym), d_last)
+        if dr and dr["spike"]:
+            tags.append("delivery_spike")
         if tags:
             hits.append({"symbol": sym, "setups": tags, "price": round(closes[-1], 2),
                          "close_date": d_last.isoformat(), "rsi": round(nums["rsi"], 1),
-                         "volume": int(vol) if vol is not None else None})
+                         "volume": int(vol) if vol is not None else None,
+                         "level": round(sw["level"], 2) if sw["level"] is not None else None,
+                         "coc": round(sw["coc"], 2) if sw["coc"] is not None else None,
+                         "swing_trend": sw["trend"],
+                         "swing_basis": "highs_lows" if s.get("h") and s.get("l") else "closes",
+                         "dq": round(dr["dq"], 2) if dr and dr["dq"] is not None else None,
+                         "dq_date": dr["date"] if dr and dr["dq"] is not None else None})
     hits.sort(key=lambda h: (-(h["price"] * (h["volume"] or 0)), h["symbol"]))  # most rupees traded first
     last_date = max(dates, key=lambda d: (dates[d], d)) if dates else None
     counts["hits"] = len(hits)
@@ -780,6 +1062,432 @@ def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume
         del h["_t"]
     counts["hits"] = len(hits)
     return hits, counts, failed
+
+
+def trend_filter(hits, rows_by_sym, retrace=SWING_RETRACE, min_bars=SWING_MIN_BARS):
+    """Keep opening-range hits whose daily swing trend is up. A name with no daily rows, too few bars for a
+    stable reading, or no trend yet stays, flagged `trend unknown` in the hit. -> (kept, dropped symbols)."""
+    kept, dropped = [], []
+    for h in hits:
+        rows = rows_by_sym.get(h["symbol"]) or []
+        sw = swing_info([(r[2], r[3], r[4]) for r in rows[-SWING_FEED:]], retrace, min_bars) if rows else None
+        if sw and sw["stable"] and sw["trend"] == "down":
+            dropped.append(h["symbol"])
+            continue
+        if sw and sw["stable"] and sw["trend"] == "up":
+            kept.append(dict(h, daily_trend="up"))
+            continue
+        why = ("no daily cache" if not rows else "under %d daily bars" % (min_bars + 1) if not sw["stable"]
+               else "no daily trend yet")
+        kept.append(dict(h, daily_trend="unknown", trend_note="trend unknown (%s)" % why))
+    return kept, dropped
+
+
+# ---------------------------------------------------------------- chart patterns
+
+# Pivot-based chart patterns on the daily cache (rows with real highs and lows). A detector is a pure function of
+# the rows up to the last bar. Thresholds marked (repo) follow the published stock-pattern rules, (ours) are ours.
+TICK = 0.05                 # NSE price tick: level = trigger + one tick, stop = swing low - one tick
+PAT_BARS = 260              # a detector reads the last 260 bars only
+BREAKOUT_MAX_PCT = 5.0      # state "breakout": the last close is the first over the trigger and at most this far over (ours)
+PATTERNS = [
+    ("vcp", "volatility contraction (VCP)"),
+    ("double_bottom", "double bottom"),
+    ("flag", "pole and flag"),
+    ("ascending_triangle", "ascending triangle (flat-top coil)"),
+    ("inverse_head_shoulders", "inverse head and shoulders"),
+    ("rising_support", "rising-support retest"),
+]
+PAT_LABEL = dict(PATTERNS)
+PAT = {
+    "min_bars": 50,              # fewer rows than this: no pattern scan (the flag needs 50, the VCP 200)
+    "L": 5, "R": 5,              # pivot window: bars strictly lower on the left, not higher on the right (ours)
+    # VCP
+    "vcp_min_bars": 200, "vcp_trend_gate": True,    # close > 50-day > 200-day, 200-day rising, near the high (ours)
+    "vcp_near_high": 0.25,       # the close is within 25 % of the 252-bar high (ours)
+    "vcp_base_window": 120, "vcp_base_age": 15,     # the base high: highest pivot high of the last 120 bars, 15+ old (ours)
+    "vcp_contractions": (2, 5),  # completed contractions (ours)
+    "vcp_first_depth": (0.08, 0.35), "vcp_shrink": 0.85, "vcp_last_depth": 0.10,   # (ours)
+    "vcp_high_floor": 0.95,      # every later high at least 95 % of the base high (ours)
+    "vcp_zone": 0.95,            # coiled: close within 5 % under the trigger (ours)
+    "vcp_max_risk_pct": 12.0,    # drop a hit whose (level - stop) / level is over this (ours)
+    # double bottom
+    "db_gap": (10, 80),          # bars between the two lows (ours)
+    "db_tol_u": 0.5,             # the lows within 0.5 U (repo)
+    "db_rebound_u": 3.0, "db_rebound_pct": 5.0,     # rebound at least max(3 U, 5 % of the low) (ours)
+    "db_prior_bars": 60, "db_prior_drop": 1.15,     # the 60 bars before low A reached 1.15 x low A (ours)
+    "db_break_u": 0.5,           # no close under the lows - 0.5 U (ours)
+    # pole and flag
+    "flag_min_bars": 50,         # (repo)
+    "flag_recent": 7, "flag_age": (4, 6), "flag_lookback": 90,     # pole top: highest high of the last 7, 4 to 6 bars old (repo)
+    "flag_gain": 0.15, "flag_base_bars": 20,        # pole gain 15 %, base to top within 20 bars (ours)
+    "flag_retrace": 0.5,         # the flag low holds the midpoint of the pole (repo)
+    # ascending triangle
+    "tri_span": (20, 90), "tri_tol_u": 1.0, "tri_rise_u": 0.5,     # span in bars, highs within 1 U (repo), lows up 0.5 U (ours)
+    # inverse head and shoulders
+    "ihs_head_u": 0.6, "ihs_neck_u": 1.0,           # head 0.6 U under the shoulders, necklines within 1 U (repo)
+    "ihs_prior_bars": 60, "ihs_sym": 0.5,           # head the lowest of 60 bars; shoulders within half the head depth (ours)
+    # rising support
+    "rs_window": 120, "rs_gap": 5, "rs_touch_u": 0.5, "rs_touches": 3,    # (ours)
+    "rs_max_above": 0.03,        # the last close at most 3 % over the line (ours; the repo allows 10 %)
+    "rs_stop_u": 1.0,
+    "stop_u": 0.5,               # stop = swing low - 0.5 U for the triangle and the head and shoulders (ours)
+}
+
+
+def median(xs):
+    s = sorted(xs)
+    m = len(s) // 2
+    return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2.0
+
+
+def find_pivots(h, l, left, right):
+    """-> (pivot highs, pivot lows) as [(index, price)]. Bar i is a pivot high when its high is strictly above each of
+    the `left` highs before it and at least each of the `right` highs after it (the earlier of equal highs wins);
+    a pivot low mirrors that. A bar that is both is ignored. A pivot needs `right` bars after it: no look-ahead."""
+    ph, pl = [], []
+    for i in range(left, len(h) - right):
+        up = h[i] > max(h[i - left:i]) and h[i] >= max(h[i + 1:i + right + 1])
+        dn = l[i] < min(l[i - left:i]) and l[i] <= min(l[i + 1:i + right + 1])
+        if up and not dn:
+            ph.append((i, h[i]))
+        elif dn and not up:
+            pl.append((i, l[i]))
+    return ph, pl
+
+
+def zigzag(ph, pl):
+    """Pivot highs and lows merged by index into [(index, "H" or "L", price)]; neighbours of one type collapse to the
+    more extreme (the earlier on a tie), so the points alternate."""
+    out = []
+    for pt in sorted([(i, "H", v) for i, v in ph] + [(i, "L", v) for i, v in pl]):
+        if out and out[-1][1] == pt[1]:
+            if pt[2] > out[-1][2] if pt[1] == "H" else pt[2] < out[-1][2]:
+                out[-1] = pt
+        else:
+            out.append(pt)
+    return out
+
+
+def pat_state(c, start, trigger, inclusive=False):
+    """"coiled" (the last close is under the trigger), "breakout" (the first close over it, at most BREAKOUT_MAX_PCT
+    over) or None. Every close after bar `start` and before the last must be under the trigger."""
+    def beyond(v):
+        return v >= trigger if inclusive else v > trigger
+    if any(beyond(v) for v in c[start + 1:-1]):
+        return None
+    last = c[-1]
+    if last < trigger:
+        return "coiled"
+    if beyond(last) and last <= trigger * (1 + BREAKOUT_MAX_PCT / 100.0):
+        return "breakout"
+    return None
+
+
+def pat_context(rows, params=None):
+    """The last PAT_BARS rows as plain lists, with the pivots and the zigzag worked out once."""
+    p = dict(PAT, **(params or {}))
+    rows = rows[-PAT_BARS:]
+    h, l = [r[2] for r in rows], [r[3] for r in rows]
+    ph, pl = find_pivots(h, l, p["L"], p["R"])
+    return {"p": p, "n": len(rows), "dates": [r[0] for r in rows], "h": h, "l": l, "c": [r[4] for r in rows],
+            "v": [r[5] for r in rows], "ph": ph, "pl": pl, "zz": zigzag(ph, pl), "rng": [a - b for a, b in zip(h, l)]}
+
+
+def pat_unit(x, start):
+    """U: the median bar range from bar `start` to the last bar."""
+    return median(x["rng"][start:]) or TICK
+
+
+def vol_dry(v, a=None, b=None):
+    """Advisory. With bars a and b: volume at bar b under volume at bar a. Without: the mean volume of the last 10
+    bars under the mean of the 50 before them. None when there is not enough volume to say."""
+    if a is not None:
+        return v[b] < v[a] if v[a] and v[b] else None
+    if len(v) < 60:
+        return None
+    base = sum(v[-60:-10]) / 50.0
+    return (sum(v[-10:]) / 10.0 < base) if base > 0 else None
+
+
+def detect_vcp(x):
+    """Volatility contraction: shrinking pullbacks under one base high, each low above the last."""
+    p, n, c, h = x["p"], x["n"], x["c"], x["h"]
+    if n < p["vcp_min_bars"]:
+        return None
+    if p["vcp_trend_gate"]:
+        if n < 220:
+            return None
+        sma50, sma200 = sum(c[-50:]) / 50.0, sum(c[-200:]) / 200.0
+        if not (c[-1] > sma50 > sma200 and sma200 > sum(c[-220:-20]) / 200.0):
+            return None
+        if c[-1] < (1 - p["vcp_near_high"]) * max(h[-YEAR_BARS:]):
+            return None
+    cands = [t for t in x["ph"] if t[0] >= n - p["vcp_base_window"] and n - 1 - t[0] >= p["vcp_base_age"]]
+    if not cands:
+        return None
+    i0, h0 = max(cands, key=lambda t: (t[1], -t[0]))
+    zz = zigzag([t for t in x["ph"] if t[0] >= i0], [t for t in x["pl"] if t[0] >= i0])
+    if not zz or zz[0][0] != i0:
+        return None
+    lows = zz[1::2]                                   # l(1) .. l(n); the highs are zz[0], zz[2], ..
+    k = len(lows)
+    if not (p["vcp_contractions"][0] <= k <= p["vcp_contractions"][1]):
+        return None
+    depth = [(zz[2 * j][2] - lows[j][2]) / zz[2 * j][2] for j in range(k)]
+    if not (p["vcp_first_depth"][0] <= depth[0] <= p["vcp_first_depth"][1]) or depth[-1] > p["vcp_last_depth"]:
+        return None
+    for j in range(1, k):
+        if depth[j] > p["vcp_shrink"] * depth[j - 1] or lows[j][2] <= lows[j - 1][2]:
+            return None
+    if any(t[2] < p["vcp_high_floor"] * h0 for t in zz[2:2 * k:2]):
+        return None
+    trigger, low_n = zz[2 * (k - 1)][2], lows[-1]
+    state = pat_state(c, low_n[0], trigger, inclusive=True)
+    if state is None or c[-1] <= low_n[2] or (state == "coiled" and c[-1] < p["vcp_zone"] * trigger):
+        return None
+    level, stop = trigger + TICK, low_n[2] - TICK
+    if (level - stop) / level * 100 > p["vcp_max_risk_pct"]:
+        return None
+    return {"pattern": "vcp", "state": state, "level": level, "stop": stop, "target": None, "anchor": i0,
+            "pivots": [(t[0], t[2]) for t in zz[:2 * k]], "vol_dry": vol_dry(x["v"])}
+
+
+def detect_double_bottom(x):
+    """Two pivot lows at about the same price with a rebound between them; coiled under the middle high."""
+    p, n, c, h, l = x["p"], x["n"], x["c"], x["h"], x["l"]
+    lows = x["pl"][-8:]
+    for ci in range(len(lows) - 1, 0, -1):
+        for ai in range(ci - 1, -1, -1):
+            a, b_ = lows[ai], lows[ci]
+            gap = b_[0] - a[0]
+            if gap > p["db_gap"][1]:
+                break
+            if gap < p["db_gap"][0]:
+                continue
+            u = pat_unit(x, a[0])
+            if abs(a[1] - b_[1]) > p["db_tol_u"] * u:
+                continue
+            mids = [t for t in x["ph"] if a[0] < t[0] < b_[0]]
+            if not mids:
+                continue
+            top = max(mids, key=lambda t: (t[1], -t[0]))[1]
+            low = min(a[1], b_[1])
+            if top - max(a[1], b_[1]) < max(p["db_rebound_u"] * u, p["db_rebound_pct"] / 100.0 * b_[1]):
+                continue
+            before = h[max(0, a[0] - p["db_prior_bars"]):a[0]]
+            if not before or max(before) < p["db_prior_drop"] * a[1]:
+                continue
+            if min(c[a[0] + 1:]) < low - p["db_break_u"] * u:
+                continue
+            state = pat_state(c, b_[0], top)
+            if state is None or (state == "coiled" and c[-1] < (b_[1] + top) / 2.0):
+                continue
+            stop = low - p["db_break_u"] * u
+            return {"pattern": "double_bottom", "state": state, "level": top + TICK, "stop": stop,
+                    "target": top + (top - low), "anchor": a[0], "pivots": [(a[0], a[1]), (b_[0], b_[1])],
+                    "vol_dry": vol_dry(x["v"], a[0], b_[0])}
+    return None
+
+
+def detect_flag(x):
+    """Pole and flag: a sharp run up to a top 4 to 6 bars ago, then a shallow pullback that holds half the pole."""
+    p, n, c, h, l = x["p"], x["n"], x["c"], x["h"], x["l"]
+    if n < p["flag_min_bars"] or n < p["flag_recent"]:
+        return None
+    recent = h[-p["flag_recent"]:]
+    top = max(recent)
+    ti = n - p["flag_recent"] + recent.index(top)
+    if not (p["flag_age"][0] <= n - 1 - ti <= p["flag_age"][1]) or top < max(h[-p["flag_lookback"]:]):
+        return None
+    bases = [t for t in x["pl"] if t[0] < ti]
+    if not bases:
+        return None
+    bi, base = bases[-1]
+    height = top - base
+    if base <= 0 or height / base < p["flag_gain"] or ti - bi > p["flag_base_bars"]:
+        return None
+    flag_low = min(l[ti:])
+    if flag_low < base + p["flag_retrace"] * height or c[-1] >= top:
+        return None
+    return {"pattern": "flag", "state": "coiled", "level": top + TICK, "stop": flag_low - TICK, "target": top + height,
+            "anchor": bi, "pivots": [(bi, base), (ti, top)], "vol_dry": None}
+
+
+def detect_ascending_triangle(x):
+    """Three equal highs over two rising lows (high, low, high, low, high); coiled under the flat top."""
+    p, n, c = x["p"], x["n"], x["c"]
+    zz = x["zz"]
+    for k in range(len(zz) - 1, max(3, len(zz) - 9), -1):
+        if zz[k][1] != "H":
+            continue
+        a, b_, _, d, e = zz[k - 4:k + 1]
+        if not (p["tri_span"][0] <= e[0] - a[0] <= p["tri_span"][1]):
+            continue
+        u = pat_unit(x, a[0])
+        highs = [zz[k - 4][2], zz[k - 2][2], zz[k][2]]
+        if max(highs) - min(highs) > p["tri_tol_u"] * u or d[2] - b_[2] < p["tri_rise_u"] * u:
+            continue
+        top = max(highs)
+        state = pat_state(c, a[0], top)
+        if state is None or (state == "coiled" and c[-1] < (d[2] + top) / 2.0):
+            continue
+        return {"pattern": "ascending_triangle", "state": state, "level": top + TICK, "stop": d[2] - p["stop_u"] * u,
+                "target": top + (top - b_[2]), "anchor": a[0], "pivots": [(t[0], t[2]) for t in zz[k - 4:k + 1]],
+                "vol_dry": None}
+    return None
+
+
+def detect_inverse_head_shoulders(x):
+    """Low, high, low, high, low with the middle low the deepest; coiled under the neckline."""
+    p, n, c, l = x["p"], x["n"], x["c"], x["l"]
+    zz = x["zz"]
+    for k in range(len(zz) - 1, max(3, len(zz) - 9), -1):
+        if zz[k][1] != "L":
+            continue
+        a, b_, head, d, e = zz[k - 4:k + 1]
+        u = pat_unit(x, a[0])
+        shoulder = min(a[2], e[2])
+        neck = max(b_[2], d[2])
+        if head[2] > shoulder - p["ihs_head_u"] * u or min(b_[2], d[2]) <= max(a[2], e[2]):
+            continue
+        before = l[max(0, head[0] - p["ihs_prior_bars"]):head[0]]
+        if (before and min(before) < head[2]) or abs(b_[2] - d[2]) > p["ihs_neck_u"] * u:
+            continue
+        if abs(a[2] - e[2]) > p["ihs_sym"] * (neck - head[2]):
+            continue
+        state = pat_state(c, e[0], neck)
+        if state is None or (state == "coiled" and c[-1] < (e[2] + neck) / 2.0):
+            continue
+        return {"pattern": "inverse_head_shoulders", "state": state, "level": neck + TICK,
+                "stop": e[2] - p["stop_u"] * u, "target": neck + (neck - head[2]), "anchor": a[0],
+                "pivots": [(t[0], t[2]) for t in zz[k - 4:k + 1]], "vol_dry": None}
+    return None
+
+
+def detect_rising_support(x):
+    """A rising line through three or more pivot lows with the last close just over it: a retest of support."""
+    p, n, c, h = x["p"], x["n"], x["c"], x["h"]
+    ws = max(0, n - p["rs_window"])
+    lows = [t for t in x["pl"] if t[0] >= ws]
+    if len(lows) < p["rs_touches"]:
+        return None
+    u = pat_unit(x, ws)
+    best = None
+    recent = lows[-8:]
+    for i in range(len(recent)):
+        for j in range(i + 1, len(recent)):
+            a, b_ = recent[i], recent[j]
+            if b_[0] - a[0] < p["rs_gap"] or b_[1] <= a[1]:
+                continue
+            slope = (b_[1] - a[1]) / float(b_[0] - a[0])
+            touches = [t for t in lows if t[0] >= a[0] and abs(t[1] - (a[1] + slope * (t[0] - a[0]))) <= p["rs_touch_u"] * u]
+            if len(touches) < p["rs_touches"]:
+                continue
+            if any(c[k] < a[1] + slope * (k - a[0]) for k in range(a[0], n)):
+                continue
+            line = a[1] + slope * (n - 1 - a[0])
+            if not (line <= c[-1] <= line * (1 + p["rs_max_above"])):
+                continue
+            key = (len(touches), touches[-1][0])
+            if best is None or key > best[0]:
+                best = (key, a, line, touches)
+    if best is None:
+        return None
+    _, a, line, touches = best
+    return {"pattern": "rising_support", "state": "coiled", "level": h[-1] + TICK, "stop": line - p["rs_stop_u"] * u,
+            "target": None, "anchor": a[0], "pivots": [(t[0], t[1]) for t in touches], "vol_dry": None}
+
+
+DETECTORS = [("vcp", detect_vcp), ("double_bottom", detect_double_bottom), ("flag", detect_flag),
+             ("ascending_triangle", detect_ascending_triangle),
+             ("inverse_head_shoulders", detect_inverse_head_shoulders), ("rising_support", detect_rising_support)]
+
+
+def pattern_hit(x, raw):
+    """A detector's answer -> the watchlist hit shape (no symbol yet)."""
+    level, stop = raw["level"], raw["stop"]
+    if level <= stop:
+        return None
+    v = x["v"]
+    mean50 = sum(v[-51:-1]) / 50.0 if len(v) >= 51 else 0
+    return {"setups": [raw["pattern"]], "price": round(x["c"][-1], 2), "close_date": x["dates"][-1].isoformat(),
+            "pattern": raw["pattern"], "state": raw["state"], "level": round(level, 2), "stop": round(stop, 2),
+            "risk_pct": round((level - stop) / level * 100, 2),
+            "target": round(raw["target"], 2) if raw["target"] is not None else None,
+            "anchor_date": x["dates"][raw["anchor"]].isoformat(),
+            "pivots": [[x["dates"][i].isoformat(), round(pr, 2)] for i, pr in raw["pivots"]],
+            "vol_x": round(v[-1] / mean50, 2) if mean50 > 0 else None, "vol_dry": raw["vol_dry"]}
+
+
+def find_patterns(rows, params=None, only=None):
+    """Daily rows (ascending, (date, o, h, l, c, v)) -> pattern hits, best known first. `params` overrides PAT,
+    `only` is a list of pattern names. A VCP and an ascending triangle on one chart merge into one hit."""
+    x = pat_context(rows, params)
+    if x["n"] < x["p"]["min_bars"]:
+        return []
+    found = []
+    for name, fn in DETECTORS:
+        if only and name not in only:
+            continue
+        raw = fn(x)
+        hit = pattern_hit(x, raw) if raw else None
+        if hit:
+            found.append(hit)
+    by = {h["pattern"]: h for h in found}
+    if "vcp" in by and "ascending_triangle" in by:
+        tri = by["ascending_triangle"]
+        by["vcp"]["setups"].append("ascending_triangle")
+        by["vcp"]["also"] = [{"pattern": "ascending_triangle", "level": tri["level"], "stop": tri["stop"],
+                              "target": tri["target"], "anchor_date": tri["anchor_date"]}]
+        found.remove(tri)
+    return found
+
+
+def scan_patterns(rows_by_sym, symbols, min_price=20.0, min_volume=100000, only=None, state=None, params=None):
+    """Pure. rows_by_sym = {SYM: daily rows}. Returns (hits, counts, last_date). One hit per (symbol, pattern,
+    anchor date)."""
+    p = dict(PAT, **(params or {}))
+    counts = {"requested": len(symbols), "cached": 0, "short": 0, "illiquid": 0, "scanned": 0}
+    hits, dates, seen = [], {}, set()
+    for sym in symbols:
+        rows = rows_by_sym.get(sym)
+        if not rows:
+            continue
+        counts["cached"] += 1
+        if len(rows) < p["min_bars"]:
+            counts["short"] += 1
+            continue
+        vol20 = sum(r[5] for r in rows[-20:]) / float(min(20, len(rows)))
+        if rows[-1][4] < min_price or vol20 < min_volume:
+            counts["illiquid"] += 1
+            continue
+        counts["scanned"] += 1
+        d = rows[-1][0]
+        dates[d] = dates.get(d, 0) + 1
+        for h in find_patterns(rows, params, only):
+            key = (sym, h["pattern"], h["anchor_date"])
+            if key in seen or (state and h["state"] != state):
+                continue
+            seen.add(key)
+            hits.append(dict({"symbol": sym}, **h))
+    hits.sort(key=lambda h: (h["state"] != "coiled", (h["level"] - h["price"]) / h["level"], h["symbol"]))
+    last_date = max(dates, key=lambda d: (dates[d], d)) if dates else None
+    counts["hits"] = len(hits)
+    return hits, counts, last_date
+
+
+def carry_first_seen(hits, previous):
+    """Stamp each hit with first_seen: the date from the previous watchlist for the same (symbol, pattern, anchor
+    date), else its own close date. `previous` is a parsed watchlist document or None."""
+    old = {}
+    if isinstance(previous, dict) and previous.get("mode") == "patterns":
+        for h in previous.get("hits") or []:
+            if isinstance(h, dict) and h.get("first_seen"):
+                old[(h.get("symbol"), h.get("pattern"), h.get("anchor_date"))] = h["first_seen"]
+    for h in hits:
+        h["first_seen"] = old.get((h["symbol"], h["pattern"], h["anchor_date"]), h["close_date"])
+    return hits
 
 
 # ---------------------------------------------------------------- fetching
@@ -1064,6 +1772,211 @@ def fallback_list(why=None):
     raise ScanError("%sno trader/data/universe.csv and no bundled snapshot. Next: %s" % (lead, DATA_HINT))
 
 
+# ---------------------------------------------------------------- delivery
+
+def delivery_path(sym, data_dir=None):
+    return os.path.join(data_dir or DATA_DIR, "delivery", "%s.csv" % sym)
+
+
+def read_delivery_csv(path):
+    """trader-data's trader/data/delivery/<SYM>.csv (date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series; an
+    empty field is missing) -> [{"date", "deliv_qty", "qty_per_trade", "series"}] ascending. Rows with a bad date are
+    skipped, a later row for a date wins, a field that is not a number is missing."""
+    def num(v):
+        try:
+            return float(v) if (v or "").strip() else None
+        except ValueError:
+            return None
+    out = {}
+    with open(path, encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            try:
+                d = datetime.date.fromisoformat((r.get("date") or "").strip())
+            except ValueError:
+                continue
+            out[d] = {"date": d, "deliv_qty": num(r.get("deliv_qty")), "qty_per_trade": num(r.get("qty_per_trade")),
+                      "series": (r.get("series") or "").strip().upper()}
+    return [out[d] for d in sorted(out)]
+
+
+def load_delivery(symbols, data_dir=None):
+    """-> {SYM: delivery rows} for the symbols that have a file; a file that cannot be read is left out."""
+    out = {}
+    for sym in symbols:
+        path = delivery_path(sym, data_dir)
+        if os.path.exists(path):
+            try:
+                rows = read_delivery_csv(path)
+            except OSError:
+                continue
+            if rows:
+                out[sym] = rows
+    return out
+
+
+def delivery_reading(rows, close_date=None):
+    """Delivery rows (ascending) -> {"date", "dq", "tq", "series", "spike"} or None for no rows. DQ = the latest
+    delivery quantity over its mean, TQ = the latest quantity per trade over its mean, both over the last
+    DELIVERY_BARS sessions in the file (the latest included, a missing value left out). A ratio needs the latest
+    value and at least DELIVERY_MIN values in the window, else it is None. `spike`: DQ and TQ both over
+    DELIVERY_RATIO, a series that is not BE or BZ, and (when close_date is given) the reading is for that day."""
+    if not rows:
+        return None
+    window = rows[-DELIVERY_BARS:]
+    last = window[-1]
+
+    def ratio(key):
+        vals = [r[key] for r in window if r[key] is not None]
+        if last[key] is None or len(vals) < DELIVERY_MIN:
+            return None
+        mean = sum(vals) / len(vals)
+        return last[key] / mean if mean > 0 else None
+    dq, tq = ratio("deliv_qty"), ratio("qty_per_trade")
+    spike = (dq is not None and tq is not None and dq > DELIVERY_RATIO and tq > DELIVERY_RATIO
+             and last["series"] not in DELIVERY_T2T and (close_date is None or last["date"] == close_date))
+    return {"date": last["date"].isoformat(), "dq": dq, "tq": tq, "series": last["series"], "spike": spike}
+
+
+# ---------------------------------------------------------------- relative strength
+
+def mansfield_series(stock, bench, n=MANSFIELD_DAILY):
+    """stock: [(date, close)] ascending, bench: {date: close}. Joined on the common dates:
+    Dorsey RS = stock / index x 100, Mansfield RS = (RS / mean of the last n RS - 1) x 100.
+    -> [(date, dorsey, mansfield or None)]; Mansfield starts at the n-th common date."""
+    rs = [(d, c / bench[d] * 100.0) for d, c in stock if bench.get(d)]
+    out = []
+    for i, (d, v) in enumerate(rs):
+        m = None
+        if i >= n - 1:
+            avg = sum(x for _, x in rs[i - n + 1:i + 1]) / n
+            m = (v / avg - 1) * 100.0 if avg else None
+        out.append((d, v, m))
+    return out
+
+
+def read_benchmark(data_dir=None):
+    """The relative-strength benchmark's closes -> ({date: close}, name, note). trader/data/index/nifty-50.csv
+    (trader-data), else NIFTYBEES (.adj.csv first) in trader/data/daily, else none and a note saying so."""
+    base = data_dir or DATA_DIR
+    for name, path in (("Nifty 50 index", os.path.join(base, "index", "nifty-50.csv")),
+                       ("NIFTYBEES", daily_cache_path("NIFTYBEES", base))):
+        if not os.path.exists(path):
+            continue
+        try:
+            rows = read_daily_csv(path)
+        except OSError:
+            continue
+        if rows:
+            return {r[0]: r[4] for r in rows}, name, ""
+    return {}, None, ("no benchmark (neither %s nor NIFTYBEES in %s): mansfield_rs is null and rs_positive is off"
+                      % (os.path.join(base, "index", "nifty-50.csv"), os.path.join(base, "daily")))
+
+
+# ---------------------------------------------------------------- market breadth
+
+def ema_series(values, n):
+    """EMA with alpha 2 / (n + 1), seeded with the plain average of the first n values and first given on the n-th
+    value. -> a list the length of `values`, None before the seed."""
+    out, prev = [], None
+    alpha = 2.0 / (n + 1)
+    for i, x in enumerate(values):
+        if i + 1 < n:
+            out.append(None)
+            continue
+        prev = sum(values[:n]) / float(n) if i + 1 == n else prev + alpha * (x - prev)
+        out.append(prev)
+    return out
+
+
+def breadth_series(rows_by_sym, sma=BREADTH_SMA, high_bars=BREADTH_HIGH_BARS, fast=BREADTH_FAST, slow=BREADTH_SLOW,
+                   days=0):
+    """Market breadth from daily rows ({SYM: [(date, o, h, l, c, v)]}): one dict per date with a bar.
+    pct_50 / pct_200: percent of the symbols (that have the history) closing above their moving average. A new high is
+    a high over the highest high of the `high_bars` sessions before it (today excluded), a new low likewise;
+    net_new_highs is the running sum of highs minus lows. A symbol advances when it closes over its own previous
+    close; net_adv_ratio = (advances - declines) / symbols with a previous close x 100, ad_line its running sum
+    divided by 100 (a ratio line, not counts). fast and slow EMAs of net_adv_ratio (seeded with the plain average
+    of the first n); mcclellan_osc = fast - slow. Dates with no symbol that has a previous close are skipped.
+    `days` keeps only the last N dates (0 = all)."""
+    all_dates = sorted({r[0] for rows in rows_by_sym.values() for r in rows})
+    first = all_dates[-days] if days and len(all_dates) > days else None
+    acc = {}
+    for rows in rows_by_sym.values():
+        c, hs, ls = [r[4] for r in rows], [r[2] for r in rows], [r[3] for r in rows]
+        pre = [0.0]
+        for x in c:
+            pre.append(pre[-1] + x)
+        for i, r in enumerate(rows):
+            if first is not None and r[0] < first:
+                continue
+            a = acc.setdefault(r[0], [0, 0, 0, 0, 0, 0, 0, 0, 0])
+            for k, n in enumerate(sma):
+                if i + 1 >= n:
+                    a[2 * k] += 1
+                    if c[i] > (pre[i + 1] - pre[i + 1 - n]) / n:
+                        a[2 * k + 1] += 1
+            if i >= high_bars:
+                if hs[i] > max(hs[i - high_bars:i]):
+                    a[4] += 1
+                if ls[i] < min(ls[i - high_bars:i]):
+                    a[5] += 1
+            if i >= 1:
+                a[8] += 1
+                if c[i] > c[i - 1]:
+                    a[6] += 1
+                elif c[i] < c[i - 1]:
+                    a[7] += 1
+    dates = [d for d in sorted(acc) if acc[d][8]]
+    ratios = [(acc[d][6] - acc[d][7]) * 100.0 / acc[d][8] for d in dates]
+    fast_ema, slow_ema = ema_series(ratios, fast), ema_series(ratios, slow)
+    out, nnh, ad = [], 0, 0.0
+    for i, d in enumerate(dates):
+        a = acc[d]
+        nnh += a[4] - a[5]
+        ad += ratios[i] / 100.0
+        out.append({"date": d.isoformat(), "pct_50": round(a[1] * 100.0 / a[0], 2) if a[0] else None,
+                    "pct_200": round(a[3] * 100.0 / a[2], 2) if a[2] else None, "net_new_highs": nnh,
+                    "ad_line": round(ad, 4),
+                    "mcclellan_osc": round(fast_ema[i] - slow_ema[i], 4) if slow_ema[i] is not None else None,
+                    "net_adv_ratio": round(ratios[i], 2),
+                    "fast_ema": round(fast_ema[i], 4) if fast_ema[i] is not None else None,
+                    "slow_ema": round(slow_ema[i], 4) if slow_ema[i] is not None else None})
+    return out
+
+
+def write_breadth(path, series):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(BREADTH_COLUMNS)
+        for r in series:
+            w.writerow(["" if r[k] is None else r[k] for k in BREADTH_COLUMNS])
+
+
+def regime_note(data_dir=None):
+    """One line about the market from the newest row of breadth.csv, or '' when there is no such file."""
+    path = os.path.join(data_dir or DATA_DIR, "breadth.csv")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        r = rows[-1]
+
+        def num(k):
+            return float(r[k]) if (r.get(k) or "").strip() else None
+        p50, p200, mc = num("pct_50"), num("pct_200"), num("mcclellan_osc")
+        gauge = p200 if p200 is not None else p50
+        if gauge is None:
+            return ""
+    except (OSError, ValueError, IndexError, KeyError):
+        return ""
+    word = "broad strength" if gauge >= BREADTH_STRONG else "weak" if gauge <= BREADTH_WEAK else "mixed"
+    return "Market breadth %s: %s (%s above the 200-day average, %s above the 50-day%s)." % (
+        r["date"], word, ("%.0f%%" % p200) if p200 is not None else "-", ("%.0f%%" % p50) if p50 is not None else "-",
+        (", McClellan %+.1f" % mc) if mc is not None else "")
+
+
 # ---------------------------------------------------------------- long-term screen
 
 LT_SCREENS = [
@@ -1071,12 +1984,17 @@ LT_SCREENS = [
     ("near_52w_high", "near the 52-week high"),
     ("near_52w_low", "near the 52-week low (value screen)"),
     ("oversold", "oversold (RSI under 30)"),
+    ("swing_up", "swing structure up (change-of-character level holding)"),
+    ("swing_reversal_up", "swing trend just reversed up"),
+    ("rs_positive", "relative strength over the Nifty positive and rising (Mansfield)"),
+    ("delivery_spike", "delivery spike (institutional-size trades, high delivery)"),
 ]
 LT_LABEL = dict(LT_SCREENS)
 
 
-def longterm_metrics(rows):
-    """Daily rows (ascending, >= LT_BARS) -> the numbers the long-term screen reads."""
+def longterm_metrics(rows, bench=None, delivery=None):
+    """Daily rows (ascending, >= LT_BARS) -> the numbers the long-term screen reads. `bench` is {date: close} of
+    the relative-strength benchmark (None or empty = mansfield_rs is None); `delivery` this stock's delivery rows."""
     c = [r[4] for r in rows]
     yr = rows[-YEAR_BARS:]
     last = c[-1]
@@ -1086,11 +2004,19 @@ def longterm_metrics(rows):
     lo = min(r[3] for r in yr)
     vol20 = sum(r[5] for r in rows[-20:]) / float(min(20, len(rows)))
     r = rsi(c[-120:])
-    return {"close": last, "dma50": dma50, "dma200": dma200, "vs_200dma_pct": (last / dma200 - 1) * 100,
+    sw = swing_info([(x[2], x[3], x[4]) for x in rows[-SWING_FEED:]])
+    ms = [x[2] for x in mansfield_series([(x[0], x[4]) for x in rows[-SWING_FEED:]], bench)] if bench else []
+    ms = [v for v in ms if v is not None]
+    dr = delivery_reading(delivery, rows[-1][0])
+    return {"close": last, "mansfield_rs": ms[-1] if ms else None,
+            "dq": dr["dq"] if dr else None, "dq_date": dr["date"] if dr and dr["dq"] is not None else None,
+            "delivery_spike": bool(dr and dr["spike"]),
+            "mansfield_prev": ms[-1 - MANSFIELD_RISE_BARS] if len(ms) > MANSFIELD_RISE_BARS else None, "dma50": dma50, "dma200": dma200, "vs_200dma_pct": (last / dma200 - 1) * 100,
             "high52": hi, "low52": lo, "from_high_pct": (last / hi - 1) * 100,
             "above_low_pct": (last / lo - 1) * 100 if lo > 0 else None, "rsi": r, "avg_volume20": vol20,
             "ret_1y_pct": (last / yr[0][4] - 1) * 100 if yr[0][4] else None, "bars": len(rows),
-            "full_year": len(rows) >= YEAR_BARS}
+            "full_year": len(rows) >= YEAR_BARS, "swing_trend": sw["trend"], "swing_coc": sw["coc"],
+            "swing_event": sw["event"], "swing_bars_since": sw["bars_since"], "swing_stable": sw["stable"]}
 
 
 def longterm_tags(m, near_high=5.0, near_low=10.0):
@@ -1103,12 +2029,19 @@ def longterm_tags(m, near_high=5.0, near_low=10.0):
         tags.append("near_52w_low")
     if m["rsi"] is not None and m["rsi"] < 30:
         tags.append("oversold")
+    tags.extend(swing_tag_list(m["swing_trend"], m["swing_event"], m["swing_stable"]))
+    if m["mansfield_rs"] is not None and m["mansfield_prev"] is not None and 0 < m["mansfield_rs"] and \
+            m["mansfield_rs"] > m["mansfield_prev"]:
+        tags.append("rs_positive")
+    if m["delivery_spike"]:
+        tags.append("delivery_spike")
     return tags
 
 
 def scan_longterm(rows_by_sym, symbols, min_price=20.0, min_volume=100000, screen=None, near_high=5.0,
-                  near_low=10.0):
-    """Pure. rows_by_sym = {SYM: daily rows}. Returns (hits, counts, last_date)."""
+                  near_low=10.0, benchmark=None, delivery=None):
+    """Pure. rows_by_sym = {SYM: daily rows}; benchmark = {date: close} for the relative-strength columns;
+    delivery = {SYM: delivery rows} for dq and the delivery_spike screen. Returns (hits, counts, last_date)."""
     counts = {"requested": len(symbols), "cached": 0, "short": 0, "illiquid": 0, "scanned": 0}
     hits, dates = [], {}
     for sym in symbols:
@@ -1119,7 +2052,7 @@ def scan_longterm(rows_by_sym, symbols, min_price=20.0, min_volume=100000, scree
         if len(rows) < LT_BARS:
             counts["short"] += 1
             continue
-        m = longterm_metrics(rows)
+        m = longterm_metrics(rows, benchmark, (delivery or {}).get(sym))
         if m["close"] < min_price or m["avg_volume20"] < min_volume:
             counts["illiquid"] += 1
             continue
@@ -1138,7 +2071,12 @@ def scan_longterm(rows_by_sym, symbols, min_price=20.0, min_volume=100000, scree
                      "above_low_pct": round(m["above_low_pct"], 2) if m["above_low_pct"] is not None else None,
                      "rsi": round(m["rsi"], 1) if m["rsi"] is not None else None,
                      "ret_1y_pct": round(m["ret_1y_pct"], 2) if m["ret_1y_pct"] is not None else None,
-                     "avg_volume20": int(m["avg_volume20"]), "full_year": m["full_year"]})
+                     "avg_volume20": int(m["avg_volume20"]), "full_year": m["full_year"],
+                     "swing_trend": m["swing_trend"],
+                     "swing_coc": round(m["swing_coc"], 2) if m["swing_coc"] is not None else None,
+                     "swing_event": m["swing_event"], "swing_bars_since": m["swing_bars_since"],
+                     "mansfield_rs": round(m["mansfield_rs"], 2) if m["mansfield_rs"] is not None else None,
+                     "dq": round(m["dq"], 2) if m["dq"] is not None else None, "dq_date": m["dq_date"]})
     if screen == "near_52w_low":
         hits.sort(key=lambda h: (h["above_low_pct"], h["symbol"]))
     else:
@@ -1241,7 +2179,7 @@ def cmd_daily(a):
     else:
         progress(a, "Fetching daily closes for %s symbols (%d spark requests)..."
                  % (indian(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
-        data, failed = fetch_spark(symbols, "3mo", "1d", a.pause, a)
+        data, failed = fetch_spark(symbols, "6mo", "1d", a.pause, a)
         if failed:
             got, _, lasts = load_daily_cache(sorted(failed))
             data.update(got)
@@ -1254,7 +2192,8 @@ def cmd_daily(a):
         why = next(iter(failed.values()), "no data") if failed else "no data"
         raise ScanError("no daily closes for any symbol (%s) and no trader/data/daily cache. Next: %s"
                         % (why, DATA_HINT))
-    hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume)
+    delivery = load_delivery(symbols) if a.cache else {}
+    hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume, delivery)
     nfailed = len(symbols) - counts["fetched"]
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily",
@@ -1263,18 +2202,25 @@ def cmd_daily(a):
            "note": NOTE, "hits": hits}
     if cnote:
         doc["cache_note"] = cnote
+    if delivery:
+        doc["delivery_symbols"] = len(delivery)
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
+    regime = regime_note(DATA_DIR)
+    if regime:
+        doc["regime"] = regime
     if not a.no_write:
         write_json(a.out, doc)
     if a.json:
         print(json.dumps(dict(doc, counts=counts, seconds=round(time.time() - t0, 1)), indent=2))
         return 0 if hits else 1
     local = to_ist(now)
-    print("Daily scan, %s IST, closes through %s (%s, daily closes only)." % (
+    print("Daily scan, %s IST, closes through %s (%s)." % (
         local.strftime("%a %Y-%m-%d %H:%M"), last_date.isoformat() if last_date else "nothing",
-        {"yahoo": "Yahoo spark", "cache": "trader-data cache", "yahoo+cache": "Yahoo spark + trader-data cache"}
-        [source]))
+        {"yahoo": "Yahoo spark, daily closes only", "cache": "trader-data cache, highs and lows",
+         "yahoo+cache": "Yahoo spark + trader-data cache"}[source]))
+    if regime:
+        print(regime)
     note_out(a, cnote)
     print("Fetched %s of %s charts%s. %s passed the liquidity filter (₹%s+ and %s+ shares)%s; "
           "%s scanned." % (indian(counts["fetched"]), indian(len(symbols)),
@@ -1285,6 +2231,9 @@ def cmd_daily(a):
                            indian(counts["scanned"])))
     if calendar_note(local.date()):
         print(calendar_note(local.date()) + ".")
+    if delivery:
+        print("Delivery data (trader/data/delivery) for %s of the symbols: dq is today's delivery quantity over its "
+              "30-session average." % indian(len(delivery)))
     if hits:
         per = [(k, sum(1 for h in hits if k in h["setups"])) for k, _ in SETUPS]
         print("%d chart%s matched a setup: %s." % (len(hits), "" if len(hits) == 1 else "s",
@@ -1293,8 +2242,12 @@ def cmd_daily(a):
     else:
         print("No setups.")
     for h in hits[:a.show]:
-        print("  %-10s %14s  RSI %5.1f  %s" % (h["symbol"], money(h["price"]), h["rsi"],
-                                              ", ".join(LABEL[t] for t in h["setups"])))
+        print("  %-10s %14s  RSI %5.1f  %s%s" % (h["symbol"], money(h["price"]), h["rsi"],
+                                                ", ".join(LABEL[t] + (" (dq %.1f)" % h["dq"] if t == "delivery_spike"
+                                                                      else "") for t in h["setups"]),
+                                                ("  [level %s, coc %s]" % (_p(h["level"]), _p(h["coc"])))
+                                                if h["level"] is not None and h["coc"] is not None
+                                                and any(t.startswith("swing_") for t in h["setups"]) else ""))
     if len(hits) > a.show:
         print("  ... and %d more in the watchlist (--show N for more)." % (len(hits) - a.show))
     if not a.no_write:
@@ -1379,6 +2332,19 @@ def cmd_orb(a):
                 raise ScanError("%s; no intraday cache either" % e)
     hits, counts, failed2 = scan_orb(data, symbols, day, cutoff, a.or_minutes, a.min_price, a.min_volume, confirm,
                                      a.max_confirm)
+    tfilter = None
+    if a.trend_filter:
+        daily_rows = {}
+        for h in hits:
+            path = daily_cache_path(h["symbol"], a.data_dir)
+            try:
+                daily_rows[h["symbol"]] = [r for r in read_daily_csv(path) if r[0] < day] if os.path.exists(path) else []
+            except OSError:
+                daily_rows[h["symbol"]] = []
+        hits, dropped = trend_filter(hits, daily_rows)
+        counts["hits"] = len(hits)
+        tfilter = {"kept": len(hits), "dropped": dropped,
+                   "unknown": sum(1 for h in hits if h["daily_trend"] == "unknown")}
     failed = dict(failed or {})
     failed.update(failed2)
     nfailed = len([s for s in symbols if s in failed])
@@ -1393,6 +2359,11 @@ def cmd_orb(a):
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
     if cnote:
         doc["cache_note"] = cnote
+    if tfilter:
+        doc["trend_filter"] = tfilter
+    regime = regime_note(a.data_dir or DATA_DIR)
+    if regime:
+        doc["regime"] = regime
     if not a.no_write:
         write_json(a.out, doc)
     if a.json:
@@ -1402,6 +2373,8 @@ def cmd_orb(a):
     print("Opening-range breakout scan, %s %s IST: %d-minute range (9:15 to %s), 5-minute bars, %s."
           % (day_label(day), clock_label(cutoff), a.or_minutes, clock_label(slot(day, a.or_minutes // BAR_MIN)),
              {"cache": "trader-data cache", "yahoo+cache": "Yahoo + trader-data cache"}.get(source, "Yahoo")))
+    if regime:
+        print(regime)
     print("Fetched %s of %s charts%s; %s usable%s; %s candidates, %s confirmed with real highs and lows."
           % (indian(counts["fetched"]), indian(len(symbols)),
              (" (%s failed or had no data)" % indian(nfailed)) if nfailed else "",
@@ -1410,6 +2383,12 @@ def cmd_orb(a):
              indian(counts["candidates"]), indian(counts["confirmed"])))
     if calendar_note(day):
         print(calendar_note(day) + ".")
+    if tfilter:
+        print("Daily trend filter: dropped %d whose daily swing trend is down%s; %d kept with the daily trend "
+              "unknown." % (len(tfilter["dropped"]),
+                            (" (" + ", ".join(tfilter["dropped"][:10]) + (", ..." if len(tfilter["dropped"]) > 10
+                                                                          else "") + ")") if tfilter["dropped"] else "",
+                            tfilter["unknown"]))
     if counts["unconfirmed"]:
         print("PARTIAL: %s more candidates were not checked (only the %s most traded are; --max-confirm 0 "
               "checks all)." % (indian(counts["unconfirmed"]), indian(a.max_confirm)))
@@ -1418,8 +2397,9 @@ def cmd_orb(a):
               % (len(hits), ("the %s checked" % indian(counts["confirmed"])) if counts["unconfirmed"]
                  else indian(counts["scanned"]), clock_label(cutoff)))
         for h in hits[:a.show]:
-            print("  %8s  %-10s %14s  range %s to %s  %+.2f%% over" % (
-                h["at"], h["symbol"], money(h["price"]), _p(h["or_low"]), _p(h["or_high"]), h["pct_over"]))
+            print("  %8s  %-10s %14s  range %s to %s  %+.2f%% over%s" % (
+                h["at"], h["symbol"], money(h["price"]), _p(h["or_low"]), _p(h["or_high"]), h["pct_over"],
+                "  (%s)" % h["trend_note"] if h.get("trend_note") else ""))
         if len(hits) > a.show:
             print("  ... and %d more in the watchlist (--show N for more)." % (len(hits) - a.show))
     else:
@@ -1434,16 +2414,25 @@ def _p(x):
     return "{:,.2f}".format(x)
 
 
-def cmd_longterm(a):
-    now = parse_now(a.now)
-    data_dir = a.data_dir or DATA_DIR
+def swing_text(h):
+    """'up 1,234.50': the swing trend and its change-of-character level, or '-'."""
+    if not h.get("swing_trend"):
+        return "-"
+    return "%s %s" % (h["swing_trend"], _p(h["swing_coc"]) if h.get("swing_coc") is not None else "-")
+
+
+def cache_symbols(a, data_dir):
+    """With no symbols, watchlist or universe file: every stock in the daily cache, else None."""
     daily_dir = os.path.join(data_dir, "daily")
-    offline_syms = None
     if not (a.symbols or a.watchlist or a.universe) and not os.path.exists(DEFAULT_UNIVERSE):
         if os.path.isdir(daily_dir):   # no universe yet: every stock in the cache
-            offline_syms = sorted({f[:-8] if f.endswith(".adj.csv") else f[:-4]
-                                   for f in os.listdir(daily_dir) if f.endswith(".csv")})
-    symbols = read_symbols(a, offline_syms or None)
+            return sorted({f[:-8] if f.endswith(".adj.csv") else f[:-4]
+                           for f in os.listdir(daily_dir) if f.endswith(".csv")})
+    return None
+
+
+def read_cache_rows(symbols, data_dir):
+    """-> ({SYM: daily rows}, {SYM: path or why}) from the trader-data daily cache."""
     rows, missing = {}, {}
     for sym in symbols:
         path = daily_cache_path(sym, data_dir)
@@ -1454,21 +2443,39 @@ def cmd_longterm(a):
             rows[sym] = read_daily_csv(path)
         except OSError as e:
             missing[sym] = "%s (%s)" % (path, e)
+    return rows, missing
+
+
+def cmd_longterm(a):
+    now = parse_now(a.now)
+    data_dir = a.data_dir or DATA_DIR
+    daily_dir = os.path.join(data_dir, "daily")
+    symbols = read_symbols(a, cache_symbols(a, data_dir) or None)
+    rows, missing = read_cache_rows(symbols, data_dir)
     if not rows:
         raise ScanError("no daily cache in %s for these symbols. Next: run `python3 trader-data/data.py daily "
                         "SYMBOL [SYMBOL ...]`, or %s" % (daily_dir, DATA_HINT))
+    bench, bench_name, bench_note = read_benchmark(data_dir)
+    delivery = load_delivery(sorted(rows), data_dir)
     hits, counts, last_date = scan_longterm(rows, symbols, a.min_price, a.min_volume, a.screen, a.near_high,
-                                            a.near_low)
+                                            a.near_low, bench, delivery)
     lasts = [r[-1][0] for r in rows.values() if r]
     cnote = cache_note("daily", len(rows), lasts)
     stale = last_date and (to_ist(now).date() - last_date).days > 5
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "longterm",
            "as_of": ("%s close" % last_date.isoformat()) if last_date else None, "universe": len(symbols),
            "scanned": counts["scanned"], "missing": len(missing), "source": "cache", "cache_note": cnote,
-           "screen": a.screen or "any",
+           "screen": a.screen or "any", "benchmark": bench_name,
            "filters": {"min_price": a.min_price, "min_volume": a.min_volume, "near_high_pct": a.near_high,
                        "near_low_pct": a.near_low},
            "note": NOTE + " Not financial advice.", "hits": hits}
+    if bench_note:
+        doc["benchmark_note"] = bench_note
+    if delivery:
+        doc["delivery_symbols"] = len(delivery)
+    regime = regime_note(data_dir)
+    if regime:
+        doc["regime"] = regime
     if not a.no_write:
         write_json(a.out, doc)
     if a.json:
@@ -1476,7 +2483,10 @@ def cmd_longterm(a):
         return 0 if hits else 1
     print("Long-term screen, closes through %s (trader-data daily cache)." % (
         last_date.isoformat() if last_date else "nothing"))
+    if regime:
+        print(regime)
     note_out(a, cnote)
+    note_out(a, bench_note)
     if stale:
         print("Note: the newest close is %s, more than 5 days old: refresh with `python3 trader-data/data.py "
               "daily SYMBOL`." % last_date.isoformat())
@@ -1492,13 +2502,15 @@ def cmd_longterm(a):
     if hits:
         per = [(k, sum(1 for h in hits if k in h["setups"])) for k, _ in LT_SCREENS]
         print("%d matched: %s." % (len(hits), ", ".join("%d %s" % (n, LT_LABEL[k]) for k, n in per if n)))
-        print("  %-10s %12s %12s %8s %12s %8s %12s %8s %6s  %s" % (
-            "SYMBOL", "CLOSE", "200-DMA", "VS 200", "52W HIGH", "OFF HI", "52W LOW", "OVER LO", "RSI", "SCREENS"))
+        print("  %-10s %12s %12s %8s %12s %8s %12s %8s %6s %7s %-14s  %s" % (
+            "SYMBOL", "CLOSE", "200-DMA", "VS 200", "52W HIGH", "OFF HI", "52W LOW", "OVER LO", "RSI", "RS",
+            "SWING COCH", "SCREENS"))
         for h in hits[:a.show]:
-            print("  %-10s %12s %12s %+7.1f%% %12s %+7.1f%% %12s %+7.1f%% %6s  %s" % (
+            print("  %-10s %12s %12s %+7.1f%% %12s %+7.1f%% %12s %+7.1f%% %6s %7s %-14s  %s" % (
                 h["symbol"], money(h["price"]), money(h["dma200"]), h["vs_200dma_pct"], money(h["high52"]),
                 h["from_high_pct"], money(h["low52"]), h["above_low_pct"] or 0.0,
                 ("%.1f" % h["rsi"]) if h["rsi"] is not None else "-",
+                ("%+.1f" % h["mansfield_rs"]) if h["mansfield_rs"] is not None else "-", swing_text(h),
                 ", ".join(LT_LABEL[t] for t in h["setups"])))
         if len(hits) > a.show:
             print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, a.out))
@@ -1508,6 +2520,148 @@ def cmd_longterm(a):
         print("Wrote %s (mode longterm, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
     print(NOTE + " Not financial advice. Next: /trader-news SYMBOL, then read the company's filings.")
     return 0 if hits else 1
+
+
+def cmd_patterns(a):
+    now = parse_now(a.now)
+    data_dir = a.data_dir or DATA_DIR
+    daily_dir = os.path.join(data_dir, "daily")
+    symbols = read_symbols(a, cache_symbols(a, data_dir) or None)
+    rows, missing = read_cache_rows(symbols, data_dir)
+    if not rows:
+        raise ScanError("no daily cache in %s for these symbols. Next: run `python3 trader-data/data.py daily "
+                        "SYMBOL [SYMBOL ...]`, or %s" % (daily_dir, DATA_HINT))
+    only = [a.pattern] if a.pattern else None
+    hits, counts, last_date = scan_patterns(rows, symbols, a.min_price, a.min_volume, only,
+                                            None if a.state == "any" else a.state)
+    previous = None
+    if os.path.exists(a.out):
+        try:
+            with open(a.out, encoding="utf-8") as fh:
+                previous = json.load(fh)
+        except (OSError, ValueError):
+            previous = None
+    carry_first_seen(hits, previous)
+    lasts = [r[-1][0] for r in rows.values() if r]
+    cnote = cache_note("daily", len(rows), lasts)
+    stale = last_date and (to_ist(now).date() - last_date).days > 5
+    doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "patterns",
+           "as_of": ("%s close" % last_date.isoformat()) if last_date else None, "universe": len(symbols),
+           "scanned": counts["scanned"], "missing": len(missing), "source": "cache", "cache_note": cnote,
+           "pattern": a.pattern or "any", "state": a.state,
+           "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
+           "note": NOTE + " Not financial advice.", "hits": hits}
+    regime = regime_note(data_dir)
+    if regime:
+        doc["regime"] = regime
+    if not a.no_write:
+        write_json(a.out, doc)
+    if a.json:
+        print(json.dumps(dict(doc, counts=counts), indent=2))
+        return 0 if hits else 1
+    print("Pattern scan, closes through %s (trader-data daily cache)." % (
+        last_date.isoformat() if last_date else "nothing"))
+    if regime:
+        print(regime)
+    note_out(a, cnote)
+    if stale:
+        print("Note: the newest close is %s, more than 5 days old: refresh with `python3 trader-data/data.py "
+              "daily SYMBOL`." % last_date.isoformat())
+    print("%s of %s symbols cached%s; %s with %d+ sessions and over the liquidity filter (\u20b9%s+ and %s+ shares a "
+          "day over 20 days); %s scanned." % (
+              indian(counts["cached"]), indian(len(symbols)),
+              (" (%s missing: `python3 trader-data/data.py daily SYMBOL`)" % indian(len(missing))) if missing else "",
+              indian(counts["scanned"] + counts["illiquid"]), PAT["min_bars"], _n(a.min_price),
+              indian(a.min_volume), indian(counts["scanned"])))
+    if counts["short"]:
+        print("%s had under %d sessions in the cache." % (indian(counts["short"]), PAT["min_bars"]))
+    print("Pivots need %d bars on each side, so a turn in the last %d sessions is not visible yet. The VCP needs 200 "
+          "sessions." % (PAT["L"], PAT["R"]))
+    if hits:
+        per = [(k, sum(1 for h in hits if k in h["setups"])) for k, _ in PATTERNS]
+        print("%d matched: %s." % (len(hits), ", ".join("%d %s" % (n, PAT_LABEL[k]) for k, n in per if n)))
+        print("  %-10s %-24s %-8s %12s %12s %12s %6s %12s  %s" % (
+            "SYMBOL", "PATTERN", "STATE", "CLOSE", "LEVEL", "STOP", "RISK", "TARGET", "SEEN"))
+        for h in hits[:a.show]:
+            print("  %-10s %-24s %-8s %12s %12s %12s %5.1f%% %12s  %s%s" % (
+                h["symbol"], h["pattern"], h["state"], money(h["price"]), money(h["level"]), money(h["stop"]),
+                h["risk_pct"], money(h["target"]) if h["target"] is not None else "-", h["first_seen"],
+                "  (new)" if h["first_seen"] == h["close_date"] else ""))
+        if len(hits) > a.show:
+            print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, a.out))
+    else:
+        print("Nothing matched.")
+    if not a.no_write:
+        print("Wrote %s (mode patterns, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
+    print(NOTE + " Not financial advice. Next: /trader-news SYMBOL, then /trader-entry SYMBOL for the level.")
+    return 0 if hits else 1
+
+
+def cmd_breadth(a):
+    now = parse_now(a.now)
+    data_dir = a.data_dir or DATA_DIR
+    daily_dir = os.path.join(data_dir, "daily")
+    symbols = read_symbols(a, cache_symbols(a, data_dir) or None)
+    rows, missing, unadjusted = {}, {}, []
+    for sym in symbols:
+        adj = os.path.join(daily_dir, "%s.adj.csv" % sym)
+        if not os.path.exists(adj) and not a.unadjusted:
+            if os.path.exists(daily_cache_path(sym, data_dir)):
+                unadjusted.append(sym)
+            else:
+                missing[sym] = adj
+            continue
+        path = daily_cache_path(sym, data_dir)
+        if not os.path.exists(path):
+            missing[sym] = path
+            continue
+        try:
+            got = read_daily_csv(path)
+        except OSError as e:
+            missing[sym] = "%s (%s)" % (path, e)
+            continue
+        if got:
+            rows[sym] = got
+    if not rows:
+        raise ScanError("no adjusted daily cache (<SYMBOL>.adj.csv) in %s for these symbols%s. Next: run `python3 "
+                        "trader-data/data.py daily SYMBOL [SYMBOL ...]`, or %s" % (
+                            daily_dir, (" (%s have only an unadjusted .csv: --unadjusted uses them, but a split "
+                                        "then fakes a new low)" % indian(len(unadjusted))) if unadjusted else "",
+                            DATA_HINT))
+    series = breadth_series(rows, days=BREADTH_DAYS if a.days is None else a.days)
+    out = a.out or os.path.join(data_dir, "breadth.csv")
+    if not a.no_write:
+        write_breadth(out, series)
+    last = series[-1] if series else None
+    doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "breadth",
+           "symbols": len(rows), "skipped_unadjusted": len(unadjusted), "missing": len(missing),
+           "rows": len(series), "out": None if a.no_write else out, "last": last, "caveat": BREADTH_CAVEAT,
+           "unadjusted_included": bool(a.unadjusted)}
+    if a.json:
+        print(json.dumps(doc, indent=2))
+        return 0 if series else 1
+    print("Market breadth from %s symbols in the trader-data daily cache%s." % (
+        indian(len(rows)), "" if a.unadjusted else " (adjusted .adj.csv files only)"))
+    if unadjusted:
+        print("Skipped %s with only an unadjusted .csv (a split would fake a new low): --unadjusted uses them."
+              % indian(len(unadjusted)))
+    if missing:
+        print("%s not in the cache: `python3 trader-data/data.py daily SYMBOL`." % indian(len(missing)))
+    if last:
+        print("%d dates, %s to %s. Latest %s:" % (len(series), series[0]["date"], last["date"], last["date"]))
+        print("  above the 50-day average  %s" % (("%.1f%%" % last["pct_50"]) if last["pct_50"] is not None else "-"))
+        print("  above the 200-day average %s" % (("%.1f%%" % last["pct_200"]) if last["pct_200"] is not None else
+                                                  "- (under 200 sessions of history)"))
+        print("  net new highs (running)   %+d" % last["net_new_highs"])
+        print("  A/D line (ratio, running) %+.2f" % last["ad_line"])
+        print("  McClellan oscillator      %s" % (("%+.2f" % last["mcclellan_osc"]) if last["mcclellan_osc"] is not None
+                                                  else "- (needs %d dates)" % BREADTH_SLOW))
+    else:
+        print("No dates with a previous close to compare.")
+    print("Caveat: %s." % BREADTH_CAVEAT)
+    if not a.no_write:
+        print("Wrote %s (%d rows). The other scans print a one-line regime note from it." % (out, len(series)))
+    return 0 if series else 1
 
 
 def main(argv=None):
@@ -1554,6 +2708,9 @@ def main(argv=None):
     p.add_argument("--at", help="cut the clock at this IST time, HH:MM")
     p.add_argument("--until", help="no new entries after HH:MM IST (default: config no_entries_after, %s)" % DEFAULT_UNTIL)
     p.add_argument("--config", default="trader/config.json")
+    p.add_argument("--trend-filter", action="store_true",
+                   help="drop names whose daily swing trend (trader-data daily cache) is down; no cache = kept, flagged")
+    p.add_argument("--data-dir", help="the trader-data folder for --trend-filter (default %s)" % DATA_DIR)
     p = sub.add_parser("longterm", help="long-term screen of the trader-data daily cache (no network)")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--symbols", help="comma-separated NSE symbols instead of the universe")
@@ -1572,12 +2729,46 @@ def main(argv=None):
     p.add_argument("--no-write", action="store_true")
     p.add_argument("--show", type=int, default=50)
     p.add_argument("--json", action="store_true")
+    p = sub.add_parser("patterns", help="chart patterns (VCP, double bottom, flag, ...) in the trader-data daily cache")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--symbols", help="comma-separated NSE symbols instead of the universe")
+    g.add_argument("--watchlist", metavar="FILE", help="a watchlist.json (hits) or a text file of NSE symbols")
+    p.add_argument("--universe", help="symbol list (default %s; without it, every stock in the cache)"
+                   % DEFAULT_UNIVERSE)
+    p.add_argument("--limit", type=int)
+    p.add_argument("--pattern", choices=[k for k, _ in PATTERNS], help="look for this pattern only (default: all)")
+    p.add_argument("--state", choices=["coiled", "breakout", "any"], default="any",
+                   help="coiled (formed, not broken out) or breakout (first close over the trigger); default any")
+    p.add_argument("--min-price", type=float, default=20.0)
+    p.add_argument("--min-volume", type=int, default=100000, help="20-day average volume (1,00,000)")
+    p.add_argument("--data-dir", help="the trader-data folder (default %s)" % DATA_DIR)
+    p.add_argument("--now", help='pretend it is this time ("2026-10-29 08:30" IST)')
+    p.add_argument("--out", default="trader/watchlist.json")
+    p.add_argument("--no-write", action="store_true")
+    p.add_argument("--show", type=int, default=50)
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("breadth", help="market breadth from the trader-data daily cache -> trader/data/breadth.csv")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--symbols", help="comma-separated NSE symbols instead of the universe")
+    g.add_argument("--watchlist", metavar="FILE", help="a watchlist.json (hits) or a text file of NSE symbols")
+    p.add_argument("--universe", help="symbol list (default %s; without it, every stock in the cache)"
+                   % DEFAULT_UNIVERSE)
+    p.add_argument("--limit", type=int)
+    p.add_argument("--unadjusted", action="store_true",
+                   help="also use symbols that have only an unadjusted <SYMBOL>.csv (a split fakes a new low)")
+    p.add_argument("--days", type=int, help="dates to write (%d; 0 = every date in the cache)" % BREADTH_DAYS)
+    p.add_argument("--data-dir", help="the trader-data folder (default %s)" % DATA_DIR)
+    p.add_argument("--now", help='pretend it is this time ("2026-10-29 08:30" IST)')
+    p.add_argument("--out", help="default <data-dir>/breadth.csv")
+    p.add_argument("--no-write", action="store_true")
+    p.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
         return 1
     try:
-        return {"universe": cmd_universe, "daily": cmd_daily, "orb": cmd_orb, "longterm": cmd_longterm}[a.cmd](a)
+        return {"universe": cmd_universe, "daily": cmd_daily, "orb": cmd_orb, "longterm": cmd_longterm,
+                "patterns": cmd_patterns, "breadth": cmd_breadth}[a.cmd](a)
     except ScanError as e:
         print("scan.py: %s" % e, file=sys.stderr)
         return 1
