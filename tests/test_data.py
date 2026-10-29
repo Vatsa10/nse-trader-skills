@@ -87,9 +87,14 @@ class Net(unittest.TestCase):
         return data.read_daily(data.data_paths(self.dd, sym)[1 if adj else 0])
 
     def seed(self, sym, upto):
-        """Cache the real RELIANCE-style rows up to a date (from the real fixture)."""
-        rows, _ = data.parse_ohlc_csv(rd(os.path.join(REAL, sym, "daily.csv")), sym)
-        data.write_daily(data.data_paths(self.dd, sym)[0], [r for r in rows if "2026-09-01" <= r["date"] <= upto])
+        """Cache flat made-up bars on every NSE trading day from 2026-09-01 up to a date."""
+        px = {"RELIANCE": 1185.0, "TCS": 2520.0}[sym]   # near the bhavcopy fixtures, so no split warning
+        d, rows = datetime.date(2026, 9, 1), []
+        while d.isoformat() <= upto:
+            if d.weekday() < 5 and d.isoformat() not in data.NSE_HOLIDAYS_2026:
+                rows.append(data.bar(d.isoformat(), px, px + 5, px - 5, px, 1000000))
+            d += datetime.timedelta(days=1)
+        data.write_daily(data.data_paths(self.dd, sym)[0], rows)
 
 
 # ---------------------------------------------------------------- calendar
@@ -188,9 +193,12 @@ class Validation(unittest.TestCase):
 # ---------------------------------------------------------------- real NSE data
 
 def real_symbols():
+    if not os.path.isdir(REAL):
+        return []
     return sorted(d for d in os.listdir(REAL) if os.path.isfile(os.path.join(REAL, d, "daily.csv")))
 
 
+@unittest.skipUnless(real_symbols(), "no real NSE fixtures: run data.py record SYMBOL to make your own")
 class RealData(Net):
     def test_have_real_data(self):
         self.assertGreaterEqual(len(real_symbols()), 3)

@@ -77,12 +77,12 @@ import the saved JSON. `data.py doctor` shows which sources work from your
 network. The scanner ships a real Nifty 500 list snapshot for when NSE blocks
 the download.
 
-**Test data was synthetic.** The suite now includes 3 years (Oct 2023 to Oct
-2026) of real NSE daily bhavcopy data for RELIANCE, TCS, INFY, IOC, HDFCBANK,
-NIFTYBEES and HINDCOPPER (source and commit in each `provenance.json`), and
-the backtester, data layer and long-term screens are tested on it. Intraday
-fixtures are still synthetic: run `data.py record SYMBOL` on your machine to
-capture real sessions, and `NSE_LIVE=1 python3 -m unittest tests.test_live`
+**Test data was synthetic.** No multi-year price history ships with this
+repo, because free sources do not license their data for redistribution. Run
+`data.py record SYMBOL` on your machine (for example RELIANCE, TCS, INFY,
+NIFTYBEES) to save real daily and intraday data under `tests/fixtures/real/`;
+the offline suite then runs its real-data checks on those files and skips
+them when the folder is absent. Run `NSE_LIVE=1 python3 -m unittest tests.test_live`
 to test every live source end to end.
 
 **Charges and circuit limits were estimates.** Charges now use Zerodha's
@@ -97,7 +97,7 @@ band, and anything unknown is labelled unknown instead of guessed.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests            # offline, includes real NSE daily data
+python3 -m unittest discover -s tests            # offline; real-data checks run if you recorded any
 NSE_LIVE=1 python3 -m unittest tests.test_live   # live sources, on your machine
 ```
 
@@ -107,5 +107,3 @@ Not financial advice. Scorecards and backtests describe the past and your
 inputs; they do not predict prices. Tax figures are estimates; check with a CA.
 Most intraday traders in India lose money (SEBI, FY23). Update the NSE holiday
 lists each year. MIT licence, see LICENSE; original work by Jake Schincariol.
-Real price fixtures come from github.com/BennyThadikaran/eod2_data (NSE
-bhavcopy); see each provenance.json.

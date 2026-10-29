@@ -1,6 +1,6 @@
 {
  "what": "format samples for trader-data tests",
- "real_values": "OHLCV numbers come from tests/fixtures/real (NSE bhavcopy-derived eod2_data, see its provenance.json)",
+ "real_values": "OHLCV numbers are NSE bhavcopy values for a few October 2026 sessions",
  "synthetic": [
   "yahoo-5m-RELIANCE.json",
   "nse-chart-RELIANCE.json",
