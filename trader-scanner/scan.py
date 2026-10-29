@@ -1759,7 +1759,7 @@ def fallback_list(why=None):
         with open(path, encoding="utf-8", errors="replace") as fh:
             text = fh.read()
         try:
-            return list_from_any(text, path), "%sused %s (trader-data)" % (lead, path)
+            return list_from_any(text, path), "%sused %s (trader-data)" % (lead, path.replace(os.sep, "/"))
         except ScanError as e:
             lead += "%s: %s; " % (path, e)
     if os.path.exists(SNAPSHOT_FILE):
