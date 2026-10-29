@@ -641,7 +641,8 @@ def _n(x):
 
 
 def rules_from_plan(plan, cfg_flat_by=None):
-    """trader/plan.json -> a stop alert, a target alert and a flat-by-close time alert, for the plan's day."""
+    """trader/plan.json -> a stop alert, a target alert and a flat-by-close time alert, for the plan's day.
+    A CNC (delivery) plan is held past the close, so it gets no flat-by alert."""
     if not isinstance(plan, dict) or not plan.get("symbol"):
         raise AlertError("the plan has no symbol (run trader-exit first)")
     sym = str(plan["symbol"]).upper()
@@ -653,11 +654,12 @@ def rules_from_plan(plan, cfg_flat_by=None):
         label = plan.get("%s_label" % key)
         out.append({"id": "%s-plan-%s" % (sym.lower(), key), "symbol": sym, "type": typ, "price": float(v),
                     "note": word + (": " + label if label else "")})
-    flat = plan.get("flat_by") or cfg_flat_by or "15:15"
-    if _hhmm(flat) is None:
-        raise AlertError("the plan's flat_by %r is not a time like 15:15" % flat)
-    out.append({"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
-                "label": "flat by %s" % flat})
+    if str(plan.get("product") or "").upper() != "CNC":
+        flat = plan.get("flat_by") or cfg_flat_by or "15:15"
+        if _hhmm(flat) is None:
+            raise AlertError("the plan's flat_by %r is not a time like 15:15" % flat)
+        out.append({"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
+                    "label": "flat by %s" % flat})
     if plan.get("date"):
         for r in out:
             r["date"] = str(plan["date"])

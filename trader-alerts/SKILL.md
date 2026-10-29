@@ -28,7 +28,7 @@ what happened and when it is time to be flat.
 
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" clock                          # NSE open or closed, next open (IST)
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --from-plan                # stop, target, flat by 15:15 from trader/plan.json
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --from-plan                # stop, target, flat by 15:15 (no flat-by for a CNC plan) from trader/plan.json
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --opening-bell
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --symbol HINDCOPPER --stop 308.10
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --symbol HINDCOPPER --target 320.50
@@ -126,6 +126,9 @@ session: ...". Alert times are not tracked for the Muhurat hour.
 
 1. Right after trader-exit writes the plan, run `add --from-plan`. Confirm
    the three alerts back to the user: the stop, the target and the flat-by time.
+   A plan from trader-exit with `"product": "CNC"` (a delivery hold) has no
+   flat-by time: it gets only the stop and the target alert, and you confirm
+   those two.
 2. Run `check` while the trade is open: every few minutes from a Claude
    scheduled task or `/loop`. Each run fetches only the symbols in today's
    rules and rings each alert once. A check reads the latest delayed quote;

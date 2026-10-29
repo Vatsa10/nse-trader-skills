@@ -434,6 +434,18 @@ class Rules(unittest.TestCase):
         q["HINDCOPPER"]["price"] = 320.50
         self.assertEqual([r["id"] for r in self.at("2026-10-19 12:00", rules, st, q)[0]], ["hindcopper-plan-target"])
 
+    def test_a_cnc_plan_has_no_flat_by(self):
+        with open(PLAN) as fh:
+            plan = json.load(fh)
+        plan.update({"product": "CNC", "flat_by": None})
+        rules = alerts.rules_from_plan(plan)
+        self.assertEqual([(r["id"], r["type"]) for r in rules],
+                         [("hindcopper-plan-stop", "stop"), ("hindcopper-plan-target", "target")])
+        self.assertEqual(len(alerts.rules_from_plan(dict(plan, product="cnc"))), 2)
+        self.assertEqual(len(alerts.rules_from_plan(dict(plan, product="CNC"), "15:00")), 2)   # even with a config time
+        self.assertEqual(len(alerts.rules_from_plan(dict(plan, product="MIS", flat_by=None))), 3)
+        self.assertEqual(len(alerts.rules_from_plan({"symbol": "BEL", "stop": 1, "target": 2})), 3)
+
     def test_flat_by_rings_once_per_trading_day(self):
         rules = plan_rules()[2:]
         self.assertEqual(self.at("2026-10-19 15:14", rules)[0], [])
