@@ -4,9 +4,11 @@ description: >-
   Exit Planner for NSE intraday trades. Sets your stop and your target before
   you enter, so you know when to get out. Reads the entry from trader-entry
   (or a price you give), puts the stop at the opening-range midpoint by
-  default (or the range low, your price, a percent, or a multiple of the ATR),
-  rounds it down to the paisa, and sets the target at 2R (or 1R, or your
-  price). Shows approximate Indian intraday costs (brokerage, STT, exchange,
+  default (or the range low, your price, a percent, a multiple of the ATR, or
+  the swing structure's change-of-character level), rounds it down to the
+  paisa, and sets the target at 2R (or 1R, or your price). With
+  `--product CNC` it plans a delivery (swing) hold instead: no flat-by,
+  delivery charges with the DP fee. Shows approximate Indian intraday costs (brokerage, STT, exchange,
   SEBI, GST, stamp, from the shared Zerodha charges model, calibrated from
   contract notes when trader/charges.json says so) and reward:risk after
   costs, and warns when the stop sits at or past the stock's real lower
@@ -17,7 +19,7 @@ description: >-
   stop and target", "plan the exit", "when do I get out", "stop loss", "what's
   my R", "risk reward", or right after /trader-entry triggers, before
   /trader-timemachine.
-argument-hint: "[--stop or-mid|or-low|price:X|pct:X|atr:K] [--target 2R|1R|price:X] [--band 5|10|20]"
+argument-hint: "[--stop or-mid|or-low|price:X|pct:X|atr:K|swing] [--target 2R|1R|price:X] [--product MIS|CNC] [--band 5|10|20]"
 ---
 
 # trader-exit
@@ -40,14 +42,19 @@ python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop or-mid --target 1R --write
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop atr:1.5           # needs the session's bars (Yahoo .NS or --offline)
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --symbol RELIANCE --entry 364.18 --or-high 362.18 --or-low 354.47
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --symbol HINDCOPPER --entry 310.40 --setup level --stop pct:1 --band 10
+python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop swing --offline RELIANCE.json   # the session's swing structure level
+python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --symbol HDFCBANK --entry 1690.25 --setup level --level 1688 --stop swing --product CNC
 python3 "${CLAUDE_SKILL_DIR}/exit.py" show                          # the current trader/plan.json
 ```
 
 Other flags: `--flat-by 15:15`, `--qty N` (shares for the cost estimate,
 default about ₹1,00,000 worth), `--band 2|5|10|20` (the stock's circuit band),
 `--json`, `--now "2026-10-19 10:00"` (IST), `--entry PRICE` with a waiting
-entry.json to plan ahead, `--setup level`, `--offline FILE` (a saved Yahoo
-chart JSON for an ATR stop). Symbols are NSE symbols (RELIANCE, M&M,
+entry.json to plan ahead, `--setup level` (with `--level PRICE`, kept in
+plan.json so trader-timemachine can replay "first close above the level"),
+`--offline FILE` (a saved Yahoo chart JSON for an ATR or swing stop),
+`--product MIS|CNC` (default MIS), `--daily-dir DIR` (daily bars for a CNC
+swing stop, default `trader/data/daily`). Symbols are NSE symbols (RELIANCE, M&M,
 BAJAJ-AUTO); the tool adds `.NS` for Yahoo. F&O contracts are refused.
 
 ## What it reads and writes
@@ -56,7 +63,8 @@ BAJAJ-AUTO); the tool adds `.NS` for Yahoo. F&O contracts are refused.
 | --- | --- |
 | `trader/entry.json` | the trigger from trader-entry: symbol, entry price, time, bar, opening range |
 | `trader/config.json` | `flat_by` (15:15) and `min_reward_risk` (1.0: a note here, trader-risk enforces it) |
-| Yahoo chart API | only for an `atr:K` stop: the session's bars (`SYMBOL.NS`) up to the entry bar, free and unofficial. query1 first, then query2 |
+| `trader/data/daily/<SYMBOL>.adj.csv` (else `.csv`) | only for `--stop swing --product CNC`: the daily bars before the plan's day (trader-data writes them) |
+| Yahoo chart API | only for an `atr:K` or intraday `swing` stop: the session's bars (`SYMBOL.NS`) up to the entry bar, free and unofficial. query1 first, then query2 |
 | `trader/data/intraday/<SYMBOL>-5m.json` | the trader-data cache for an `atr:K` stop: with `--cache`, or when Yahoo fails (it prints the data's time) |
 | `trader/data/bands.json` | the price bands trader-data writes: `band_pct`, `lower`, `upper` per symbol. Read when present (`--bands PATH`) |
 | `trader/charges.json` | optional charges override, deep-merged over the built-in Zerodha defaults; its `calibration` (written by trader-broker `reconcile`) scales the total (`--charges PATH`) |
@@ -71,8 +79,17 @@ BAJAJ-AUTO); the tool adds `.NS` for Yahoo. F&O contracts are refused.
 | `price:X` | your price |
 | `pct:X` | X percent under the entry |
 | `atr:K` | K times the 14-bar ATR under the entry, on the session's bars up to the entry bar. With fewer than 14 bars by then it averages all of them and says so |
+| `swing` | the change-of-character level of the swing structure, rounded down. Intraday: the session's bars up to the entry bar, no pullback filter (by 10:00 there are few bars, so it often equals the opening range). With `--product CNC`: the daily cache bars before the plan's day, pullbacks under 5% ignored, more than 40 bars wanted |
 
 A level setup has no opening range to lean on, so it needs a stop you name.
+
+The swing stop is refused, with the reason, when the swing trend is not up
+("the swing trend is down on the 8 session bars"), when no trend has started
+yet, when a daily series has too few bars, or when the level is at or above
+the entry. It is a closing-basis level: the structure only breaks on a close
+under it, a wick through it does nothing, so as a resting price stop it is
+tighter than the structure itself (the plan says so). The daily one belongs
+to a delivery hold; for an intraday trade it is usually far from price.
 
 - **Rounding.** The stop rounds AWAY from the entry to the paisa (down, for a
   long). Risk = entry minus stop. Target = entry + R x risk, rounded half up
@@ -87,6 +104,14 @@ A level setup has no opening range to lean on, so it needs a stop you name.
   (MIS) positions at about 15:20, so a later flat-by gets a note, and one at
   or after the 15:30 close is refused. NSE has no early closes. An entry at
   or after the flat-by time is refused.
+- **Delivery mode (`--product CNC`).** For a pattern or swing plan held
+  overnight. No flat-by (the plan says `"flat_by": null` and `"product":
+  "CNC"`; an intraday plan carries no `product` key, as before), costs priced
+  with the delivery charges (STT 0.1% both sides, stamp 0.015% on the buy, DP
+  fee on the sell, from the same shared model), and a note that a gap at the
+  open can fill well past the stop and that the stop needs a resting order or
+  an alert. trader-budget reads `product`. trader-alerts adds its default
+  flat-by-close alert from a plan with no flat_by: skip that one for a CNC hold.
 - **Costs (approximate).** Zerodha intraday (MIS) charges for a round trip,
   verified 2026-10-29 from zerodha.com/charges: brokerage min(₹20, 0.03%) an
   order, STT 0.025% on the sell, NSE exchange transaction 0.00307%, SEBI ₹10

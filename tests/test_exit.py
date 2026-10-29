@@ -409,6 +409,217 @@ class V4DataChargesBands(unittest.TestCase):
         self.assertEqual(exitp.HOSTS, ("query1", "query2"))
 
 
+# Series A / B of the swing spec as (high, low, close)
+SERIES_A = [(10, 8, 9), (11, 9, 10.5), (12, 10, 11.8), (11.5, 10.5, 11), (11.2, 10.2, 10.4), (12.6, 11, 12.4),
+            (12.4, 11.6, 11.8), (11.9, 9.8, 10.0)]
+
+
+def bars_of(hlc):
+    return [{"h": h, "l": l, "c": c} for h, l, c in hlc]
+
+
+def write_chart(path, hlc, day=None, sym="RELIANCE.NS"):
+    """A saved Yahoo 5-minute chart of one session (09:15 IST onward) from (high, low, close) tuples."""
+    day = day or exitp.datetime.date(2026, 10, 19)
+    t0 = int((exitp.datetime.datetime.combine(day, exitp.datetime.time(9, 15)) - exitp.IST_OFFSET
+              - exitp.EPOCH).total_seconds())
+    stamps = [t0 + 300 * i for i in range(len(hlc))]
+    doc = {"chart": {"result": [{"meta": {"symbol": sym, "regularMarketTime": stamps[-1] + 3000},
+                                 "timestamp": stamps,
+                                 "indicators": {"quote": [{"open": [c for _, _, c in hlc],
+                                                           "high": [h for h, _, _ in hlc],
+                                                           "low": [l for _, l, _ in hlc],
+                                                           "close": [c for _, _, c in hlc],
+                                                           "volume": [1000] * len(hlc)}]}}], "error": None}}
+    with open(path, "w") as fh:
+        json.dump(doc, fh)
+
+
+def write_daily(folder, sym, hlc, last=exitp.datetime.date(2026, 10, 16)):
+    """Daily bars ending on `last`, weekdays only, one per (high, low, close)."""
+    days, d = [], last
+    while len(days) < len(hlc):
+        if d.weekday() < 5:
+            days.append(d)
+        d -= exitp.datetime.timedelta(days=1)
+    days.reverse()
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, sym + ".adj.csv"), "w") as fh:
+        fh.write("date,open,high,low,close,volume\n")
+        for day, (h, l, c) in zip(days, hlc):
+            fh.write("%s,%s,%s,%s,%s,1000\n" % (day.isoformat(), c, h, l, c))
+
+
+class SwingStop(unittest.TestCase):
+    def test_compute_from_the_spec(self):
+        p = exitp.compute(12.5, "swing", None, "r", 2, swing_coc=10.2)
+        self.assertEqual(p["stop"], Decimal("10.20"))
+        self.assertEqual(p["risk"], Decimal("2.30"))
+        self.assertEqual(p["target"], Decimal("17.10"))
+        self.assertEqual(p["reward_risk"], Decimal("2.00"))
+        self.assertEqual(p["stop_label"], "swing change-of-character level")
+        self.assertEqual(exitp.parse_stop("swing"), ("swing", None))
+
+    def test_floor_to_the_paisa_and_the_existing_refusals(self):
+        self.assertEqual(exitp.compute(12.5, "swing", None, "r", 2, swing_coc=10.239)["stop"], Decimal("10.23"))
+        with self.assertRaises(exitp.PlanError) as cm:
+            exitp.compute(10.0, "swing", None, "r", 2, swing_coc=10.2)
+        self.assertIn("at or above the entry", str(cm.exception))
+        with self.assertRaises(exitp.PlanError):
+            exitp.compute(12.5, "swing", None, "r", 2)                  # no level: refuse, not guess
+
+    def test_uptrend_gives_the_coc_and_downtrend_is_refused(self):
+        got = exitp.swing_stop(bars_of(SERIES_A[:6]))
+        self.assertEqual((got["trend"], got["coc"], got["bars"]), ("up", 10.2, 6))
+        with self.assertRaises(exitp.PlanError) as cm:
+            exitp.swing_stop(bars_of(SERIES_A))                          # bar 8 closes under 10.2: DOWN
+        self.assertIn("trend is down", str(cm.exception))
+
+    def test_no_trend_yet_and_too_few_bars(self):
+        with self.assertRaises(exitp.PlanError) as cm:
+            exitp.swing_stop(bars_of([(10, 8, 9)] * 5))
+        self.assertIn("no swing trend yet", str(cm.exception))
+        with self.assertRaises(exitp.PlanError) as cm:
+            exitp.swing_stop(bars_of(SERIES_A[:6]), 5.0, 40, "daily")
+        self.assertIn("needs more than 40", str(cm.exception))
+
+    def test_retrace_filter_moves_the_level(self):
+        # a 15 % pullback counts at 5 %, and is ignored at 20 %: the level stays at the opening range low
+        self.assertEqual(exitp.swing_stop(bars_of(SERIES_A[:6]), 5.0)["coc"], 10.2)
+        self.assertEqual(exitp.swing_stop(bars_of(SERIES_A[:6]), 20.0)["coc"], 8)
+
+
+class SwingCli(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        os.chdir(self.d)
+        os.mkdir("trader")
+        self.chart = os.path.join(self.d, "chart.json")
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def plan(self, *args):
+        return run(exitp, ["plan", "--now", "2026-10-19 10:01"] + list(args))
+
+    def flags(self, entry="12.5", bar="5", *extra):
+        return ["--symbol", "RELIANCE", "--entry", entry, "--setup", "level", "--date", "2026-10-19",
+                "--entry-bar", bar, "--offline", self.chart, "--json"] + list(extra)
+
+    def test_session_swing_stop_end_to_end(self):
+        write_chart(self.chart, SERIES_A)
+        code, text, err = self.plan(*self.flags(), "--stop", "swing")
+        self.assertEqual(code, 0, err)
+        p = json.loads(text)
+        self.assertEqual((p["stop"], p["risk_per_share"], p["target"], p["reward_risk"]), (10.2, 2.3, 17.1, 2.0))
+        self.assertEqual(p["stop_rule"], "swing")
+        self.assertEqual(p["swing"]["coc"], 10.2)
+        self.assertEqual((p["swing"]["trend"], p["swing"]["bars"]), ("up", 6))
+        self.assertEqual(p["flat_by"], "15:15")
+        self.assertNotIn("product", p)                                  # MIS plans look exactly as before
+        self.assertTrue(any("closing-basis" in w for w in p["warnings"]))
+
+    def test_session_downtrend_is_refused_with_the_reason(self):
+        write_chart(self.chart, SERIES_A)
+        code, _, err = self.plan(*self.flags("10.0", "7"), "--stop", "swing")
+        self.assertEqual(code, 1)
+        self.assertIn("trend is down", err)
+        code, _, err = self.plan(*self.flags("12.5", "1"), "--stop", "swing")   # two bars only
+        self.assertIn("a swing stop needs at least 3 closed", err)
+
+    def test_coc_at_or_above_the_entry_is_refused(self):
+        write_chart(self.chart, SERIES_A)
+        code, _, err = self.plan(*self.flags("10.2"), "--stop", "swing")
+        self.assertEqual(code, 1)
+        self.assertIn("at or above the entry", err)
+
+    def test_cnc_swing_stop_reads_the_daily_cache(self):
+        daily = os.path.join(self.d, "daily")
+        write_daily(daily, "RELIANCE", [(10, 8, 9)] * 36 + SERIES_A[:6])       # 42 bars, trend up, coc 10.2
+        args = ["--symbol", "RELIANCE", "--entry", "12.5", "--setup", "level", "--date", "2026-10-19",
+                "--stop", "swing", "--product", "CNC", "--daily-dir", daily, "--qty", "100", "--json"]
+        code, text, err = self.plan(*args)
+        self.assertEqual(code, 0, err)
+        p = json.loads(text)
+        self.assertEqual((p["stop"], p["target"]), (10.2, 17.1))
+        self.assertEqual((p["product"], p["flat_by"]), ("CNC", None))
+        self.assertEqual((p["swing"]["bars"], p["swing"]["retrace_pct"]), (42, 5.0))
+        self.assertTrue(p["swing"]["source"].endswith("RELIANCE.adj.csv"))
+        self.assertTrue(any("held overnight" in w for w in p["warnings"]))
+        self.assertFalse(any("Flat-by" in w for w in p["warnings"]))
+        # delivery charges: STT both sides, stamp, and the DP charge on the sell
+        want = exitp.costs(12.5, 10.2, 100, intraday=False)["total"]
+        self.assertEqual(p["costs"]["at_stop"], float(want))
+        self.assertIn("delivery (CNC)", p["costs"]["label"])
+        self.assertGreater(p["costs"]["at_stop"], float(exitp.costs(12.5, 10.2, 100, intraday=True)["total"]))
+
+    def test_cnc_uses_only_bars_before_the_plan_day(self):
+        daily = os.path.join(self.d, "daily")
+        write_daily(daily, "RELIANCE", [(10, 8, 9)] * 36 + SERIES_A[:6], last=exitp.datetime.date(2026, 10, 19))
+        args = ["--symbol", "RELIANCE", "--entry", "12.5", "--setup", "level", "--date", "2026-10-19",
+                "--stop", "swing", "--product", "CNC", "--daily-dir", daily, "--json"]
+        code, text, err = self.plan(*args)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(text)["swing"]["bars"], 41)          # the 19th itself is left out
+        self.assertEqual(json.loads(text)["swing"]["coc"], 8.0)         # so the BOS bar is not seen yet
+
+    def test_cnc_refusals(self):
+        daily = os.path.join(self.d, "daily")
+        base = ["--symbol", "RELIANCE", "--entry", "12.5", "--setup", "level", "--date", "2026-10-19",
+                "--stop", "swing", "--product", "CNC", "--daily-dir", daily]
+        code, _, err = self.plan(*base)
+        self.assertEqual(code, 1)
+        self.assertIn("no daily bars for RELIANCE", err)
+        self.assertIn("trader-data", err)
+        write_daily(daily, "RELIANCE", [(10, 8, 9)] * 20 + SERIES_A[:6])             # an uptrend, but only 26 bars
+        code, _, err = self.plan(*base)
+        self.assertIn("needs more than 40", err)
+        write_daily(daily, "RELIANCE", [(10, 8, 9)] * 34 + SERIES_A)                  # 42 bars, ends in a downtrend
+        code, _, err = self.plan(*base)
+        self.assertIn("trend is down", err)
+        code, _, err = self.plan(*base, "--flat-by", "15:00")
+        self.assertIn("a CNC delivery plan has no flat-by", err)
+
+    def test_cnc_plan_without_swing_and_show(self):
+        code, text, err = self.plan("--symbol", "HDFCBANK", "--entry", "1690.25", "--setup", "level", "--stop", "pct:4",
+                                    "--product", "cnc", "--qty", "10", "--write")
+        self.assertEqual(code, 0, err)
+        self.assertIn("delivery (CNC)", text)
+        self.assertIn("delivery charges", text)
+        self.assertIn("no flat-by, held overnight", text)
+        self.assertNotIn("Flat by", text)
+        with open(os.path.join("trader", "plan.json")) as fh:
+            plan = json.load(fh)
+        self.assertEqual((plan["product"], plan["flat_by"]), ("CNC", None))
+        for k in ("symbol", "side", "date", "setup", "entry", "stop", "target", "risk_per_share", "reward_risk"):
+            self.assertIn(k, plan)
+        code, text, err = run(exitp, ["show", "--now", "2026-10-19 11:00"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Hold          delivery (CNC)", text)
+        # an intraday plan still needs its flat_by, and MIS stays the default
+        code, text, _ = self.plan("--symbol", "HDFCBANK", "--entry", "1690.25", "--setup", "level", "--stop", "pct:4",
+                                  "--qty", "10", "--json")
+        p = json.loads(text)
+        self.assertEqual(p["flat_by"], "15:15")
+        self.assertNotIn("product", p)
+        self.assertIn("intraday (MIS)", p["costs"]["label"])
+
+    def test_level_is_kept_for_a_level_setup_only(self):
+        code, text, _ = self.plan("--symbol", "HDFCBANK", "--entry", "1690.25", "--setup", "level", "--level", "1688",
+                                  "--stop", "pct:1", "--json")
+        self.assertEqual(json.loads(text)["level"], 1688.0)
+        with open(os.path.join("trader", "entry.json"), "w") as fh:
+            json.dump(dict(REEL_ENTRY, setup="level", level=362.0), fh)
+        code, text, _ = self.plan("--stop", "pct:1", "--json")
+        self.assertEqual(json.loads(text)["level"], 362.0)
+        with open(os.path.join("trader", "entry.json"), "w") as fh:
+            json.dump(REEL_ENTRY, fh)                                   # an orb: its "level" is the range high
+        code, text, _ = self.plan("--json")
+        self.assertNotIn("level", json.loads(text))
+
+
 class SkillDoc(unittest.TestCase):
     def test_skill_md(self):
         with open(os.path.join(ROOT, "trader-exit", "SKILL.md"), encoding="utf-8") as fh:

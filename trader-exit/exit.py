@@ -6,6 +6,8 @@ It never places an order.
     python3 exit.py plan                                    # from trader/entry.json: or-mid stop, 2R target
     python3 exit.py plan --stop or-mid --target 1R --write  # the reel: stop 358.32, target 370.04
     python3 exit.py plan --symbol RELIANCE --entry 364.18 --or-high 362.18 --or-low 354.47
+    python3 exit.py plan --stop swing --offline RELIANCE.json   # the session's swing structure level
+    python3 exit.py plan --symbol HDFCBANK --entry 1690.25 --setup level --level 1688 --stop swing --product CNC
     python3 exit.py plan --stop atr:1.5 --offline RELIANCE.json # ATR needs the session's bars
     python3 exit.py plan --symbol HDFCBANK --entry 1690.25 --setup level --stop pct:1 --band 10
     python3 exit.py show                                    # the current trader/plan.json
@@ -18,6 +20,11 @@ Stops (a long's stop rounds DOWN to the paisa, away from the entry):
   atr:K      K times the 14-bar ATR under the entry, on the session's bars up
              to the entry bar (--offline FILE or Yahoo). With fewer than 14
              bars by then it averages all of them and says so.
+  swing      the change-of-character level of the swing structure (closing
+             basis): on the session's bars up to the entry bar (no pullback
+             filter), or with --product CNC on the daily cache bars before the
+             plan's day (pullbacks under 5% ignored, more than 40 bars). Refused
+             when the swing trend is not up, or the level is at or above the entry.
   A level setup has no opening-range default: give a stop.
 
 Targets (round half up to the paisa):
@@ -32,6 +39,10 @@ plans longs only).
 flat_by (default 15:15 IST, or "flat_by" in trader/config.json): out by then,
 win or lose. The NSE session is 09:15 to 15:30 IST; brokers auto square off
 intraday (MIS) positions at about 15:20. NSE has no early closes.
+
+--product CNC plans a delivery (swing) hold instead: no flat-by, held overnight,
+costs priced with the delivery charges (STT both sides, stamp, DP on the sell),
+"product": "CNC" and "flat_by": null in plan.json. The default, MIS, is unchanged.
 
 Costs: Zerodha intraday (MIS) charges for --qty shares (default about Rs 1
 lakh worth) at the stop and at the target, with reward:risk after costs. The
@@ -61,6 +72,7 @@ Exit codes: plan 0 = a plan, 1 = refused or an error. show 0 = a plan exists.
 
 import argparse
 import copy
+import csv
 import datetime
 import gzip
 import json
@@ -90,6 +102,9 @@ CHARGES_DEFAULT = {  # verified 2026-10-29 from zerodha.com/charges; trader/char
 INTERVALS = {"1m": 60, "5m": 300}
 DEFAULTS = {"flat_by": "15:15", "min_reward_risk": 1.0}
 ATR_BARS = 14
+DAILY_DIR = os.path.join("trader", "data", "daily")
+SWING_DAILY_RETRACE = 5.0          # CNC swing stop: pullbacks under 5 % of the swing high do not move the level
+SWING_DAILY_MIN_BARS = 40          # ... and the structure needs more than this many daily bars to be trusted
 MIN_RISK_PCT = Decimal("0.05")     # risk under 0.05% of the price is inside the spread's noise
 CENT = Decimal("0.01")
 EPOCH = datetime.datetime(1970, 1, 1)
@@ -372,9 +387,11 @@ def parse_stop(text):
         return "or_mid", None
     if t in ("or-low", "or_low", "low"):
         return "or_low", None
+    if t in ("swing", "swing-coc", "coc"):
+        return "swing", None
     m = re.match(r"^(price|pct|atr):\s*(?:\$|\u20b9|rs\.?)?\s*([0-9][0-9,]*\.?[0-9]*)$", t)
     if not m:
-        raise PlanError("--stop is or-mid, or-low, price:X, pct:X or atr:K (got %r)" % text)
+        raise PlanError("--stop is or-mid, or-low, price:X, pct:X, atr:K or swing (got %r)" % text)
     kind, val = m.group(1), D(m.group(2), "--stop")
     if val <= 0:
         raise PlanError("--stop %s needs a number above 0" % kind)
@@ -403,7 +420,7 @@ def r_label(r):
 
 
 def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=None, or_low=None,
-            atr=None, atr_bars=None):
+            atr=None, atr_bars=None, swing_coc=None, swing_bars=None):
     """The stop, the target and the risk, in exact cents. Raises PlanError with the reason."""
     e = cents(entry)
     if e <= 0:
@@ -435,6 +452,12 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
         label = "%s x ATR(%d) under the entry" % (num(stop_param), atr_bars)
         detail = "ATR \u20b9%s over the %d bars to the entry%s" % (
             num(a.quantize(Decimal("0.0001"))), atr_bars, " (fewer than 14 so far)" if atr_bars < ATR_BARS else "")
+    elif stop_rule == "swing":
+        if swing_coc is None:
+            raise PlanError("a swing stop needs the swing change-of-character level (the bars)")
+        raw = D(swing_coc)
+        label = "swing change-of-character level"
+        detail = "structure level \u20b9%s%s, on a close" % (num(raw), " over %d bars" % swing_bars if swing_bars else "")
     else:
         raise PlanError("unknown stop rule %r" % stop_rule)
     stop = floor_cents(raw)
@@ -452,6 +475,7 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
                         "survive the spread, normal wiggle would stop you out. Widen it."
                         % (money(risk), money(floor_risk.quantize(CENT, rounding=ROUND_HALF_UP)), money(e)))
     if target_rule == "r":
+        target_param = D(target_param, "the target R")      # an int or float R works too, not only parse_target's
         target = cents(e + target_param * risk)
         t_label = r_label(target_param)
     else:
@@ -658,6 +682,149 @@ def atr_of(bars, n=ATR_BARS):
     return sum(use) / len(use), len(use)
 
 
+# --- swing engine: keep byte-identical in scan.py, backtest.py, invest.py and exit.py (tests/test_repo.py checks) ---
+# Market structure, one bar at a time, closing basis. In an uptrend the first bar that fails to make a new high
+# freezes that high as the pending swing high (pivot); a close above it is a break of structure (bos) and the
+# lowest low of the pullback becomes the change-of-character level (coc), a structural trailing stop. A close
+# beyond coc reverses the trend. Pullbacks shallower than `retrace` percent of the pivot do not move coc.
+# Downtrends are the mirror image. Causal: no future bars, so it is safe to replay in a backtest.
+
+def swing_new(retrace=5.0, sideways=20, min_bars=40):
+    return {"trend": None, "hi": None, "lo": None, "pivot": None, "coc": None, "bars_since": 0, "total": 0,
+            "legs": 0, "last_bos": None, "retrace": retrace or 0.0, "sideways_n": sideways, "min_bars": min_bars}
+
+
+def _swing_shallow(s, depth, pivot):
+    # depth / pivot < retrace %, cross-multiplied so an exact tie (3 / 30 vs 10 %) confirms
+    return s["retrace"] > 0 and depth * 100 < s["retrace"] * pivot
+
+
+def swing_step(s, h, l, c):
+    """Feed one bar (high, low, close). Returns the bar's event: start_up, start_down, bos, reversal or None."""
+    if h is None or l is None or c is None:
+        return None
+    s["total"] += 1
+    if s["trend"] is None:
+        if s["hi"] is None:
+            s["hi"], s["lo"] = h, l
+            return None
+        ev = None
+        if c > s["hi"]:
+            s["trend"], s["coc"], s["hi"], ev = "up", s["lo"], h, "start_up"
+        elif c < s["lo"]:
+            s["trend"], s["coc"], s["lo"], ev = "down", s["hi"], l, "start_down"
+        s["hi"], s["lo"] = max(s["hi"], h), min(s["lo"], l)
+        return ev
+    s["bars_since"] += 1
+    if s["trend"] == "up":
+        if s["pivot"] is not None:
+            if h > s["hi"]:
+                s["hi"], s["bars_since"] = h, 0
+            s["lo"] = min(s["lo"], l)
+        elif h > s["hi"]:
+            s["hi"], s["lo"], s["bars_since"] = h, l, 0
+        else:
+            s["pivot"], s["lo"], s["bars_since"] = s["hi"], l, 1
+        if c < s["coc"]:   # checked on every bar, a new-high bar included
+            s.update(trend="down", coc=s["hi"], hi=None, pivot=None, lo=l, bars_since=0, legs=0)
+            return "reversal"
+        if s["pivot"] is not None and c > s["pivot"]:
+            pivot, s["pivot"], s["bars_since"] = s["pivot"], None, 0
+            if _swing_shallow(s, pivot - s["lo"], pivot):
+                return None
+            s["coc"], s["last_bos"] = s["lo"], pivot
+            s["legs"] += 1
+            return "bos"
+        return None
+    if s["pivot"] is not None:
+        if l < s["lo"]:
+            s["lo"], s["bars_since"] = l, 0
+        s["hi"] = max(s["hi"], h)
+    elif l < s["lo"]:
+        s["lo"], s["hi"], s["bars_since"] = l, h, 0
+    else:
+        s["pivot"], s["hi"], s["bars_since"] = s["lo"], h, 1
+    if c > s["coc"]:
+        s.update(trend="up", coc=s["lo"], lo=None, pivot=None, hi=h, bars_since=0, legs=0)
+        return "reversal"
+    if s["pivot"] is not None and c < s["pivot"]:
+        pivot, s["pivot"], s["bars_since"] = s["pivot"], None, 0
+        if _swing_shallow(s, s["hi"] - pivot, pivot):
+            return None
+        s["coc"], s["last_bos"] = s["hi"], pivot
+        s["legs"] += 1
+        return "bos"
+    return None
+
+
+def swing_snapshot(s):
+    out = {k: s[k] for k in ("trend", "coc", "pivot", "last_bos", "hi", "lo", "bars_since", "legs")}
+    out["sideways"] = s["trend"] is not None and s["bars_since"] > s["sideways_n"]
+    out["stable"] = s["total"] > s["min_bars"]
+    return out
+
+
+def swing_run(bars, retrace=5.0, sideways=20, min_bars=40):
+    """bars: (high, low, close) oldest first. Returns (final snapshot, one event per bar)."""
+    s = swing_new(retrace, sideways, min_bars)
+    events = [swing_step(s, h, l, c) for h, l, c in bars]
+    return swing_snapshot(s), events
+# --- end swing engine ---
+
+
+# ---------------------------------------------------------------- swing stop
+
+def read_daily_bars(sym, before, daily_dir=None):
+    """Daily bars of trader/data/daily/<SYM>.adj.csv (else .csv) dated before `before`, oldest first, as
+    {"h","l","c"}. Returns (bars, path)."""
+    base = daily_dir or DAILY_DIR
+    path = None
+    for name in (sym + ".adj.csv", sym + ".csv"):
+        if os.path.exists(os.path.join(base, name)):
+            path = os.path.join(base, name)
+            break
+    if path is None:
+        raise PlanError("no daily bars for %s in %s: a CNC swing stop reads the daily cache. Next: %s"
+                        % (sym, base, DATA_HINT))
+    rows = []
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            for row in csv.DictReader(fh):
+                row = {str(k).strip().lower(): v for k, v in row.items() if k}
+                try:
+                    d = datetime.date.fromisoformat(str(row.get("date") or "")[:10])
+                    h, lo, cl = float(row["high"]), float(row["low"]), float(row["close"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if d < before:
+                    rows.append((d, {"h": h, "l": lo, "c": cl}))
+    except (OSError, UnicodeDecodeError) as e:
+        raise PlanError("could not read %s: %s" % (path, e))
+    rows.sort(key=lambda r: r[0])
+    return [b for _, b in rows], path
+
+
+def swing_stop(bars, retrace=0.0, min_bars=0, what="session"):
+    """The change-of-character level of `bars` ({"h","l","c"}, oldest first) as a long's stop. Refuses, with
+    the reason, when the swing trend is not up (or not started), or there are not enough bars."""
+    snap, _ = swing_run([(b["h"], b["l"], b["c"]) for b in bars], retrace, 20, min_bars)
+    n = len(bars)
+    if snap["trend"] is None:
+        raise PlanError("there is no swing trend yet in the %d %s bars (price has not closed outside its first "
+                        "range): a swing stop needs an uptrend. Pick another stop." % (n, what))
+    if snap["trend"] != "up":
+        raise PlanError("the swing trend is down on the %d %s bars (the change-of-character level %s is above "
+                        "price): a long's swing stop needs an uptrend. Pick another stop."
+                        % (n, what, num(D(snap["coc"]))))
+    if not snap["stable"]:
+        raise PlanError("only %d %s bars: a swing stop needs more than %d so the first level is not an accident "
+                        "of the opening range" % (n, what, min_bars))
+    if snap["coc"] is None:
+        raise PlanError("the swing trend is up but has no change-of-character level yet")
+    return {"coc": snap["coc"], "pivot": snap["pivot"], "trend": snap["trend"], "bars": n,
+            "retrace_pct": retrace, "bars_kind": what}
+
+
 # ---------------------------------------------------------------- plan
 
 def read_json(path, what):
@@ -710,7 +877,8 @@ def gather(a):
             raise PlanError("give both --or-high and --or-low, or neither")
         info = {"symbol": nse_symbol(a.symbol), "entry": a.entry, "setup": a.setup or ("orb" if a.or_high is not None else "level"),
                 "date": a.date, "entry_time": a.time, "entry_bar": a.entry_bar, "interval": a.interval or "5m",
-                "or_high": a.or_high, "or_low": a.or_low, "or_minutes": a.or_minutes, "source": "flags"}
+                "or_high": a.or_high, "or_low": a.or_low, "or_minutes": a.or_minutes, "source": "flags",
+                "level": getattr(a, "level", None)}
     else:
         path = a.from_path or "trader/entry.json"
         doc = read_json(path, "entry (run /trader-entry first, or give --symbol and --entry)")
@@ -727,7 +895,8 @@ def gather(a):
                 "interval": a.interval or doc.get("interval") or "5m",
                 "or_high": a.or_high if a.or_high is not None else orr.get("high"),
                 "or_low": a.or_low if a.or_low is not None else orr.get("low"),
-                "or_minutes": orr.get("minutes") or a.or_minutes, "source": path}
+                "or_minutes": orr.get("minutes") or a.or_minutes, "source": path,
+                "level": getattr(a, "level", None) if getattr(a, "level", None) is not None else doc.get("level")}
         if not info["symbol"] or info["entry"] is None:
             raise PlanError("%s has no symbol or price" % path)
         info["symbol"] = nse_symbol(info["symbol"])
@@ -739,11 +908,16 @@ def gather(a):
 def build_plan(a, now_utc):
     info = gather(a)
     cfg = read_config(a.config)
+    product = str(getattr(a, "product", None) or "MIS").upper()
+    if product not in ("MIS", "CNC"):
+        raise PlanError("--product is MIS (intraday, the default) or CNC (delivery), not %r" % product)
+    if product == "CNC" and a.flat_by:
+        raise PlanError("--flat-by is for intraday (MIS) plans: a CNC delivery plan has no flat-by")
     stop_text = a.stop
     if not stop_text:
         if info["setup"] != "orb":
-            raise PlanError("a %s setup has no opening-range stop to default to: give --stop price:X, pct:X or atr:K"
-                            % info["setup"])
+            raise PlanError("a %s setup has no opening-range stop to default to: give --stop price:X, pct:X, atr:K "
+                            "or swing" % info["setup"])
         stop_text = "or-mid"
     stop_rule, stop_param = parse_stop(stop_text)
     target_rule, target_param = parse_target(a.target or "2R")
@@ -756,17 +930,29 @@ def build_plan(a, now_utc):
     else:
         day = to_ist(now_utc).date()
     entry_time = parse_clock(info["entry_time"], "the entry time") if info["entry_time"] else None
-    atr = atr_n = None
-    if stop_rule == "atr":
+    atr = atr_n = swing = None
+    if stop_rule == "swing" and product == "CNC":
+        dbars, dpath = read_daily_bars(info["symbol"], day, getattr(a, "daily_dir", None))
+        swing = swing_stop(dbars, SWING_DAILY_RETRACE, SWING_DAILY_MIN_BARS, "daily")
+        swing["source"] = dpath
+    elif stop_rule in ("atr", "swing"):
         chart = load_chart(info["symbol"], info["interval"], day, a.offline, getattr(a, "cache", False))
         bars = session_bars(chart, day, info["interval"], info["entry_bar"], parse_now(a.now) if a.now else None)
         if len(bars) < 3:
-            raise PlanError("an atr stop needs at least 3 closed %s bars of %s on %s by the entry; found %d"
-                            % (info["interval"], info["symbol"], day, len(bars)))
-        atr, atr_n = atr_of(bars)
+            raise PlanError("%s %s stop needs at least 3 closed %s bars of %s on %s by the entry; found %d"
+                            % ("an" if stop_rule == "atr" else "a", stop_rule, info["interval"], info["symbol"],
+                               day, len(bars)))
+        if stop_rule == "atr":
+            atr, atr_n = atr_of(bars)
+        else:
+            swing = swing_stop(bars, 0.0, 0, "%s session" % info["interval"])
+            swing["source"] = "%s session bars" % info["interval"]
     c = compute(info["entry"], stop_rule, stop_param, target_rule, target_param, info["or_high"], info["or_low"],
-                atr, atr_n)
-    flat_by, flat_note = resolve_flat_by(day, a.flat_by, cfg, entry_time)
+                atr, atr_n, swing["coc"] if swing else None, swing["bars"] if swing else None)
+    if product == "CNC":
+        flat_by, flat_note = None, ""
+    else:
+        flat_by, flat_note = resolve_flat_by(day, a.flat_by, cfg, entry_time)
     orr = None
     if info["or_high"] is not None and info["or_low"] is not None:
         orr = {"high": float(cents(info["or_high"])), "low": float(cents(info["or_low"])),
@@ -779,18 +965,27 @@ def build_plan(a, now_utc):
             "target": float(c["target"]), "target_r": float(c["target_r"]), "target_label": c["target_label"],
             "risk_per_share": float(c["risk"]), "reward_risk": float(c["reward_risk"]), "flat_by": flat_by,
             "stop_detail": c["stop_detail"], "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "note": NOTE}
+    if product == "CNC":
+        plan["product"] = "CNC"      # only a delivery plan says so: trader-budget reads it, MIS stays as before
+    if info.get("level") is not None and info["setup"] == "level":
+        plan["level"] = float(cents(info["level"]))    # trader-timemachine replays "first close above this"
     if atr is not None:
         plan["atr"] = round(atr, 4)
         plan["atr_bars"] = atr_n
+    if swing is not None:
+        plan["swing"] = {"coc": swing["coc"], "trend": swing["trend"], "bars": swing["bars"],
+                         "retrace_pct": swing["retrace_pct"], "source": swing["source"]}
     qty = a.qty if a.qty else default_qty(c["entry"])
     model = load_charges(getattr(a, "charges", None))
-    at_stop = costs(c["entry"], c["stop"], qty, model=model)["total"]
-    at_target = costs(c["entry"], c["target"], qty, model=model)["total"]
+    intraday = product == "MIS"
+    at_stop = costs(c["entry"], c["stop"], qty, intraday, model)["total"]
+    at_target = costs(c["entry"], c["target"], qty, intraday, model)["total"]
     cal = model.get("calibration") or {}
     plan["costs"] = {"qty": qty, "at_stop": float(at_stop), "at_target": float(at_target),
                      "per_share_at_stop": float((at_stop / qty).quantize(CENT, rounding=ROUND_HALF_UP)),
-                     "label": "%s intraday (MIS) charges for a round trip, %s" % (
-                         str(model.get("broker") or "zerodha").capitalize(), charges_label(model)),
+                     "label": "%s %s charges for a round trip, %s" % (
+                         str(model.get("broker") or "zerodha").capitalize(),
+                         "intraday (MIS)" if intraday else "delivery (CNC)", charges_label(model)),
                      "estimate": charges_label(model), "verified": model.get("verified"),
                      "calibration_factor": float(D(cal.get("factor") or 1)),
                      "calibration_samples": int(cal.get("samples") or 0)}
@@ -839,6 +1034,12 @@ def build_plan(a, now_utc):
         warnings.append(hn + ".")
     if flat_note:
         warnings.append("Flat-by %s: %s." % (flat_by, flat_note))
+    if product == "CNC":
+        warnings.append("Delivery (CNC): the position is held overnight, so a gap at the open can fill well past "
+                        "the stop, and the stop needs a resting order or an alert of its own. This plan places nothing.")
+    if swing is not None:
+        warnings.append("The swing level is a closing-basis stop: the structure breaks on a close under it, a wick "
+                        "through it does nothing. As a price stop it is tighter than the structure itself.")
     mrr = cfg.get("min_reward_risk")
     try:
         if mrr is not None and c["reward_risk"] < D(mrr):
@@ -863,8 +1064,12 @@ def describe(plan):
         when = " at %s" % plan["entry_time"]
         if plan.get("entry_bar") is not None:
             when += " (bar %d)" % plan["entry_bar"]
-    out = ["Exit plan: %s long, %s, %s on %s bars" % (
-        plan["symbol"], day.strftime("%a %Y-%m-%d"), setup, "5-minute" if plan["interval"] == "5m" else "1-minute")]
+    cnc = plan.get("product") == "CNC"
+    if cnc:
+        out = ["Exit plan: %s long, delivery (CNC), %s, %s" % (plan["symbol"], day.strftime("%a %Y-%m-%d"), setup)]
+    else:
+        out = ["Exit plan: %s long, %s, %s on %s bars" % (
+            plan["symbol"], day.strftime("%a %Y-%m-%d"), setup, "5-minute" if plan["interval"] == "5m" else "1-minute")]
     out.append("  Entry         %s%s" % (money(plan["entry"]), when))
     out.append("  Stop          %s  %s%s" % (money(plan["stop"]), plan["stop_label"],
                                              (": " + plan["stop_detail"]) if plan.get("stop_detail") else ""))
@@ -873,8 +1078,9 @@ def describe(plan):
     out.append("  Reward:risk   %s" % ratio(plan["reward_risk"]))
     cs = plan.get("costs")
     if cs:
-        out.append("  Costs         about %s at the stop, %s at the target for %d shares (intraday charges, %s); "
+        out.append("  Costs         about %s at the stop, %s at the target for %d shares (%s charges, %s); "
                    "reward:risk after costs %s" % (money(cs["at_stop"]), money(cs["at_target"]), cs["qty"],
+                                                   "delivery" if cnc else "intraday",
                                                    cs.get("estimate") or "estimate", ratio(plan["net_reward_risk"])))
     bd = plan.get("band")
     if bd:
@@ -882,7 +1088,10 @@ def describe(plan):
             ("%s%%" % num(D(bd["band_pct"]))) if bd.get("band_pct") is not None else "no band",
             money(bd["lower"]) if bd.get("lower") is not None else "-",
             money(bd["upper"]) if bd.get("upper") is not None else "-", bd.get("as_of") or ""))
-    out.append("  Flat by       %s IST, win or lose: no overnight hold (MIS auto square-off about 15:20)" % plan["flat_by"])
+    if cnc:
+        out.append("  Hold          delivery (CNC): no flat-by, held overnight (the sell carries the DP charge)")
+    else:
+        out.append("  Flat by       %s IST, win or lose: no overnight hold (MIS auto square-off about 15:20)" % plan["flat_by"])
     out.append("Set before the entry. If price hits the stop, you are out; never move it further away.")
     out.append(NOTE)
     return out
@@ -916,7 +1125,8 @@ def cmd_show(a):
         print("No plan at %s yet. Make one: exit.py plan --write" % a.plan)
         return 1
     plan = read_json(a.plan, "plan")
-    for k in ("symbol", "date", "entry", "stop", "target", "risk_per_share", "reward_risk", "flat_by"):
+    need = ("symbol", "date", "entry", "stop", "target", "risk_per_share", "reward_risk")
+    for k in need + (() if plan.get("product") == "CNC" else ("flat_by",)):
         if plan.get(k) is None:
             raise PlanError("%s is missing %r: make a new plan with exit.py plan --write" % (a.plan, k))
     if a.json:
@@ -946,7 +1156,11 @@ def main(argv=None):
     p.add_argument("--entry-bar", type=int)
     p.add_argument("--interval", choices=["5m", "1m"])
     p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
-    p.add_argument("--stop", help="or-mid (orb default), or-low, price:X, pct:X, atr:K")
+    p.add_argument("--stop", help="or-mid (orb default), or-low, price:X, pct:X, atr:K, swing")
+    p.add_argument("--product", type=str.upper, default="MIS", choices=["MIS", "CNC"],
+                   help="MIS intraday (default, flat by 15:15) or CNC delivery (no flat-by, delivery charges)")
+    p.add_argument("--level", type=float, help="the price a level setup closes above (kept in plan.json for the replay)")
+    p.add_argument("--daily-dir", default=DAILY_DIR, help="daily bars for a CNC swing stop (default %s)" % DAILY_DIR)
     p.add_argument("--target", help="2R (default), 1R, 1.5R, price:X")
     p.add_argument("--flat-by", help="HH:MM IST (default: config flat_by, 15:15; MIS square-off is about 15:20)")
     p.add_argument("--qty", type=int, help="shares, for the cost estimate (default: about Rs 1 lakh worth)")
