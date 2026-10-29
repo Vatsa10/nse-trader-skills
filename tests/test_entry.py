@@ -313,6 +313,80 @@ class Calendar(unittest.TestCase):
             entry.parse_chart("<html>", "RELIANCE")
 
 
+CAL_2027 = {"fetched_at": "2026-10-29T10:00:00Z", "years": [2027],
+            "holidays": {"2027-01-26": "Republic Day", "2027-03-22": "Holi"},
+            "special_sessions": {"2027-02-06": "Special Saturday session",
+                                 "2027-10-29": "Diwali Laxmi Pujan (Muhurat)"},
+            "last_circular_check": "2026-10-29", "warnings": []}
+
+
+class CalendarFile(unittest.TestCase):
+    """trader/data/calendar.json (trader-data: data.py calendar) extends the holiday list past 2026."""
+
+    def setUp(self):
+        self.cwd = os.getcwd()
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, self.cwd)
+
+    def fresh(self, content):
+        """A newly loaded entry.py that reads trader/data/calendar.json from the current folder."""
+        os.makedirs(os.path.join("trader", "data"), exist_ok=True)
+        with open(os.path.join("trader", "data", "calendar.json"), "w", encoding="utf-8") as fh:
+            fh.write(content if isinstance(content, str) else json.dumps(content))
+        return load("trader-entry", "entry")
+
+    def run_on(self, mod, day, hhmm="10:00"):
+        d = shift_to(doc(), datetime.date.fromisoformat(day))
+        return mod.evaluate(mod.parse_chart(json.dumps(d), "RELIANCE"), mod.parse_now("%s %s" % (day, hhmm)))
+
+    def test_2027_holiday_closed_and_weekday_open(self):
+        e = self.fresh(CAL_2027)
+        r = self.run_on(e, "2027-01-26")
+        self.assertEqual((r["status"], r["phase"]), ("no-data", "closed"))
+        self.assertIn("NSE holiday: Republic Day", r["reason"])
+        self.assertEqual(r["next_open"], "2027-01-27 09:15")
+        self.assertTrue(r["calendar_known"])
+        r = self.run_on(e, "2027-01-27")
+        self.assertEqual(r["status"], "triggered")
+        self.assertTrue(r["calendar_known"])
+        self.assertNotIn("covers", "\n".join(e.describe(r)))
+        self.assertIn(2027, e.CALENDAR_YEARS)
+        self.assertNotIn("2027-01-26", entry.NSE_HOLIDAYS)                  # the module loaded at import is untouched
+
+    def test_special_saturday_opens_and_muhurat_closes_the_regular_market(self):
+        e = self.fresh(CAL_2027)
+        self.assertEqual(e.trading_day(datetime.date(2027, 2, 6)), (True, ""))
+        self.assertEqual(self.run_on(e, "2027-02-06")["status"], "triggered")
+        ok, why = e.trading_day(datetime.date(2027, 10, 29))                # a Friday
+        self.assertFalse(ok)
+        self.assertIn("Muhurat", why)
+        self.assertIn("no normal 09:15-15:30 market", why)
+        r = self.run_on(e, "2027-10-29")
+        self.assertEqual((r["status"], r["phase"]), ("no-data", "closed"))
+        self.assertEqual(r["next_open"], "2027-11-01 09:15")
+
+    def test_builtin_2026_still_holds_and_other_years_still_warn(self):
+        e = self.fresh(CAL_2027)
+        self.assertIn("NSE holiday: Dussehra", e.evaluate(chart(), e.parse_now("2026-10-20 10:15"))["reason"])
+        ok, why = e.trading_day(datetime.date(2026, 11, 8))                  # the 2026 Muhurat Sunday
+        self.assertFalse(ok)
+        r = self.run_on(e, "2028-01-03")
+        self.assertFalse(r["calendar_known"])
+        self.assertIn("covers 2026, 2027 only", "\n".join(e.describe(r)))
+
+    def test_missing_or_corrupt_file_falls_back_to_the_builtin_table(self):
+        e = load("trader-entry", "entry")                                    # no file at all
+        self.assertEqual(e.CALENDAR_YEARS, (2026,))
+        for bad in ("{not json", "[1, 2]", "", '{"years": "x", "holidays": []}'):
+            e = self.fresh(bad)
+            self.assertEqual(e.CALENDAR_YEARS, (2026,), bad)
+            self.assertEqual(e.trading_day(datetime.date(2027, 1, 26)), (True, ""), bad)
+            self.assertFalse(self.run_on(e, "2027-01-26")["calendar_known"], bad)
+            self.assertIn("NSE holiday: Dussehra", e.trading_day(datetime.date(2026, 10, 20))[1], bad)
+
+
 class Network(unittest.TestCase):
     """Yahoo is never called: _open_url and _sleep are swapped for fakes."""
 

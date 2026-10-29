@@ -118,8 +118,10 @@ How the numbers work:
   `trader/prices.json` (under 15 minutes old).
 - **The window** is IST (fixed UTC+05:30), worked out in the tool, never
   from the computer's clock zone. NSE trades 09:15 to 15:30; weekends and the
-  2026 NSE holidays are closed. Outside 2026 it warns: "holiday list covers
-  2026 only: check nseindia.com". The Muhurat session is treated as closed.
+  NSE holidays are closed: the built-in 2026 list plus `trader/data/calendar.json`
+  (`python3 trader-data/data.py calendar` writes it). For a year in neither it
+  warns: "holiday list covers 2026 only: check nseindia.com". The Muhurat
+  session is treated as closed.
   Set both `no_entries_*` to null to switch the window off.
 - **Circuit bands** come from `trader/data/bands.json` (`--bands`), which
   trader-data writes (`bands`, or `import-kite` from a saved Kite

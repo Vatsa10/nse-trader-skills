@@ -2,6 +2,7 @@ import datetime
 import io
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
@@ -332,6 +333,70 @@ def bands(**over):
         doc = json.load(fh)
     doc.update(over)
     return doc
+
+
+CAL_2027 = {"fetched_at": "2026-10-29T10:00:00Z", "years": [2027],
+            "holidays": {"2027-01-26": "Republic Day", "2027-03-22": "Holi"},
+            "special_sessions": {"2027-02-06": "Special Saturday session",
+                                 "2027-10-29": "Diwali Laxmi Pujan (Muhurat)"},
+            "last_circular_check": "2026-10-29", "warnings": []}
+
+
+class CalendarFile(unittest.TestCase):
+    """trader/data/calendar.json (trader-data: data.py calendar) extends the holiday list past 2026."""
+
+    def setUp(self):
+        self.cwd = os.getcwd()
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, self.cwd)
+        os.makedirs(os.path.join("trader", "data"))
+
+    def fresh(self, content):
+        """A newly loaded check.py that reads trader/data/calendar.json from the current folder."""
+        with open(os.path.join("trader", "data", "calendar.json"), "w", encoding="utf-8") as fh:
+            fh.write(content if isinstance(content, str) else json.dumps(content))
+        return load("trader-risk", "check")
+
+    def one(self, mod, now):
+        return mod.check([rel()], cfg(), now=mod.parse_now(now))
+
+    def test_2027_holiday_closed_and_weekday_open(self):
+        c = self.fresh(CAL_2027)
+        res = self.one(c, "2027-01-26 10:15")
+        self.assertEqual(verdicts(res), ["BLOCK"])
+        self.assertIn("window: the market is closed today (NSE holiday: Republic Day", reasons(res))
+        self.assertNotIn("covers", " ".join(res["warnings"]))
+        res = self.one(c, "2027-01-27 10:15")
+        self.assertEqual(verdicts(res), ["PASS"])
+        self.assertNotIn("covers", " ".join(res["warnings"]))
+        self.assertIn(2027, c.CALENDAR_YEARS)
+        self.assertNotIn("2027-01-26", check.NSE_HOLIDAYS)               # the module loaded at import is untouched
+
+    def test_special_saturday_opens_and_muhurat_closes_the_regular_market(self):
+        c = self.fresh(CAL_2027)
+        self.assertEqual(verdicts(self.one(c, "2027-02-06 10:15")), ["PASS"])
+        res = self.one(c, "2027-10-29 10:15")                            # a Friday
+        self.assertEqual(verdicts(res), ["BLOCK"])
+        self.assertIn("Muhurat", reasons(res))
+        self.assertIn("no normal 09:15-15:30 market", reasons(res))
+
+    def test_builtin_2026_still_holds_and_other_years_still_warn(self):
+        c = self.fresh(CAL_2027)
+        self.assertIn("NSE holiday: Dussehra", reasons(self.one(c, "2026-10-20 10:15")))
+        self.assertIn("holiday list covers 2026, 2027 only: check nseindia.com",
+                      " ".join(self.one(c, "2028-01-03 10:15")["warnings"]))
+
+    def test_missing_or_corrupt_file_falls_back_to_the_builtin_table(self):
+        self.assertEqual(load("trader-risk", "check").CALENDAR_YEARS, (2026,))   # no file at all
+        for bad in ("{not json", "[1, 2]", "", '{"years": "x", "holidays": []}'):
+            c = self.fresh(bad)
+            self.assertEqual(c.CALENDAR_YEARS, (2026,), bad)
+            res = self.one(c, "2027-01-26 10:15")
+            self.assertEqual(verdicts(res), ["PASS"], bad)
+            self.assertIn("holiday list covers 2026 only: check nseindia.com", " ".join(res["warnings"]), bad)
+            self.assertIn("NSE holiday: Dussehra", reasons(self.one(c, "2026-10-20 10:15")), bad)
 
 
 class CircuitBands(unittest.TestCase):
