@@ -3,7 +3,8 @@ name: trader-backtest
 description: >-
   Backtester. Replays a long-term or swing strategy on years of NSE daily bars
   before you commit money to it: buy and hold, monthly SIP, SMA crossover,
-  52-week-high breakout, buy-the-dip below the 200-DMA, and multi-ETF
+  52-week-high breakout, swing-structure trend following (break of structure
+  in, change of character out), buy-the-dip below the 200-DMA, and multi-ETF
   rebalancing (for example NIFTYBEES / GOLDBEES / ITBEES). Long-only CNC,
   fills at the next day's open, slippage, whole shares, Zerodha delivery
   charges (DP included) and optional STCG/LTCG tax on FIFO lots. Prints CAGR,
@@ -49,6 +50,8 @@ python3 "$B" run --strategy buy_hold --symbol NIFTYBEES
 python3 "$B" run --strategy sip --symbol NIFTYBEES --param amount=10000
 python3 "$B" run --strategy sma_cross --symbol RELIANCE --param fast=50 --param slow=200 --tax
 python3 "$B" run --strategy breakout_52w --symbol TCS --param exit_low=50 --param trail_pct=20
+python3 "$B" run --strategy swing_trend --symbol RELIANCE --param retrace_pct=5 --param entry=bos
+python3 "$B" run --strategy swing_trend --symbol RELIANCE --sweep retrace_pct=0,3,5,8 --split 0.7
 python3 "$B" run --strategy dip_buy --symbol NIFTYBEES --param dip_pct=8 --param exit_above_pct=5
 python3 "$B" run --strategy rebalance --weights NIFTYBEES=0.6,GOLDBEES=0.2,ITBEES=0.2 --param freq=quarterly
 python3 "$B" run --name three-etf-quarterly            # a named strategy (trader/strategies.json, else the example)
@@ -76,6 +79,7 @@ Copy it to `trader/strategies.json` to keep the user's own.
 | `sip` | `amount` on the first trading day of each month, whole shares, leftover cash carried to next month |
 | `sma_cross` | long while SMA(fast) is above SMA(slow) at the close, flat below |
 | `breakout_52w` | buy on a close above the highest close of the last `lookback` (252) days; sell on a close below the lowest low of the last `exit_low` days, or `trail_pct` % under the best close since entry |
+| `swing_trend` | market structure on daily bars: `entry` `bos` buys the next open after a close breaks the pending swing high in an uptrend, `reversal` buys when the trend turns up; sells when a close breaks the change-of-character level and the trend turns down. `retrace_pct` (5) ignores pullbacks shallower than that percent (null = every break counts), `warmup` (40) bars must have been seen before an entry. Causal, so sweep and `--split` are honest |
 | `dip_buy` | buy when the close is `dip_pct` % below SMA(`ma`); sell `exit_above_pct` % above it (null holds forever) |
 | `rebalance` | `weights` per symbol (rest is cash), `freq` monthly, quarterly, or threshold (`band` points of drift) |
 
@@ -135,7 +139,8 @@ charges are an estimate, past performance does not predict the future.
 
 ## Split and bonus warnings
 
-With only an unadjusted file, it scans for overnight gaps that match a
+A symbol that has a `<SYMBOL>.adj.csv` is trusted as adjusted: the guess is
+off for it, and the caveats say so. With only an unadjusted file, it scans for overnight gaps that match a
 split or bonus (to about 1/2, 2/3, 1/3, 1/4, 1/5, 1/10) and lists the
 dates. Results across those dates are wrong (a fake 50 % crash). Fix it by
 fetching adjusted data with trader-data, or `--auto-adjust` to back-adjust by
