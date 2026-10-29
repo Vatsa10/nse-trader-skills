@@ -312,7 +312,6 @@ CHARGES_DEFAULTS = {
     "calibration": {"factor": 1.0, "samples": 0, "updated": None},
 }
 CHARGES_FILE = "trader/charges.json"
-_CHARGES_CACHE = {}
 
 
 def deep_merge(base, over):
@@ -334,15 +333,14 @@ def load_charges(path=None):
     path = CHARGES_FILE if path is None else path
     if not path or not os.path.exists(path):
         return deep_merge(CHARGES_DEFAULTS, {})
+    # read every time: a cache keyed on the file's mtime goes stale when a rewrite lands in the same
+    # timestamp tick as the read before it (reconcile writes the calibration, then --show reads it)
     try:
-        key = (os.path.abspath(path), os.path.getmtime(path))
-        if key not in _CHARGES_CACHE:
-            with open(path, encoding="utf-8") as fh:
-                doc = json.load(fh)
-            _CHARGES_CACHE[key] = deep_merge(CHARGES_DEFAULTS, doc if isinstance(doc, dict) else {})
-        return deep_merge(_CHARGES_CACHE[key], {})
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
     except (OSError, ValueError):
         return deep_merge(CHARGES_DEFAULTS, {})
+    return deep_merge(CHARGES_DEFAULTS, doc if isinstance(doc, dict) else {})
 
 
 def charges_factor(model):
