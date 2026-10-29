@@ -44,6 +44,7 @@
       "weight": 10,
       "metrics": {
         "dist_200dma_pct": {"weight": 2, "good": 5, "bad": -20, "label": "distance from 200-DMA %"},
+        "swing_cushion_pct": {"weight": 1, "good": 15, "bad": -10, "label": "swing cushion above the change-of-character level %"},
         "off_52w_high_pct": {"weight": 1, "good": 5, "bad": 40, "label": "below 52w high %"},
         "price_cagr_5y": {"weight": 2, "good": 15, "bad": -5, "label": "price CAGR 5y %"},
         "max_drawdown_pct": {"weight": 1, "good": 20, "bad": 60, "label": "max drawdown %"},
