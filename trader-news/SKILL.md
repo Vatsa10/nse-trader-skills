@@ -6,11 +6,16 @@ description: >-
   (SYMBOL.NS), Google News India search results for the company, and how far
   each stock is from yesterday's close in ₹. Shows only what is new since the
   last check, newest first, in IST, tags each item (earnings, analyst, deal,
-  capital, circuit/halt, regulatory, macro...) and never repeats one. Use
-  when the user says "any news on RELIANCE", "why is HINDCOPPER moving",
-  "what's the news on my watchlist", "morning briefing", "pre-market news",
-  "monitor the news", "did anything break", or after /trader-scanner finds
-  setups.
+  capital, circuit/halt, regulatory, macro...) and never repeats one. Also
+  reads NSE bulk deals, block deals and short-selling disclosures on your
+  symbols (size against the 20-day average volume, net buying per client),
+  and puts a "results soon" warning at the top of the morning briefing when
+  a stock's results or board meeting is within 2 NSE sessions (gap risk for
+  an intraday trade). Use when the user says "any news on RELIANCE", "why is
+  HINDCOPPER moving", "what's the news on my watchlist", "morning briefing",
+  "pre-market news", "monitor the news", "did anything break", "any bulk
+  deals", "block deals", "who is buying", "results date", "when are results",
+  "board meeting", or after /trader-scanner finds setups.
 argument-hint: "[symbols]"
 ---
 
@@ -28,6 +33,8 @@ Tool in this folder (standard library Python, no keys):
 python3 "${CLAUDE_SKILL_DIR}/news.py"                         # watchlist + plan + portfolio
 python3 "${CLAUDE_SKILL_DIR}/news.py" --tickers RELIANCE HDFCBANK --hours 12
 python3 "${CLAUDE_SKILL_DIR}/news.py" --no-google --json
+python3 "${CLAUDE_SKILL_DIR}/news.py" --deal-days 90          # deals window (default 30; --no-deals skips)
+python3 "${CLAUDE_SKILL_DIR}/news.py" --no-calendar           # skip the results-date check
 ```
 
 ## What it reads and writes
@@ -41,6 +48,10 @@ python3 "${CLAUDE_SKILL_DIR}/news.py" --no-google --json
 | Google News RSS (India) | `https://news.google.com/rss/search?q=<COMPANY or SYMBOL>+NSE&hl=en-IN&gl=IN&ceid=IN:en` (`--no-google` to skip) |
 | Yahoo Finance chart endpoint | the last price against yesterday's close (unofficial, can lag). query1 first, then query2 |
 | NSE corporate announcements | when both headline feeds fail for a symbol (or with `--nse`): a cookie-primed session, `https://www.nseindia.com/` first, then `https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=RELIANCE`. Results, board meetings, outcomes: the primary source |
+| NSE bulk, block and short-selling deals | `https://www.nseindia.com/api/historicalOR/bulk-block-short-deals?optionType=bulk_deals&from=DD-MM-YYYY&to=DD-MM-YYYY` (also `block_deals`, `short_selling`): three requests per run for the whole `--deal-days` window, not one per symbol, then filtered to your symbols. Same cookie-primed NSE session as the announcements |
+| NSE board meetings | `https://www.nseindia.com/api/corporate-board-meetings?index=equities&symbol=RELIANCE` (forthcoming meetings), one request per symbol on the same NSE session. A purpose containing "financial results" is a results date, "dividend" a dividend board date |
+| `trader/data/calendar.json` | optional, from trader-data: `{"years": [..], "holidays": {"YYYY-MM-DD": name}, "special_sessions": {..}}`. Used to count sessions to a results date; without it only weekends are skipped (a weekday holiday then makes a date look one session farther away than it is). A calendar that does not list this year is ignored, with a note |
+| `trader/data/daily/<SYMBOL>.adj.csv` (else `.csv`) | `date,open,high,low,close,volume`: the 20-day average volume a deal is measured against |
 | `trader/data/intraday/<SYMBOL>-5m.json`, `trader/data/daily/<SYMBOL>.csv` | the trader-data cache: the move when Yahoo's chart fails (or with `--cache`), with "using cached data from <time>" |
 | `trader/state/news.json` | what has been shown (kept 30 days) |
 
@@ -56,6 +67,54 @@ then means "could not look", not "nothing happened". For the price move with
 no live data, the error names the way out: `python3 trader-data/data.py
 doctor`, or the Kite MCP `get_historical_data` then `data.py import-kite`.
 
+## Bulk, block and short-selling deals
+
+Deals on your symbols arrive as ordinary items tagged `deal`: new since the
+last check, newest first, IST, never repeated. NSE gives a date, not a time,
+so a deal is stamped 15:30 IST of its day. The title says who did what:
+`Bulk deal: ALPHA GROWTH FUND bought 1,000,000 shares at ₹1,350.50 [2.50% of
+20-day avg volume, LARGE]`. The percent needs the trader-data cache; without
+it the deal prints with no percent. **LARGE** is 1 % or more of the 20-day
+average volume. Short-selling rows name no client.
+
+Under the items, `Net deals by client` lists bought minus sold per named
+client over the window, for the symbols with a deal shown (all with `--all`;
+`--json` always has `deal_flow`). A big net buyer is a lead, not a signal:
+say who, how much, and that the filing does not say why.
+
+An empty deal list is normal (most days have nothing on a given stock). If NSE
+blocks (HTTP 401/403 or a block page), the session is primed once more, and if
+it still refuses you get one note line; headlines and moves still print, and
+the deals are simply "not checked", which is not "none".
+
+## Results and board-meeting calendar
+
+The first lines of the output (above the price lines) come from NSE's board
+meetings, for results and dividend dates from today on:
+
+```
+RESULTS SOON  HINDCOPPER  results and dividend board date 2026-10-16 (Fri), 2 sessions away: gap risk, an overnight gap can jump past an intraday stop
+coming up     RELIANCE    results 2026-10-19 (Mon), 3 sessions away
+```
+
+**RESULTS SOON** means a results date 0, 1 or 2 NSE sessions away (0 is
+today: results often land after the close and the gap is the next morning).
+Sessions skip weekends and the holidays in `trader/data/calendar.json`. Other
+results and dividend dates within 30 days print as `coming up`; meetings on
+other business (fund raising, say) are left out. `--json` has `results_soon`
+(the symbols) and `calendar` (every date, with `sessions_away`).
+
+What to do with it: tell the user before `/trader-entry` that an intraday
+trade in a RESULTS SOON stock can gap past its stop at the open, and that a
+swing trade carries the result. A board meeting date is the company's
+intimation, not the outcome: open the announcement. No meetings listed means
+none announced yet, which is not the same as none coming.
+
+If NSE blocks the meetings request, the session is primed once more; if it
+still refuses, one note line says results dates were not checked, and the
+headlines, deals and moves still print. Do not tell the user "no results
+soon" when that note is there.
+
 ## The rules
 
 - **Headlines are leads, not facts.** Before telling the user something
@@ -64,7 +123,9 @@ doctor`, or the Kite MCP `get_historical_data` then `data.py import-kite`.
 - **Exchange filings beat headlines.** Results, board meetings, dividends,
   bonus and fundraising are announced on nseindia.com (Corporate
   announcements). If a headline matters, check the company's announcement
-  there before relying on it. This tool does not scrape NSE.
+  there before relying on it. This tool reads NSE's JSON endpoints politely
+  (cookie-primed session, spacing between calls, one re-prime) and never
+  scrapes pages.
 - **Say what it touches.** Every item lists the symbols it touches and its
   tags: earnings, analyst, legal, deal, capital (dividend, bonus, QIP, OFS,
   block deal), people, risk, halt (upper/lower circuit, ASM/GSM, suspension),
@@ -109,7 +170,9 @@ When a symbol has no news, say so rather than padding the brief.
 - Never invents or embellishes a story, a quote or a number.
 - Never trades on news, and never tells the user to buy or sell because of a
   headline.
-- Never hammers a server: one request per feed per symbol, half a second apart.
+- Never hammers a server: one request per feed per symbol, half a second
+  apart; the deals are three requests for the whole run and the results
+  calendar one per symbol, spaced and abandoned after the first refusal.
 
 ## Safety
 
