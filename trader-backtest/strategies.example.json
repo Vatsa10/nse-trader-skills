@@ -1,0 +1,14 @@
+{
+  "_about": "Named strategies for trader-backtest. Copy to trader/strategies.json and edit. Run one with: backtest.py run --name NAME. Education and tooling, not financial advice.",
+  "strategies": {
+    "nifty-sip": {"type": "sip", "symbols": ["NIFTYBEES"], "params": {"amount": 10000}},
+    "nifty-buy-hold": {"type": "buy_hold", "symbols": ["NIFTYBEES"], "capital": 100000},
+    "golden-cross": {"type": "sma_cross", "symbols": ["RELIANCE"], "params": {"fast": 50, "slow": 200}, "capital": 100000},
+    "52w-breakout": {"type": "breakout_52w", "symbols": ["TCS"], "params": {"lookback": 252, "exit_low": 50, "trail_pct": 20}, "capital": 100000},
+    "dip-below-200dma": {"type": "dip_buy", "symbols": ["NIFTYBEES"], "params": {"ma": 200, "dip_pct": 8, "exit_above_pct": 5}, "capital": 100000},
+    "three-etf-quarterly": {"type": "rebalance", "symbols": ["NIFTYBEES", "GOLDBEES", "ITBEES"],
+                            "params": {"weights": {"NIFTYBEES": 0.6, "GOLDBEES": 0.2, "ITBEES": 0.2}, "freq": "quarterly"}, "capital": 300000},
+    "three-etf-drift-5": {"type": "rebalance", "symbols": ["NIFTYBEES", "GOLDBEES", "ITBEES"],
+                          "params": {"weights": {"NIFTYBEES": 0.6, "GOLDBEES": 0.2, "ITBEES": 0.2}, "freq": "threshold", "band": 5}, "capital": 300000}
+  }
+}
