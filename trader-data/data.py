@@ -25,6 +25,10 @@ Writes (shared contracts, see PORT_V4_SPEC.md):
   trader/data/cache_meta.json        where each cached file came from and when
   trader/data/calendar.json          {"fetched_at","years","holidays","special_sessions","last_circular_check","warnings"}
 
+NSE requests (www.nseindia.com, nsearchives) retry up to 5 times on a 429, 502, 503, 504
+or a timeout, waiting 2^n seconds with jitter (never over 8 s, or the Retry-After the server
+sends); a 404 on an archive file is final. Cookies persist in trader/data/nse_cookies.txt.
+
 Daily chain (auto): Yahoo query1 -> Yahoo query2 -> NSE JSON API (cookie
 primed) -> NSE bhavcopy archives (one file per trading day). Only dates after
 the last cached session are fetched (--fill-gaps also refetches holes).
@@ -36,12 +40,15 @@ from trader/data/calendar.json, which the calendar command keeps up to date).
 import argparse
 import csv
 import datetime
+import email.utils
 import gzip
+import http.client
 import http.cookiejar
 import importlib.util
 import io
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -68,6 +75,13 @@ PAUSE = 0.6          # seconds between requests to the same site
 BHAV_PAUSE = 1.0     # bhavcopy archive: one file a second
 RETRIES = 2          # extra tries per Yahoo host on a 429 / 5xx
 BACKOFF = 2.0        # first back-off in seconds, doubles each try
+NSE_RETRIES = 5      # extra tries on an NSE host after a 429 / 502 / 503 / 504 or a timeout
+RETRY_STATUS = (429, 502, 503, 504)
+RETRY_CAP = 8.0      # longest wait before an NSE retry, Retry-After included
+COOKIE_FILE = "nse_cookies.txt"
+COOKIE_FRESH = 1800  # seconds: a saved cookie file this young skips the home page prime
+UDIFF_FROM = datetime.date(2024, 7, 8)   # before this day NSE published only the legacy bhavcopy
+MONTH_UP = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 NSE_CHUNK_DAYS = 100
 TIMEOUT = 20
 IST = datetime.timedelta(hours=5, minutes=30)
@@ -154,9 +168,9 @@ class DataError(Exception):
 
 
 class SourceError(DataError):
-    def __init__(self, source, message, hint=""):
+    def __init__(self, source, message, hint="", transient=False):
         DataError.__init__(self, message)
-        self.source, self.hint = source, hint
+        self.source, self.hint, self.transient = source, hint, transient   # transient: worth a retry
 
     def __str__(self):
         msg = DataError.__str__(self)
@@ -608,19 +622,76 @@ def to_5m(points):
 
 # ---------------------------------------------------------------- HTTP
 
-_transport = None    # tests: fn(url, headers, timeout) -> (status, bytes)
+_transport = None    # tests: fn(url, headers, timeout) -> (status, bytes) or (status, bytes, response headers)
 _sleep = time.sleep
 _clock = time.monotonic
+_jitter = random.random    # tests: fn() -> a number in [0, 1)
+
+
+def retry_after(headers):
+    """Retry-After (seconds or an HTTP date) -> seconds >= 0, or None when absent or unreadable."""
+    value = None
+    for k, v in (headers or {}).items():
+        if str(k).lower() == "retry-after":
+            value = str(v).strip()
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return max(0.0, (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
+
+
+def retry_wait(attempt, headers=None):
+    """Seconds to wait before retry number `attempt` (1, 2, ...): the Retry-After if the server sent
+    one, else 2^attempt with full random jitter. Never more than RETRY_CAP."""
+    sent = retry_after(headers)
+    if sent is not None:
+        return min(RETRY_CAP, sent)
+    return min(RETRY_CAP, 2.0 ** attempt) * _jitter()
 
 
 class Session(object):
-    """One cookie jar per run, browser-like headers, gzip handled."""
+    """One cookie jar per run (saved in the data folder when one is given), browser-like headers,
+    gzip handled, and retries with back-off on NSE hosts."""
 
-    def __init__(self):
-        self.jar = http.cookiejar.CookieJar()
+    def __init__(self, data_dir=None):
+        self.cookie_path = os.path.join(data_dir, COOKIE_FILE) if data_dir else None
+        self.jar = (http.cookiejar.MozillaCookieJar(self.cookie_path) if self.cookie_path
+                    else http.cookiejar.CookieJar())
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
-        self.nse_primed = False
+        self.nse_primed = self.load_cookies()
         self.last = {}
+        self.last_headers = {}
+
+    def load_cookies(self):
+        """Reload the saved cookies (expired ones dropped, session cookies kept). True when they are
+        NSE cookies young enough to skip the home page prime."""
+        if not self.cookie_path or not os.path.exists(self.cookie_path):
+            return False
+        try:
+            self.jar.load(ignore_discard=True, ignore_expires=False)
+            age = time.time() - os.path.getmtime(self.cookie_path)
+        except (OSError, ValueError):
+            self.jar.clear()    # an unreadable file is a cold start, never a crash
+            return False
+        return age < COOKIE_FRESH and any("nseindia.com" in c.domain for c in self.jar)
+
+    def save_cookies(self):
+        if not self.cookie_path or not len(self.jar):
+            return
+        try:
+            os.makedirs(os.path.dirname(self.cookie_path) or ".", exist_ok=True)
+            self.jar.save(ignore_discard=True, ignore_expires=True)
+        except OSError:
+            pass
 
     def polite(self, host, gap):
         t = self.last.get(host)
@@ -630,20 +701,47 @@ class Session(object):
                 _sleep(wait)
         self.last[host] = _clock()
 
-    def get(self, url, headers=None, timeout=TIMEOUT, gap=PAUSE):
+    def get(self, url, headers=None, timeout=TIMEOUT, gap=PAUSE, retries=None):
+        """(status, body). NSE hosts retry up to NSE_RETRIES times on a 429 / 502 / 503 / 504 or a
+        timeout or dropped connection; any other status (a 404 on an archive file above all) comes
+        straight back. Other hosts do not retry here (Yahoo has its own loop)."""
         host = urllib.parse.urlsplit(url).netloc
-        self.polite(host, gap)
+        if retries is None:
+            retries = NSE_RETRIES if host.endswith("nseindia.com") else 0
         h = dict(BROWSER)
         h.update(headers or {})
+        attempt = 0
+        while True:
+            self.polite(host, gap)
+            try:
+                code, body, reply = self.once(url, h, timeout, host)
+            except SourceError as e:
+                if not (e.transient and attempt < retries):
+                    if attempt:
+                        raise SourceError(e.source, "%s (gave up after %d retries)" % (DataError.__str__(e), attempt),
+                                          e.hint)
+                    raise
+                wait = retry_wait(attempt + 1)
+            else:
+                if code not in RETRY_STATUS or attempt >= retries:
+                    self.last_headers = reply
+                    return code, body
+                wait = retry_wait(attempt + 1, reply)
+            attempt += 1
+            _sleep(wait)
+
+    def once(self, url, h, timeout, host):
+        """One request -> (status, body, response headers)."""
         if _transport is not None:
-            return _transport(url, h, timeout)
+            got = _transport(url, h, timeout)
+            return got[0], got[1], (got[2] if len(got) > 2 else {})
         req = urllib.request.Request(url, headers=h)
         try:
             with self.opener.open(req, timeout=timeout) as r:
                 body = r.read()
                 if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
                     body = gzip.decompress(body)
-                return r.status, body
+                return r.status, body, dict(r.headers.items())
         except urllib.error.HTTPError as e:
             try:
                 body = e.read()
@@ -654,14 +752,21 @@ class Session(object):
                     e.close()
                 except Exception:
                     pass
-            return e.code, body
+            return e.code, body, dict(e.headers.items()) if e.headers else {}
         except socket.timeout:
-            raise SourceError(host, "%s timed out after %ss" % (host, timeout), "network or firewall")
+            raise SourceError(host, "%s timed out after %ss" % (host, timeout), "network or firewall",
+                              transient=True)
+        except http.client.HTTPException as e:
+            # the server dropped or garbled the connection: start from a clean opener, keep the cookies
+            self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
+            raise SourceError(host, "%s broke the connection: %s" % (host, e), "network or firewall",
+                              transient=True)
         except (urllib.error.URLError, OSError) as e:
             why = str(getattr(e, "reason", e))
+            proxy = "403" in why or "407" in why
             tip = ("a proxy or firewall on this network blocks %s; use Kite MCP or import-csv" % host
-                   if "403" in why or "407" in why else "no network, DNS or firewall")
-            raise SourceError(host, "could not reach %s: %s" % (host, why), tip)
+                   if proxy else "no network, DNS or firewall")
+            raise SourceError(host, "could not reach %s: %s" % (host, why), tip, transient=not proxy)
 
 
 def hint(source, code):
@@ -783,6 +888,7 @@ def nse_prime(sess, force=False):
     if code != 200:
         raise SourceError("nse-home", "www.nseindia.com home page answered HTTP %d" % code, hint("nse", code))
     sess.nse_primed = True
+    sess.save_cookies()
 
 
 def nse_api(sess, path, referer):
@@ -855,8 +961,14 @@ def parse_nse_chart(doc):
 # ---------------------------------------------------------------- NSE bhavcopy archives
 
 def bhav_urls(d):
-    return [ARCHIVES + "/products/content/sec_bhavdata_full_%s.csv" % d.strftime("%d%m%Y"),
-            ARCHIVES + "/content/cm/BhavCopy_NSE_CM_0_0_0_%s_F_0000.csv.zip" % d.strftime("%Y%m%d")]
+    """The delivery bhavcopy first, then the plain one: UDiFF from 2024-07-08, the legacy
+    cmDDMONYYYYbhav file before that."""
+    full = ARCHIVES + "/products/content/sec_bhavdata_full_%s.csv" % d.strftime("%d%m%Y")
+    if d >= UDIFF_FROM:
+        return [full, ARCHIVES + "/content/cm/BhavCopy_NSE_CM_0_0_0_%s_F_0000.csv.zip" % d.strftime("%Y%m%d")]
+    mon = MONTH_UP[d.month - 1]
+    return [full, ARCHIVES + "/content/historical/EQUITIES/%d/%s/cm%02d%s%dbhav.csv.zip" % (
+        d.year, mon, d.day, mon, d.year)]
 
 
 def _key(h):
@@ -1052,7 +1164,7 @@ def get_daily(sess, bhav, sym, miss, end, source, years, max_days):
 
 def cmd_daily(a):
     now = parse_now(a.now)
-    sess, rc = Session(), 0
+    sess, rc = Session(a.data), 0
     bhav = Bhav(sess)
     for s in a.symbols:
         sym = norm_symbol(s)
@@ -1117,7 +1229,7 @@ def cmd_daily(a):
 # ---------------------------------------------------------------- intraday command
 
 def cmd_intraday(a):
-    sess, rc = Session(), 0
+    sess, rc = Session(a.data), 0
     days = max(1, min(60, a.days))
     for s in a.symbols:
         sym = norm_symbol(s)
@@ -1194,7 +1306,7 @@ def cmd_bands(a):
                  if s not in syms]
     if not syms:
         raise DataError("no symbols: give some, or fill the daily cache first")
-    sess, entries, unknown, errors, used = Session(), {}, [], [], set()
+    sess, entries, unknown, errors, used = Session(a.data), {}, [], [], set()
     today = now.date().isoformat()
     nse_ok = a.source in ("auto", "nse")
     for sym in syms:
@@ -1636,7 +1748,7 @@ def cmd_calendar(a):
             old["fetched_at"], old["last_circular_check"]))
         print_calendar_summary(old, today)
         return 0
-    sess, errors, master, circ = Session(), [], None, None
+    sess, errors, master, circ = Session(a.data), [], None, None
     if need_master:
         try:
             master = parse_holiday_master(nse_api(sess, "/api/holiday-master?type=trading", CAL_REFERER))
@@ -1740,7 +1852,7 @@ def check_body(kind, code, body):
 
 def cmd_doctor(a):
     now = parse_now(a.now)
-    sess = Session()
+    sess = Session(a.data)
     results = {}
     print("%-13s %-6s %-5s %8s  %s" % ("source", "kind", "ok", "latency", "error / hint"))
     for name, kind, url, check in probes(now):
@@ -1754,7 +1866,7 @@ def cmd_doctor(a):
                 hdr.update({"Accept": "application/json", "Referer": NSE + "/get-quotes/equity?symbol=RELIANCE"})
             if check in ("holidays", "circulars"):
                 hdr.update({"Accept": "application/json", "Referer": CAL_REFERER, "X-Requested-With": "XMLHttpRequest"})
-            code, body = sess.get(url, hdr, timeout=a.timeout, gap=0)
+            code, body = sess.get(url, hdr, timeout=a.timeout, gap=0, retries=0)   # a probe reports the first answer
             ok, why = check_body(check, code, body)
             if not ok:
                 err = hint(name, code) if code not in (200, 206) else why

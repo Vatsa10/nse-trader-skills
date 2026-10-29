@@ -1,10 +1,13 @@
 import csv
 import datetime
+import email.utils
+import http.cookiejar
 import io
 import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 import zipfile
 from contextlib import redirect_stdout, redirect_stderr
@@ -68,11 +71,12 @@ class Net(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.dd = os.path.join(self.tmp, "data")
         self.sleeps = []
-        self._t, self._s = data._transport, data._sleep
+        self._t, self._s, self._j = data._transport, data._sleep, data._jitter
         data._sleep = self.sleeps.append
+        data._jitter = lambda: 1.0          # full wait, so back-off sleeps are exact
 
     def tearDown(self):
-        data._transport, data._sleep = self._t, self._s
+        data._transport, data._sleep, data._jitter = self._t, self._s, self._j
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def net(self, rules):
@@ -616,6 +620,213 @@ class Daily(Net):
         code, out, _ = self.run_d("daily", "RELIANCE", "--source", "bhavcopy", "--now", self.NOW)
         self.assertEqual(code, 0, out)
         self.assertEqual(self.daily("RELIANCE", adj=True)[-1]["date"], "2026-10-23")
+
+
+# ---------------------------------------------------------------- NSE transport: retries, cookies, legacy bhavcopy
+
+def email_date(dt):
+    return email.utils.format_datetime(dt, usegmt=True)
+
+
+def script(*replies):
+    """A Fake rule body that answers each call from the list in turn; an exception in it is raised."""
+    it = iter(replies)
+
+    def body(url):
+        r = next(it)
+        if isinstance(r, Exception):
+            raise r
+        return r
+    return body
+
+
+ARCH = "https://nsearchives.nseindia.com/content/cm/x.csv"
+
+
+class Transport(Net):
+    def get(self, rules, url=ARCH, **kw):
+        f = self.net([("nseindia.com", None, rules)])
+        return f, data.Session().get(url, gap=0, **kw)
+
+    def test_503_twice_with_retry_after_then_200(self):
+        f, (code, body) = self.get(script((503, b"", {"Retry-After": "1"}), (503, b"", {"retry-after": "1"}),
+                                          (200, b"fine", {})))
+        self.assertEqual((code, body), (200, b"fine"))
+        self.assertEqual(len(f.calls), 3)
+        self.assertEqual(self.sleeps, [1.0, 1.0])
+
+    def test_retry_after_is_capped_and_may_be_an_http_date(self):
+        future = email_date(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1))
+        past = email_date(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1))
+        self.get(script((429, b"", {"Retry-After": "120"}), (503, b"", {"Retry-After": future}),
+                        (503, b"", {"Retry-After": past}), (503, b"", {"Retry-After": "soon"}), (200, b"", {})))
+        # 120 s and a date an hour away are capped at 8; a past date is 0; garbage falls back to 2^4
+        self.assertEqual(self.sleeps, [8.0, 8.0, 0.0, 8.0])
+        self.assertEqual(data.retry_after({"Retry-After": "3"}), 3.0)
+        self.assertIsNone(data.retry_after({"Retry-After": "soon"}))
+        self.assertIsNone(data.retry_after({}))
+
+    def test_exponential_backoff_with_jitter_capped_at_8(self):
+        f, _ = self.get(script(*([(429, b"", {})] * 5 + [(200, b"", {})])))
+        self.assertEqual(self.sleeps, [2.0, 4.0, 8.0, 8.0, 8.0])
+        self.assertEqual(len(f.calls), 6)
+        data._jitter = lambda: 0.5
+        del self.sleeps[:]
+        self.get(script((502, b"", {}), (504, b"", {}), (200, b"", {})))
+        self.assertEqual(self.sleeps, [1.0, 2.0])
+        data._jitter = lambda: 0.0
+        del self.sleeps[:]
+        self.get(script((503, b"", {}), (200, b"", {})))
+        self.assertEqual(self.sleeps, [0.0])
+
+    def test_gives_up_after_five_retries_and_returns_the_status(self):
+        f, (code, _) = self.get(script(*([(503, b"busy", {})] * 9)))
+        self.assertEqual(code, 503)
+        self.assertEqual(len(f.calls), 1 + data.NSE_RETRIES)
+        self.assertEqual(len(self.sleeps), data.NSE_RETRIES)
+        self.assertTrue(all(0 <= x <= 8 for x in self.sleeps))
+
+    def test_a_404_on_an_archive_file_is_never_retried(self):
+        f, (code, _) = self.get(script((404, b"", {}), (200, b"late", {})))
+        self.assertEqual(code, 404)
+        self.assertEqual(len(f.calls), 1)
+        self.assertEqual(self.sleeps, [])
+        for status in (401, 403, 400, 500):
+            f, (code, _) = self.get(script((status, b"", {}), (200, b"", {})))
+            self.assertEqual((code, len(f.calls)), (status, 1), status)
+
+    def test_timeouts_are_retried_then_reported(self):
+        boom = data.SourceError("nsearchives", "timed out", transient=True)
+        f, (code, body) = self.get(script(boom, boom, (200, b"ok", {})))
+        self.assertEqual((code, len(f.calls), self.sleeps), (200, 3, [2.0, 4.0]))
+        del self.sleeps[:]
+        self.net([("nseindia.com", None, script(*([boom] * 9)))])
+        with self.assertRaises(data.SourceError) as cm:
+            data.Session().get(ARCH, gap=0)
+        self.assertIn("gave up after 5 retries", str(cm.exception))
+        self.assertEqual(len(self.sleeps), 5)
+        # an error that is not transient is raised at once
+        del self.sleeps[:]
+        self.net([("nseindia.com", None, script(data.SourceError("nsearchives", "proxy says no")))])
+        with self.assertRaises(data.SourceError):
+            data.Session().get(ARCH, gap=0)
+        self.assertEqual(self.sleeps, [])
+
+    def test_only_nse_hosts_retry_unless_told(self):
+        f = self.net([("yahoo.com", None, script((503, b"", {}), (200, b"", {})))])
+        self.assertEqual(data.Session().get("https://query1.finance.yahoo.com/x", gap=0)[0], 503)
+        self.assertEqual(len(f.calls), 1)
+        f = self.net([("nseindia.com", None, script((503, b"", {}), (200, b"", {})))])
+        self.assertEqual(data.Session().get(ARCH, gap=0, retries=0)[0], 503)
+        self.assertEqual(len(f.calls), 1)
+
+    def test_a_bhavcopy_day_survives_a_503(self):
+        csv_text = fx("sec_bhavdata_full_23102026.csv")
+        f = self.net([("sec_bhavdata_full_23102026", None, script((503, b"", {"Retry-After": "2"}), (200, csv_text, {})))])
+        table = data.Bhav(data.Session()).day(datetime.date(2026, 10, 23))
+        self.assertEqual(table["RELIANCE"]["close"], 1190.0)
+        self.assertEqual(len(f.calls), 2)
+        self.assertIn(2.0, self.sleeps)
+
+    def test_doctor_reports_the_first_answer_without_retrying(self):
+        f = self.net([("quote-equity", 503, b""), ("", 403, b"")])
+        self.run_d("doctor")
+        self.assertEqual(len(f.urls("quote-equity")), 1)
+        self.assertNotIn(8.0, self.sleeps)
+
+
+class Cookies(Net):
+    def cookie(self, domain="www.nseindia.com", expires=None, name="nsit"):
+        return http.cookiejar.Cookie(0, name, "abc", None, False, domain, True, False, "/", True, False, expires,
+                                     expires is None, None, None, {})
+
+    def test_saved_and_reloaded_without_dropping_session_cookies(self):
+        s1 = data.Session(self.dd)
+        self.assertFalse(s1.nse_primed)
+        s1.jar.set_cookie(self.cookie())
+        s1.jar.set_cookie(self.cookie(expires=1, name="old"))     # long expired
+        s1.save_cookies()
+        path = os.path.join(self.dd, data.COOKIE_FILE)
+        self.assertTrue(rd(path).startswith("# Netscape HTTP Cookie File"))
+        s2 = data.Session(self.dd)
+        self.assertEqual([c.name for c in s2.jar], ["nsit"])           # the session cookie stays, the expired one goes
+        self.assertTrue(s2.nse_primed)                                 # fresh NSE cookies: no prime call
+        old = time.time() - data.COOKIE_FRESH - 60
+        os.utime(path, (old, old))
+        s3 = data.Session(self.dd)
+        self.assertEqual(len(s3.jar), 1)
+        self.assertFalse(s3.nse_primed)                                # stale file: cookies loaded, prime again
+
+    def test_a_garbage_cookie_file_is_a_cold_start(self):
+        os.makedirs(self.dd)
+        wr(os.path.join(self.dd, data.COOKIE_FILE), "this is not a cookie file")
+        s = data.Session(self.dd)
+        self.assertEqual(len(s.jar), 0)
+        self.assertFalse(s.nse_primed)
+
+    def test_a_fresh_cookie_file_skips_the_home_page(self):
+        s1 = data.Session(self.dd)
+        s1.jar.set_cookie(self.cookie())
+        s1.save_cookies()
+        f = self.net([("quote-equity", 200, fx("nse-quote-RELIANCE.json")), ("www.nseindia.com/", 200, b"home")])
+        code, out, _ = self.run_d("bands", "RELIANCE", "--now", "2026-10-23 16:30")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([u for u in f.urls() if u.endswith("nseindia.com/")], [])
+
+    def test_a_401_primes_once_more(self):
+        s = data.Session(self.dd)
+        s.jar.set_cookie(self.cookie())
+        s.save_cookies()
+        f = self.net([("quote-equity", None, script((401, b"", {}), (200, fx("nse-quote-RELIANCE.json"), {}))),
+                      ("www.nseindia.com/", 200, b"home")])
+        code, out, _ = self.run_d("bands", "RELIANCE", "--now", "2026-10-23 16:30")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len([u for u in f.urls() if u.endswith("nseindia.com/")]), 1)   # the re-prime
+        self.assertEqual(len(f.urls("quote-equity")), 2)
+
+    def test_the_prime_writes_the_cookie_file(self):
+        class Home(object):
+            def __call__(inner, url, headers, timeout):
+                self.sess.jar.set_cookie(self.cookie())
+                return 200, b"home"
+        self.sess = data.Session(self.dd)
+        data._transport = Home()
+        data.nse_prime(self.sess)
+        self.assertTrue(os.path.exists(os.path.join(self.dd, data.COOKIE_FILE)))
+
+
+class LegacyBhav(Net):
+    def test_urls_switch_on_the_udiff_date(self):
+        D = datetime.date
+        new = data.bhav_urls(D(2024, 7, 8))
+        self.assertTrue(new[1].endswith("/content/cm/BhavCopy_NSE_CM_0_0_0_20240708_F_0000.csv.zip"))
+        old = data.bhav_urls(D(2024, 7, 5))
+        self.assertEqual(old[0], data.ARCHIVES + "/products/content/sec_bhavdata_full_05072024.csv")
+        self.assertEqual(old[1], data.ARCHIVES + "/content/historical/EQUITIES/2024/JUL/cm05JUL2024bhav.csv.zip")
+        self.assertTrue(data.bhav_urls(D(2020, 1, 3))[1].endswith("/EQUITIES/2020/JAN/cm03JAN2020bhav.csv.zip"))
+
+    def test_daily_max_style_fill_reads_the_legacy_file(self):
+        def legacy(url):
+            name = url.rsplit("/", 1)[-1]                       # cm05JUL2024bhav.csv.zip
+            day = datetime.datetime.strptime(name[2:11], "%d%b%Y")
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as z:
+                z.writestr(name[:-4], "SYMBOL,SERIES,OPEN,HIGH,LOW,CLOSE,LAST,PREVCLOSE,TOTTRDQTY,TOTTRDVAL,TIMESTAMP,"
+                                      "TOTALTRADES,ISIN,\nRELIANCE,EQ,2900,2950,2880,2940,2940,2890,4000000,1,"
+                                      "%s,100,INE002A01018,\nRELIANCE,BE,1,1,1,1,1,1,1,1,%s,1,X,\n"
+                                      % (day.strftime("%d-%b-%Y").upper(), day.strftime("%d-%b-%Y").upper()))
+            return 200, buf.getvalue()
+        f = self.net([("content/historical/EQUITIES/", None, legacy), ("yahoo.com", 403, b""),
+                      ("nseindia.com", 404, b"")])
+        code, out, _ = self.run_d("daily", "RELIANCE", "--source", "bhavcopy", "--years", "0.02",
+                                  "--now", "2024-07-05 19:00")
+        self.assertEqual(code, 0, out)
+        rows = self.daily("RELIANCE")
+        self.assertEqual([r["date"] for r in rows], ["2024-06-28", "2024-07-01", "2024-07-02", "2024-07-03",
+                                                     "2024-07-04", "2024-07-05"])
+        self.assertEqual(rows[-1], data.bar("2024-07-05", 2900, 2950, 2880, 2940, 4000000))   # EQ row, not BE
+        self.assertEqual(len(f.urls("cm05JUL2024bhav.csv.zip")), 1)
+        self.assertEqual(f.urls("BhavCopy_NSE_CM"), [])         # UDiFF is not tried before its start date
 
 
 # ---------------------------------------------------------------- intraday

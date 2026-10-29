@@ -60,6 +60,7 @@ Every command takes `--data DIR` (default `trader/data`) and `--now
 | `trader/data/bands.json` | `{"as_of","source","bands":{SYM:{"band_pct","lower","upper"}},"unknown":[...]}` | risk, exit, broker |
 | `trader/data/sources.json` | doctor's result per source: ok, latency, error, checked_at | everyone, to pick a source |
 | `trader/data/cache_meta.json` | which source filled each file and when | status, record |
+| `trader/data/nse_cookies.txt` | the NSE cookie jar (Mozilla format), reused between runs | data.py only |
 | `trader/data/calendar.json` | NSE holidays and special sessions (contract below) | data, alerts, and the skills that load alerts |
 
 `band_pct` is `null` for a stock with no band (F&O stocks; they still have
@@ -80,7 +81,10 @@ Daily (`--source auto`):
    `/api/historical/cm/equity?symbol=X&series=["EQ"]&from=dd-mm-yyyy&to=dd-mm-yyyy`
    in 100 day chunks. Unadjusted.
 3. NSE bhavcopy archives: `https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_DDMMYYYY.csv`
-   (then the UDiFF `BhavCopy_NSE_CM_0_0_0_YYYYMMDD_F_0000.csv.zip`), one file
+   (then the UDiFF `BhavCopy_NSE_CM_0_0_0_YYYYMMDD_F_0000.csv.zip`, or for
+   days before 2024-07-08 the legacy
+   `/content/historical/EQUITIES/YYYY/MON/cmDDMONYYYYbhav.csv.zip`, so
+   `--years max` reaches back), one file
    per NSE trading day, one a second, weekends and holidays skipped, each day
    fetched once for all symbols in the run, at most `--max-days` (300) per run.
 
@@ -89,6 +93,17 @@ Intraday: Yahoo `interval=5m&range=60d`, then NSE
 minute bars, no volume). Bands: NSE `/api/quote-equity?symbol=X`
 (`priceInfo.pPriceBand`, `lowerCP`, `upperCP`), then
 `nsearchives .../content/equities/sec_list.csv` (Band column, no limits).
+
+NSE transport (www.nseindia.com and nsearchives; Yahoo keeps its own loop):
+a 429, 502, 503, 504, a timeout or a dropped connection is retried up to 5
+times, waiting 2^n seconds with random jitter, never more than 8 s; a
+`Retry-After` header (seconds or an HTTP date) replaces that wait, with the
+same 8 s cap. Any other status comes straight back, and a 404 on an archive
+file is final ("not published yet"), never retried. `doctor` does not retry:
+it reports the first answer. Cookies are saved to `trader/data/nse_cookies.txt`
+(Mozilla format); expired ones are dropped on load, session cookies are kept,
+a file under 30 minutes old skips the home page prime, and a 401 primes once
+more. A cookie file that cannot be read is a cold start, never an error.
 
 Only dates after the last cached session are fetched. The last complete
 session is today after 18:00 IST on a trading day (bhavcopy is published in
