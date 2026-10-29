@@ -1844,6 +1844,256 @@ class ActionsCommand(Net):
         self.assertIn("no list of actions", s["nse-actions"]["error"])
 
 
+# ---------------------------------------------------------------- index snapshot, valuation and India VIX
+
+INDEX_HEAD = "date,open,high,low,close,volume,pe,pb,div_yield"
+
+
+class IndexParse(unittest.TestCase):
+    def test_slug(self):
+        for name, want in (("NIFTY 50", "nifty-50"), ("Nifty Bank", "nifty-bank"), ("India VIX", "india-vix"),
+                           ("Nifty Bank / X", "nifty-bank-x"), ("Nifty Financial Services 25/50",
+                                                               "nifty-financial-services-25-50"),
+                           ("NIFTY   MIDCAP150  MOMENTUM 50", "nifty-midcap150-momentum-50"), ("S&P", "s-p")):
+            self.assertEqual(data.index_slug(name), want, name)
+
+    def test_snapshot_file(self):
+        t = data.parse_index_csv(fx("ind_close_all_22102026.csv").decode(), datetime.date(2026, 10, 22))
+        self.assertEqual(sorted(t), ["india-vix", "nifty-50", "nifty-500", "nifty-bank",
+                                     "nifty-financial-services-25-50"])
+        name, row = t["nifty-50"]
+        self.assertEqual(name, "Nifty 50")
+        self.assertEqual(row, {"date": "2026-10-22", "open": 25000.1, "high": 25100.35, "low": 24900.2,
+                               "close": 25050.4, "volume": 345000000, "pe": 24.8, "pb": 3.45, "div_yield": 1.28})
+        bank = t["nifty-bank"][1]
+        self.assertEqual((bank["pe"], bank["pb"], bank["div_yield"]), (None, None, None))     # "-" is empty, not 0
+        self.assertEqual(bank["close"], 56100.75)
+        vix = t["india-vix"][1]
+        self.assertEqual((vix["close"], vix["volume"], vix["pe"]), (13.4, None, None))
+
+    def test_not_a_snapshot(self):
+        with self.assertRaises(data.DataError):
+            data.parse_index_csv("<html>Access Denied</html>\n", datetime.date(2026, 10, 22))
+        self.assertEqual(data.parse_index_csv("", datetime.date(2026, 10, 22)), {})
+        # a row with no close is skipped, and the requested day fills a missing Index Date
+        t = data.parse_index_csv("Index Name,Closing Index Value,P/E\nNifty 50,25000,23.5\nNifty Bank,-,-\n",
+                                 datetime.date(2026, 10, 22))
+        self.assertEqual(list(t), ["nifty-50"])
+        self.assertEqual(t["nifty-50"][1]["date"], "2026-10-22")
+
+    def test_history_shapes(self):
+        rows = data.parse_index_history(json.loads(fx("nse-index-history-NIFTY50.json")))
+        self.assertEqual([(r["date"], r["close"]) for r in rows], [("2026-10-19", 24900.0), ("2026-10-21", 24990.25)])
+        self.assertEqual((rows[0]["open"], rows[0]["high"], rows[0]["low"]), (24800.0, 24950.0, 24750.0))
+        self.assertEqual((rows[0]["volume"], rows[0]["pe"]), (None, None))                    # ascending; no P/E here
+        vix = data.parse_index_history(json.loads(fx("nse-vix-history.json")))
+        self.assertEqual([(r["date"], r["close"]) for r in vix], [("2026-10-19", 13.1), ("2026-10-21", 13.2)])
+        self.assertEqual(data.parse_index_history({"data": []}), [])
+        self.assertEqual(data.parse_index_history({}), [])
+
+    def test_valuation_rule_of_thumb(self):
+        v = data.pe_verdict
+        self.assertEqual((data.PE_EXPENSIVE, data.PE_CHEAP, data.PE_MIN_ROWS), (25.0, 20.0, 250))
+        self.assertEqual(v(25.0), "expensive")
+        self.assertEqual(v(24.99), "neutral")
+        self.assertEqual(v(20.0), "cheap")
+        self.assertEqual(v(20.01), "neutral")
+        self.assertIsNone(v(None))
+        self.assertEqual(v(25.0, expensive=26), "neutral")
+
+    def rows(self, n, pe=lambda i: i):
+        days = data.index_days(datetime.date(2026, 10, 23), n)
+        return [data.index_row(d, 1, 2, 0.5, 1.5, None, pe(i), None, None) for i, d in enumerate(days)]
+
+    def test_percentile_needs_250_rows(self):
+        series = lambda i: float((i * 37) % 300 + 1)    # a permutation of 1..300; the last one is 264  # noqa: E731
+        rows = self.rows(300, series)
+        self.assertEqual(len(rows), 300)
+        self.assertEqual(rows[-1]["pe"], 264.0)
+        self.assertEqual(data.pe_percentile(rows), 88.0)
+        self.assertIsNone(data.pe_percentile(rows[-249:]))
+        self.assertIsNotNone(data.pe_percentile(rows[-250:]))
+        # rows without a P/E do not count towards the 250
+        sparse = self.rows(300, lambda i: None if i < 60 else float(i))
+        self.assertIsNone(data.pe_percentile(sparse))
+        self.assertEqual(data.pe_percentile(self.rows(300, lambda i: float(i))), 100.0)
+
+    def test_merge_never_wipes_a_value(self):
+        old = [data.index_row("2026-10-22", 1, 2, 0.5, 1.5, 7, 24.8, 3.4, 1.2)]
+        new = [data.index_row("2026-10-22", 1.1, 2, 0.5, 1.6, None, None, None, None),
+               data.index_row("2026-10-21", 1, 2, 0.5, 1.4, None, None, None, None)]
+        got = data.merge_index(old, new)
+        self.assertEqual([r["date"] for r in got], ["2026-10-21", "2026-10-22"])
+        self.assertEqual((got[1]["open"], got[1]["close"], got[1]["volume"], got[1]["pe"]), (1.1, 1.6, 7, 24.8))
+
+
+class IndexCommand(Net):
+    NOW = "2026-10-23 19:00"
+
+    def archive(self, **extra):
+        """The two snapshot fixtures; any other day is a 404. extra: {"DDMMYYYY": (code, body)}."""
+        def snap(url):
+            key = url.rsplit("_", 1)[-1].split(".")[0]
+            if key in extra:
+                return extra[key]
+            name = "ind_close_all_%s.csv" % key
+            return (200, fx(name)) if os.path.exists(os.path.join(DFIX, name)) else (404, b"")
+        return self.net([("ind_close_all", None, snap), ("www.nseindia.com/", 200, b"home")])
+
+    def csv_text(self, name):
+        return rd(data.index_path(self.dd, name))
+
+    def test_writes_the_contract(self):
+        f = self.archive()
+        code, out, err = self.run_d("index", "--days", "2", "--now", self.NOW)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.dd, "index"))),
+                         ["india-vix.csv", "nifty-50.csv", "nifty-500.csv", "nifty-bank.csv"])    # the financial 25/50 is not asked for
+        self.assertEqual(self.csv_text("NIFTY 50").splitlines(), [
+            INDEX_HEAD,
+            "2026-10-22,25000.1,25100.35,24900.2,25050.4,345000000,24.8,3.45,1.28",
+            "2026-10-23,25060,25250,25000,25200.15,360000000,25,3.5,1.27"])
+        self.assertEqual(self.csv_text("Nifty Bank").splitlines()[1:], [
+            "2026-10-22,56000,56300.5,55800.25,56100.75,150000000,,,",                  # "-" is an empty cell
+            "2026-10-23,56150,56500,56000,56400,155000000,14.5,2.4,1.05"])
+        self.assertEqual(self.csv_text("India VIX").splitlines(), [
+            INDEX_HEAD, "2026-10-22,13.1,13.8,12.9,13.4,,,,", "2026-10-23,13.4,13.6,12.7,12.95,,,,"])
+        self.assertEqual(sorted(u.rsplit("_", 1)[-1] for u in f.urls("ind_close_all")), ["22102026.csv", "23102026.csv"])
+        self.assertIn("https://nsearchives.nseindia.com/content/indices/ind_close_all_22102026.csv", f.urls("ind_close_all"))
+        self.assertIn("NIFTY 50 on 2026-10-23: P/E 25, P/B 3.5, dividend yield 1.27%", out)
+        self.assertIn("rule of thumb: P/E >= 25 expensive, <= 20 cheap, between neutral -> expensive", out)
+        self.assertIn("P/E percentile: 2 of 250 rows with a P/E", out)
+        self.assertIn("India VIX 12.95 on 2026-10-23", out)
+        self.assertIn("not a timing signal", out)
+
+    def test_default_run_with_nothing_cached_reads_the_last_sessions(self):
+        f = self.archive()
+        code, out, _ = self.run_d("index", "--now", self.NOW)
+        self.assertEqual(len(f.urls("ind_close_all")), data.INDEX_DAYS)
+        self.assertEqual(code, 0, out)                       # the 404 days in between are skipped, not fatal
+        self.assertIn("no snapshot file for 28 day(s), skipped", out)
+        self.assertEqual(len(self.csv_text("NIFTY 50").splitlines()), 3)
+
+    def test_a_later_run_fetches_only_the_new_days(self):
+        self.archive()
+        self.run_d("index", "--days", "2", "--now", self.NOW)
+        new = fx("ind_close_all_23102026.csv").replace(b"23-10-2026", b"26-10-2026")
+        f = self.archive(**{"26102026": (200, new)})
+        code, out, _ = self.run_d("index", "--now", "2026-10-26 19:00")                # Monday
+        self.assertEqual(code, 0, out)
+        self.assertEqual([u.rsplit("_", 1)[-1] for u in f.urls("ind_close_all")], ["26102026.csv"])
+        self.assertEqual([r["date"] for r in data.read_index(data.index_path(self.dd, "NIFTY 50"))],
+                         ["2026-10-22", "2026-10-23", "2026-10-26"])
+        f = self.net([])
+        code, out, _ = self.run_d("index", "--now", "2026-10-26 20:00")
+        self.assertEqual(f.calls, [])                                                  # nothing to ask
+        self.assertIn("up to date", out)
+
+    def test_named_indices(self):
+        self.archive()
+        code, out, _ = self.run_d("index", "Nifty Financial Services 25/50", "--days", "1", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.dd, "index"))),
+                         ["india-vix.csv", "nifty-financial-services-25-50.csv"])
+        self.assertEqual(self.csv_text("Nifty Financial Services 25/50").splitlines()[1],
+                         "2026-10-23,27060,27200,27000,27150,,,,")
+        _, out, _ = self.run_d("index", "NIFTY NOPE", "--days", "1", "--now", self.NOW)
+        self.assertIn("NIFTY NOPE: not in the snapshot files", out)
+        self.assertFalse(os.path.exists(data.index_path(self.dd, "NIFTY NOPE")))
+
+    def test_thresholds_are_configurable(self):
+        self.archive()
+        _, out, _ = self.run_d("index", "--days", "2", "--pe-expensive", "26", "--pe-cheap", "21", "--now", self.NOW)
+        self.assertIn("P/E >= 26 expensive, <= 21 cheap, between neutral -> neutral", out)
+
+    def test_today_before_the_evening_is_not_an_error(self):
+        self.archive(**{"23102026": (404, b"")})
+        code, out, _ = self.run_d("index", "--days", "2", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertIn("not published yet", out)
+        self.assertEqual(len(self.csv_text("NIFTY 50").splitlines()), 2)        # the 22nd is kept
+
+    def test_a_block_stops_the_run(self):
+        f = self.net([("", 403, b"Access Denied")])
+        code, out, _ = self.run_d("index", "--days", "5", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertIn("NSE blocks this IP", out)
+        self.assertEqual(len(f.urls("ind_close_all")), 1)                         # not hammered
+        self.assertFalse(os.path.exists(os.path.join(self.dd, "index")))
+
+    def test_a_bot_wall_page_is_reported(self):
+        self.net([("ind_close_all", 200, b"<html>Access Denied</html>")])
+        code, out, _ = self.run_d("index", "--days", "1", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertIn("not the index snapshot", out)
+
+    def test_history_backfill_in_yearly_chunks(self):
+        f = self.archive()
+        f = self.net([("historicalOR/indicesHistory", 200, fx("nse-index-history-NIFTY50.json")),
+                      ("historicalOR/vixhistory", 200, fx("nse-vix-history.json"))] + f.rules)
+        code, out, _ = self.run_d("index", "NIFTY 50", "--days", "2", "--years", "1", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        hist = f.urls("indicesHistory")
+        self.assertEqual(len(hist), 1)
+        self.assertIn("indexType=NIFTY%2050&from=23-10-2025&to=21-10-2026", hist[0])          # up to the first cached day
+        self.assertIn("from=23-10-2025&to=21-10-2026", f.urls("vixhistory")[0])
+        rows = data.read_index(data.index_path(self.dd, "NIFTY 50"))
+        self.assertEqual([r["date"] for r in rows], ["2026-10-19", "2026-10-21", "2026-10-22", "2026-10-23"])
+        self.assertEqual([r["pe"] for r in rows], [None, None, 24.8, 25.0])        # history has no P/E, the archive does
+        self.assertEqual(rows[0]["close"], 24900.0)
+        vix = data.read_index(data.index_path(self.dd, "India VIX"))
+        self.assertEqual([(r["date"], r["close"]) for r in vix],
+                         [("2026-10-19", 13.1), ("2026-10-21", 13.2), ("2026-10-22", 13.4), ("2026-10-23", 12.95)])
+        self.assertEqual(self.csv_text("India VIX").splitlines()[1], "2026-10-19,13.2,13.4,12.9,13.1,,,,")
+
+    def test_a_long_backfill_is_chunked_by_year(self):
+        f = self.net([("indicesHistory", 200, b'{"data": {"indexCloseOnlineRecords": []}}'),
+                      ("vixhistory", 200, b'{"data": []}'), ("ind_close_all", 404, b""),
+                      ("www.nseindia.com/", 200, b"home")])
+        code, out, _ = self.run_d("index", "NIFTY 50", "--years", "3", "--now", self.NOW)
+        hist = f.urls("indicesHistory")
+        self.assertEqual(len(hist), 4)                                              # 3 years and a day: 4 yearly chunks
+        self.assertIn("&to=23-10-2026", hist[-1])
+
+    def test_history_failure_is_reported_and_keeps_the_archive_rows(self):
+        self.archive()
+        f = self.net([("historicalOR", 200, b"<html>wall</html>")] + self.archive().rules)
+        code, out, _ = self.run_d("index", "NIFTY 50", "--days", "2", "--years", "1", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertIn("NIFTY 50 history:", out)
+        self.assertEqual(len(data.read_index(data.index_path(self.dd, "NIFTY 50"))), 2)
+
+    def test_percentile_is_printed_once_250_rows_exist(self):
+        days = data.index_days(datetime.date(2026, 10, 23), 300)
+        rows = [data.index_row(d, 1, 2, 0.5, 1.5, None, float((i * 37) % 300 + 1), 3.0, 1.0) for i, d in enumerate(days)]
+        data.write_index(self.dd, "NIFTY 50", rows)
+        data.write_index(self.dd, "India VIX", [data.index_row("2026-10-23", 13, 14, 12, 13.5, None, None, None, None)])
+        f = self.net([])
+        code, out, _ = self.run_d("index", "NIFTY 50", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(f.calls, [])
+        self.assertIn("P/E percentile: 88% of the 300 cached sessions", out)
+        self.assertIn("India VIX 13.5 on 2026-10-23", out)
+
+    def test_doctor_probes_the_archive_and_status_lists_the_files(self):
+        f = self.net([("ind_close_all", 200, fx("ind_close_all_23102026.csv")), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertTrue(s["nse-index"]["ok"])
+        self.assertIn("ind_close_all_23102026.csv", s["nse-index"]["url"])
+        self.assertEqual(f.urls("ind_close_all")[0].count("ind_close_all"), 1)
+        self.net([("ind_close_all", 200, b"<html>wall</html>"), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertFalse(s["nse-index"]["ok"])
+        self.assertIn("not the index snapshot", s["nse-index"]["error"])
+        self.archive()
+        self.run_d("index", "--days", "2", "--now", self.NOW)
+        _, out, _ = self.run_d("status", "--now", self.NOW)
+        self.assertIn("index/nifty-50.csv", out)
+        self.assertIn("2 rows 2026-10-22..2026-10-23", out)
+
+
 class Style(unittest.TestCase):
     def test_no_em_dash_and_skill_frontmatter(self):
         for f in ("data.py", "SKILL.md"):

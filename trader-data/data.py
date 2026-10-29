@@ -14,6 +14,7 @@ saved yourself (Kite MCP JSON, Kite Console / NSE website CSV).
     python3 data.py calendar [--refresh]
     python3 data.py actions RELIANCE TCS [--years 3] [--refresh]
     python3 data.py adjust RELIANCE TCS [--force]
+    python3 data.py index ["NIFTY 50" "NIFTY BANK" ...] [--days 30] [--years 1] [--pe-expensive 25 --pe-cheap 20]
     python3 data.py delivery RELIANCE TCS [--window 30] [--no-fetch]
     python3 data.py doctor
     python3 data.py record RELIANCE [--date 2026-10-23]
@@ -30,6 +31,7 @@ Writes (shared contracts, see PORT_V4_SPEC.md):
   trader/data/delivery/<SYM>.csv     date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series (blank = unknown)
   trader/data/delivery/pending.json  {"pending": [dates whose delivery file is not published yet]}
   trader/data/actions.json           {"fetched_at","symbols":{SYM:{"from","fetched_through","actions":[...]}}}
+  trader/data/index/<slug>.csv       date,open,high,low,close,volume,pe,pb,div_yield (nifty-50, nifty-bank, india-vix)
 
 NSE requests (www.nseindia.com, nsearchives) retry up to 5 times on a 429, 502, 503, 504
 or a timeout, waiting 2^n seconds with jitter (never over 8 s, or the Retry-After the server
@@ -119,6 +121,17 @@ ACTIONS_STALE_DAYS = 7        # adjust warns when actions were fetched this long
 SPLIT_WORDS = ("split", "splt", "consolidation")
 BONUS_SKIP = ("deb", "pref", "ncrps", "dvr")   # debenture, preference and DVR "bonus" is not a share bonus
 VERIFY_LOW, VERIFY_HIGH = 0.67, 1.5           # the adjusted close on the ex-date over the day before
+INDEX_DIR = "index"
+INDEX_HEADER = ["date", "open", "high", "low", "close", "volume", "pe", "pb", "div_yield"]
+INDEX_DEFAULT = ("NIFTY 50", "NIFTY BANK", "NIFTY 500")   # what `index` keeps when no name is given
+INDEX_DAYS = 30               # snapshot files fetched for an index with nothing cached yet
+INDEX_REFERER = NSE + "/reports-indices-historical-index-data"
+VIX_REFERER = NSE + "/reports-indices-historical-vix"
+VIX_NAME = "India VIX"
+VALUATION_INDEX = "NIFTY 50"
+PE_EXPENSIVE = 25.0           # Nifty 50 P/E at or above this is flagged expensive (eod2's rule of thumb)
+PE_CHEAP = 20.0               # at or below this, cheap
+PE_MIN_ROWS = 250             # P/E rows needed before a percentile means anything
 
 # ---------------------------------------------------------------- NSE trading calendar
 # 2026 comes from trader-alerts/alerts.py (loaded below, with this copy as the fallback).
@@ -2503,6 +2516,269 @@ def cmd_adjust(a):
     return rc
 
 
+# ---------------------------------------------------------------- index snapshot, valuation and India VIX
+
+def index_slug(name):
+    """Lowercase, every run of characters outside a-z and 0-9 becomes one "-": NIFTY 50 -> nifty-50."""
+    return re.sub(r"[^a-z0-9]+", "-", str(name or "").strip().lower())
+
+
+def index_path(data_dir, name):
+    return os.path.join(data_dir, INDEX_DIR, index_slug(name) + ".csv")
+
+
+def index_url(d):
+    return ARCHIVES + "/content/indices/ind_close_all_%s.csv" % d.strftime("%d%m%Y")
+
+
+def index_row(date, o, h, low, c, v, pe, pb, dy):
+    return {"date": date if isinstance(date, str) else date.isoformat(), "open": o, "high": h, "low": low,
+            "close": c, "volume": None if v is None else int(round(v)), "pe": pe, "pb": pb, "div_yield": dy}
+
+
+def read_index(path):
+    """index/<slug>.csv -> rows ascending by date; an empty cell is None."""
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, newline="", encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            try:
+                datetime.date.fromisoformat(r["date"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            rows.append(index_row(r["date"], num(r.get("open")), num(r.get("high")), num(r.get("low")),
+                                  num(r.get("close")), num(r.get("volume")), num(r.get("pe")), num(r.get("pb")),
+                                  num(r.get("div_yield"))))
+    return sorted(rows, key=lambda r: r["date"])
+
+
+def merge_index(old, new):
+    """By date; a value in the new row replaces the old one, a blank never wipes a value."""
+    by = dict((r["date"], dict(r)) for r in old)
+    for r in new:
+        cur = by.setdefault(r["date"], dict(r))
+        for k, v in r.items():
+            if v is not None:
+                cur[k] = v
+    return [by[d] for d in sorted(by)]
+
+
+def write_index(data_dir, name, new_rows):
+    """Merge rows into index/<slug>.csv (header date,open,high,low,close,volume,pe,pb,div_yield, empty
+    cell for "-" or missing). -> rows now in the file."""
+    path = index_path(data_dir, name)
+    rows = merge_index(read_index(path), new_rows)
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(INDEX_HEADER)
+    for r in rows:
+        w.writerow([r["date"]] + [fmt(r[k]) for k in INDEX_HEADER[1:]])
+    _atomic_write(path, buf.getvalue())
+    return rows
+
+
+def parse_index_csv(text, day):
+    """ind_close_all_DDMMYYYY.csv -> {slug: (index name, row)}. "-" is an empty cell. A row with no
+    closing value is skipped. The row's own Index Date wins; the requested day fills in when it is missing."""
+    rd = csv.reader(io.StringIO(text))
+    try:
+        head = [_key(h) for h in next(rd)]
+    except StopIteration:
+        return {}
+    pick = lambda *names: next((head.index(n) for n in names if n in head), None)  # noqa: E731
+    ix = {"name": pick("index name"), "date": pick("index date", "date"),
+          "o": pick("open index value", "open"), "h": pick("high index value", "high"),
+          "l": pick("low index value", "low"), "c": pick("closing index value", "close"),
+          "v": pick("volume"), "pe": pick("p/e", "pe"), "pb": pick("p/b", "pb"),
+          "dy": pick("div yield", "dividend yield")}
+    if None in (ix["name"], ix["c"]):
+        raise DataError("not the index snapshot (columns: %s)" % ", ".join(head[:8]))
+    cell = lambda r, k: num(r[ix[k]]) if ix[k] is not None and ix[k] < len(r) else None  # noqa: E731
+    out = {}
+    for r in rd:
+        if len(r) <= max(ix["name"], ix["c"]) or not r[ix["name"]].strip():
+            continue
+        close = cell(r, "c")
+        if close is None:
+            continue
+        try:
+            d = parse_date(r[ix["date"]]) if ix["date"] is not None else day
+        except DataError:
+            d = day
+        name = " ".join(r[ix["name"]].split())
+        out[index_slug(name)] = (name, index_row(d, cell(r, "o"), cell(r, "h"), cell(r, "l"), close, cell(r, "v"),
+                                                 cell(r, "pe"), cell(r, "pb"), cell(r, "dy")))
+    return out
+
+
+def fetch_index_day(sess, d):
+    """One archive file -> parse_index_csv. A 404 is "not published", never retried."""
+    code, body = sess.get(index_url(d), {"Accept": "*/*", "Referer": NSE + "/"}, gap=BHAV_PAUSE)
+    if code != 200:
+        raise SourceError("nsearchives", "ind_close_all_%s.csv answered HTTP %d" % (d.strftime("%d%m%Y"), code),
+                          hint("nsearchives", code), transient=False)
+    return parse_index_csv(body.decode("utf-8", "replace"), d)
+
+
+def history_records(doc):
+    """The first list of dicts that carries EOD_TIMESTAMP, wherever the answer nests it."""
+    if isinstance(doc, list):
+        if doc and isinstance(doc[0], dict) and "EOD_TIMESTAMP" in doc[0]:
+            return doc
+        found = [history_records(x) for x in doc if isinstance(x, (dict, list))]
+    elif isinstance(doc, dict):
+        found = [history_records(x) for x in doc.values() if isinstance(x, (dict, list))]
+    else:
+        found = []
+    return next((f for f in found if f), [])
+
+
+def parse_index_history(doc):
+    """historicalOR/indicesHistory or vixhistory answer (newest first) -> rows ascending. NSE sends no
+    volume, P/E, P/B or yield here, so those cells stay empty."""
+    rows = {}
+    for r in history_records(doc):
+        try:
+            d = parse_date(r.get("EOD_TIMESTAMP"))
+        except DataError:
+            continue
+        close = num(r.get("EOD_CLOSE_INDEX_VAL"))
+        if close is None:
+            continue
+        rows[d.isoformat()] = index_row(d, num(r.get("EOD_OPEN_INDEX_VAL")), num(r.get("EOD_HIGH_INDEX_VAL")),
+                                        num(r.get("EOD_LOW_INDEX_VAL")), close, None, None, None, None)
+    return [rows[k] for k in sorted(rows)]
+
+
+def fetch_index_history(sess, name, lo, hi):
+    lo_s, hi_s = lo.strftime("%d-%m-%Y"), hi.strftime("%d-%m-%Y")
+    if index_slug(name) == index_slug(VIX_NAME):
+        doc = nse_api(sess, "/api/historicalOR/vixhistory?from=%s&to=%s" % (lo_s, hi_s), VIX_REFERER)
+    else:
+        doc = nse_api(sess, "/api/historicalOR/indicesHistory?indexType=%s&from=%s&to=%s" % (
+            urllib.parse.quote(str(name).upper()), lo_s, hi_s), INDEX_REFERER)
+    return parse_index_history(doc)
+
+
+def pe_verdict(pe, expensive=PE_EXPENSIVE, cheap=PE_CHEAP):
+    """Nifty 50 P/E rule of thumb: at or above `expensive` is expensive, at or below `cheap` is cheap."""
+    if pe is None:
+        return None
+    return "expensive" if pe >= expensive else "cheap" if pe <= cheap else "neutral"
+
+
+def pe_percentile(rows, min_rows=PE_MIN_ROWS):
+    """Share of the cached P/E values (the latest included) at or below the latest one, in percent.
+    None until there are min_rows rows with a P/E."""
+    vals = [r["pe"] for r in rows if r["pe"] is not None]
+    if len(vals) < min_rows:
+        return None
+    return 100.0 * sum(1 for v in vals if v <= vals[-1]) / len(vals)
+
+
+def index_days(end, n):
+    """The last n trading sessions up to end."""
+    return trading_days(end - datetime.timedelta(days=int(n * 1.5) + 14), end)[-n:]
+
+
+def print_valuation(data_dir, a):
+    rows = read_index(index_path(data_dir, VALUATION_INDEX))
+    withpe = [r for r in rows if r["pe"] is not None]
+    if not withpe:
+        print("%s valuation: no P/E cached yet (the snapshot archive has it; run index --days 30)." % VALUATION_INDEX)
+    else:
+        last = withpe[-1]
+        line = "%s on %s: P/E %s" % (VALUATION_INDEX, last["date"], fmt(last["pe"]))
+        for key, label, unit in (("pb", "P/B", ""), ("div_yield", "dividend yield", "%")):
+            if last[key] is not None:
+                line += ", %s %s%s" % (label, fmt(last[key]), unit)
+        print(line)
+        print("  rule of thumb: P/E >= %s expensive, <= %s cheap, between neutral -> %s" % (
+            fmt(a.pe_expensive), fmt(a.pe_cheap), pe_verdict(last["pe"], a.pe_expensive, a.pe_cheap)))
+        pct = pe_percentile(rows)
+        if pct is None:
+            print("  P/E percentile: %d of %d rows with a P/E; needs %d (run index --days %d once, about a second "
+                  "a file)" % (len(withpe), PE_MIN_ROWS, PE_MIN_ROWS, PE_MIN_ROWS + 10))
+        else:
+            print("  P/E percentile: %.0f%% of the %d cached sessions had a P/E at or below today's" % (
+                pct, len(withpe)))
+        print("  A market-wide rule of thumb, not a timing signal: valuation can stay high or low for years.")
+    vix = read_index(index_path(data_dir, VIX_NAME))
+    if vix:
+        print("India VIX %s on %s." % (fmt(vix[-1]["close"]), vix[-1]["date"]))
+
+
+def cmd_index(a):
+    now = parse_now(a.now)
+    end = last_complete_session(now)
+    wanted = {}
+    for n in (a.names or list(INDEX_DEFAULT)) + [VIX_NAME]:
+        wanted.setdefault(index_slug(n), " ".join(n.split()).upper() if n != VIX_NAME else VIX_NAME)
+    if a.days:
+        days = index_days(end, a.days)
+    else:
+        days = set()
+        for slug in wanted:
+            rows = read_index(index_path(a.data, slug))
+            days |= set(trading_days(datetime.date.fromisoformat(rows[-1]["date"]) + datetime.timedelta(days=1), end)
+                        if rows else index_days(end, INDEX_DAYS))
+        days = sorted(days)[-a.max_days:]
+    sess, rc, got, notes, present = Session(a.data), 0, dict((s, []) for s in wanted), [], set()
+    missing = []
+    for d in days:
+        try:
+            table = fetch_index_day(sess, d)
+        except SourceError as e:
+            gone = "HTTP 404" in str(e)
+            if gone and d < end:
+                missing.append(d)
+                continue
+            rc = 0 if gone else 1     # today's file before the evening is not an error; a block is
+            notes.append("%s: %s%s" % (d, e, " (not published yet, it appears in the evening)" if gone else ""))
+            break
+        except DataError as e:
+            rc = 1
+            notes.append("%s: %s" % (d, e))
+            break
+        for slug in wanted:
+            if slug in table:
+                got[slug].append(table[slug][1])
+                present.add(slug)
+    if missing:
+        notes.insert(0, "no snapshot file for %d day(s), skipped (an unannounced closure, or not archived): %s" % (
+            len(missing), compress(missing, 4)))
+    if present:
+        for slug, name in wanted.items():
+            if slug not in present:
+                notes.append("%s: not in the snapshot files (names look like NIFTY 50, NIFTY BANK, India VIX)" % name)
+    for slug, name in wanted.items():
+        if a.years:
+            start = end - datetime.timedelta(days=int(round(365.25 * a.years)))
+            dates = [r["date"] for r in read_index(index_path(a.data, slug)) + got[slug]]
+            hi = datetime.date.fromisoformat(min(dates)) - datetime.timedelta(days=1) if dates else end
+            if dates and hi <= start + datetime.timedelta(days=7):
+                continue    # the cache already reaches back that far
+            try:
+                for c0, c1 in chunk_range(start, hi):
+                    got[slug] += fetch_index_history(sess, name, c0, c1)
+            except (SourceError, DataError) as e:
+                rc = 1
+                notes.append("%s history: %s" % (name, e))
+        if got[slug]:
+            before = len(read_index(index_path(a.data, slug)))
+            after = write_index(a.data, name, got[slug])
+            print("%s: +%d row(s), %d cached (%s to %s) -> %s" % (
+                name, len(after) - before, len(after), after[0]["date"], after[-1]["date"],
+                index_path(a.data, slug)))
+        elif not days and not a.years:
+            print("%s: up to date." % name)
+    for n in notes:
+        print("  " + n)
+    print_valuation(a.data, a)
+    return rc
+
+
 # ---------------------------------------------------------------- doctor
 
 def probes(now_ist):
@@ -2519,6 +2795,7 @@ def probes(now_ist):
         ("nse-actions", "cal", NSE + "/api/corporates-corporateActions?index=equities&symbol=RELIANCE"
          "&from_date=%s&to_date=%s" % ((now_ist.date() - datetime.timedelta(days=365)).strftime("%d-%m-%Y"),
                                        now_ist.strftime("%d-%m-%Y")), "actions"),
+        ("nse-index", "index", index_url(bd), "index"),
         ("nsearchives", "price", bhav_urls(bd)[0], "bhav"),
         ("niftyindices", "list", NIFTY_LIST, "csv"),
         ("google-news", "news", GNEWS, "rss"),
@@ -2554,6 +2831,8 @@ def check_body(kind, code, body):
             return False, "not JSON (bot wall)"
     if kind == "bhav":
         return "SYMBOL" in text.upper(), "not a bhavcopy"
+    if kind == "index":
+        return "index name" in text.lower(), "not the index snapshot"
     if kind == "csv":
         return "symbol" in text.lower(), "not the index CSV"
     if kind == "rss":
@@ -2571,7 +2850,7 @@ def cmd_doctor(a):
         ok, err, code = False, "", None
         try:
             hdr = {"Referer": NSE + "/"} if "nse" in url else {}
-            if check == "bhav":
+            if check in ("bhav", "index"):
                 hdr["Range"] = "bytes=0-2047"
             if name == "nse-api":
                 hdr.update({"Accept": "application/json", "Referer": NSE + "/get-quotes/equity?symbol=RELIANCE"})
@@ -2699,6 +2978,12 @@ def cmd_status(a):
     if acts["symbols"]:
         n = sum(1 for e in acts["symbols"].values() for x in e["actions"] if x["factor"])
         print("actions.json: %d symbol(s), %d split/bonus, fetched %s" % (len(acts["symbols"]), n, acts["fetched_at"]))
+    idx = os.path.join(a.data, INDEX_DIR)
+    for f in sorted(os.listdir(idx) if os.path.isdir(idx) else []):
+        if f.endswith(".csv"):
+            rows = read_index(os.path.join(idx, f))
+            if rows:
+                print("index/%-22s %5d rows %s..%s" % (f, len(rows), rows[0]["date"], rows[-1]["date"]))
     cal = _CAL
     if cal:
         print("calendar.json: years %s, %d holiday(s), fetched %s, circulars checked %s" % (
@@ -2788,6 +3073,14 @@ def main(argv=None):
     common(p)
     p.add_argument("symbols", nargs="*", help="default: every cached symbol that has actions")
     p.add_argument("--force", action="store_true", help="also replace an adj file that came from Yahoo, Kite or a CSV")
+    p = sub.add_parser("index", help="index snapshot, Nifty 50 valuation and India VIX into index/<slug>.csv")
+    common(p)
+    p.add_argument("names", nargs="*", help="index names, default: NIFTY 50, NIFTY BANK, NIFTY 500 (India VIX always)")
+    p.add_argument("--days", type=int, default=0, help="fetch the snapshot file of the last N sessions again")
+    p.add_argument("--max-days", type=int, default=300, help="cap on snapshot files per run")
+    p.add_argument("--years", type=float, default=0, help="also backfill N years of index levels (no P/E)")
+    p.add_argument("--pe-expensive", type=float, default=PE_EXPENSIVE, help="P/E flagged expensive (default 25)")
+    p.add_argument("--pe-cheap", type=float, default=PE_CHEAP, help="P/E flagged cheap (default 20)")
     p = sub.add_parser("doctor", help="probe every source")
     common(p)
     p.add_argument("--timeout", type=float, default=10)
@@ -2809,8 +3102,8 @@ def main(argv=None):
     try:
         return {"daily": cmd_daily, "intraday": cmd_intraday, "bands": cmd_bands, "import-kite": cmd_import_kite,
                 "import-csv": cmd_import_csv, "calendar": cmd_calendar, "delivery": cmd_delivery,
-                "actions": cmd_actions, "adjust": cmd_adjust, "doctor": cmd_doctor, "record": cmd_record,
-                "status": cmd_status}[a.cmd](a)
+                "actions": cmd_actions, "adjust": cmd_adjust, "index": cmd_index, "doctor": cmd_doctor,
+                "record": cmd_record, "status": cmd_status}[a.cmd](a)
     except DataError as e:
         print("data.py: %s" % e, file=sys.stderr)
         return 1
