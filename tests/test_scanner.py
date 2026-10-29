@@ -255,6 +255,10 @@ class Daily(unittest.TestCase):
         "SBICARD": ["oversold"],         # RSI 25.5
         "SONATSOFTW": ["oversold"],       # RSI 22.7
         "METROPOLIS": ["oversold_bounce"],  # RSI 27.1 on Thursday, closed up Friday (214.94 -> 217.39), RSI 34.0
+        # the swing engine on closes: up, a swing high pending 3 to 15 bars, the close over the coc level
+        "RELIANCE": ["swing_pullback"],     # bos 380.68 (coc 352.84), new high 382.70, 5 bars since, close 354.72
+        "TCS": ["swing_pullback"],          # level 239.24, coc 210.96, 8 bars since
+        "HDFCBANK": ["swing_pullback"],     # level 543.45, coc 480.35, 3 bars since
     }
     # The reel's refs/scan.py tags for the same charts (it used highs and lows): all reproduced.
     REEL = {"BAJFINANCE": "breakout_20d", "TATACONSUM": "breakout_20d", "GMRAIRPORT": "breakout_20d", "BHARATFORG": "breakout_20d",
@@ -271,7 +275,13 @@ class Daily(unittest.TestCase):
         self.assertEqual({h["symbol"]: h["setups"] for h in hits}, self.EXPECT)
         self.assertEqual(last, D(2026, 10, 16))
         self.assertEqual(counts, {"requested": 19, "fetched": 19, "illiquid": 0, "short": 0, "scanned": 19,
-                                  "hits": 15})
+                                  "hits": 18})
+        rel = [h for h in hits if h["symbol"] == "RELIANCE"][0]
+        self.assertEqual((rel["level"], rel["coc"], rel["swing_trend"], rel["swing_basis"]),
+                         (382.7, 352.84, "up", "closes"))                    # spark: closes only
+        itc = [h for h in hits if h["symbol"] == "ITC"][0]
+        self.assertEqual((itc["level"], itc["coc"]), (93.9, 85.65))          # trend up, no tag: the numbers stay
+        self.assertIsNone([h for h in hits if h["symbol"] == "COALINDIA"][0]["level"])   # trend down
         for sym, tag in self.REEL.items():
             self.assertIn(tag, self.EXPECT[sym], sym)
         blk = [h for h in hits if h["symbol"] == "BAJFINANCE"][0]
@@ -295,7 +305,8 @@ class Daily(unittest.TestCase):
     def test_liquidity_filter(self):
         # meta is Yahoo's as of 10:35 AM Monday, so the volume is the day's so far
         hits, counts, _ = scan.scan_daily(self.data, self.syms, scan.parse_now("2026-10-19 10:35"), 5, 1000000)
-        self.assertEqual(sorted(h["symbol"] for h in hits), ["COALINDIA", "DELHIVERY", "GMRAIRPORT", "IOC", "ITC", "KEI", "SONATSOFTW"])
+        self.assertEqual(sorted(h["symbol"] for h in hits), ["COALINDIA", "DELHIVERY", "GMRAIRPORT", "HDFCBANK", "IOC",
+                                                             "ITC", "KEI", "RELIANCE", "SONATSOFTW", "TCS"])
         self.assertEqual(counts["illiquid"], 8)     # SUZLON under ₹5; BAJFINANCE, TATACONSUM, BHARATFORG, LTTS, BOSCHLTD, SBICARD, METROPOLIS under 1M so far
         self.assertEqual(counts["scanned"], 11)
 
@@ -701,8 +712,10 @@ class Cli(unittest.TestCase):
         self.assertIn("Fetched 4 of 9 charts (5 failed or had no data)", text)
         doc = self.read(self.wl)
         self.assertEqual((doc["mode"], doc["universe"], doc["scanned"], doc["failed"]), ("daily", 9, 4, 5))
-        self.assertEqual(doc["hits"], [{"symbol": "ITC", "setups": ["breakout_20d"], "price": 93.9,
-                                        "close_date": "2026-10-16", "rsi": 75.3, "volume": 3680307}])
+        self.assertEqual(sorted(h["symbol"] for h in doc["hits"]), ["HDFCBANK", "ITC", "RELIANCE", "TCS"])
+        self.assertIn({"symbol": "ITC", "setups": ["breakout_20d"], "price": 93.9, "close_date": "2026-10-16",
+                       "rsi": 75.3, "volume": 3680307, "level": 93.9, "coc": 85.65, "swing_trend": "up",
+                       "swing_basis": "closes"}, doc["hits"])
         self.assertEqual(doc["as_of"], "2026-10-16 close")
 
         # the 10:00 IST scan
@@ -833,7 +846,7 @@ class Cli(unittest.TestCase):
                              "--min-volume", "0", "--min-price", "0"])
         self.assertEqual(code, 0)
         out = json.loads(text)
-        self.assertEqual(len(out["hits"]), 15)
+        self.assertEqual(len(out["hits"]), 18)
         self.assertEqual(out["note"], "A scan is a list of charts that match a rule, not a list of stocks to buy.")
 
 
@@ -1042,6 +1055,156 @@ class SwingScreens(unittest.TestCase):
             doc = json.loads(text)
             self.assertEqual(doc["hits"][0]["swing_trend"], "up")
             self.assertNotIn("\u2014", text)
+        finally:
+            os.chdir(cwd)
+            shutil.rmtree(d)
+
+
+def swing_daily_bars(extra_bars=2):
+    """41 daily (high, low, close) bars that end in Series A's pullback: a quiet 33-bar range, bars 2 to 7 of the
+    series, then `extra_bars` more (12/11/11.5 then 11.8/10.9/11.2 for two). 41 is past the 40-bar warm-up."""
+    return [SERIES_A[0]] * 33 + SERIES_A[1:7] + [(12, 11, 11.5), (11.8, 10.9, 11.2)][:extra_bars]
+
+
+class DailySwing(unittest.TestCase):
+    """swing_pullback and swing_reversal_up in the daily scan, and orb --trend-filter."""
+
+    def test_the_pullback_numbers(self):
+        a9 = SERIES_A[:7] + [(12, 11, 11.5), (11.8, 10.9, 11.2)]
+        tags, nums = scan.find_swing(a9, 5, 0)
+        self.assertEqual(tags, ["swing_pullback"])
+        self.assertEqual((nums["level"], nums["coc"], nums["bars_since"], nums["trend"]), (12.6, 10.2, 3, "up"))
+        tags, nums = scan.find_swing(SERIES_A[:7], 5, 0)                         # bars_since 1: too soon
+        self.assertEqual(tags, [])
+        self.assertEqual((nums["level"], nums["coc"], nums["bars_since"]), (12.6, 10.2, 1))
+        # 3 to 15 bars since the swing high formed, inclusive
+        flat = (12, 11, 11.5)
+        for extra, want in ((1, []), (2, ["swing_pullback"]), (14, ["swing_pullback"]), (15, [])):
+            tags, nums = scan.find_swing(SERIES_A[:7] + [flat] * extra, 5, 0)
+            self.assertEqual(tags, want, extra)
+        self.assertEqual((scan.SWING_PULLBACK_MIN, scan.SWING_PULLBACK_MAX), (3, 15))
+        # a close under the coc level reverses the trend: nothing, and no level
+        tags, nums = scan.find_swing(SERIES_A, 5, 0)
+        self.assertEqual((tags, nums["trend"], nums["level"], nums["coc"]), ([], "down", None, None))
+        # under the warm-up the trend is not reported at all
+        tags, nums = scan.find_swing(a9)
+        self.assertEqual((tags, nums["trend"]), ([], None))
+
+    def test_a_reversal_up_on_the_last_bar(self):
+        tags, nums = scan.find_swing(SERIES_B, 5, 0)
+        self.assertEqual(tags, ["swing_reversal_up"])
+        self.assertEqual((nums["level"], nums["coc"], nums["bars_since"]), (10.2, 7.4, 0))
+
+    def rows(self, bars, end=D(2026, 10, 16)):
+        day, out = end - datetime.timedelta(days=len(bars) - 1), []
+        for h, l, c in bars:
+            out.append((day, c, h, l, c, 100000.0))
+            day += datetime.timedelta(days=1)
+        return out
+
+    def test_real_highs_and_lows_versus_closes_only(self):
+        rows = self.rows(swing_daily_bars())
+        full = scan.series_from_daily(rows)                                      # the cache: real highs and lows
+        spark = {"t": full["t"], "c": full["c"], "meta": full["meta"]}           # Yahoo spark: closes only
+        now = scan.parse_now("2026-10-19 08:45")
+        hits, _, _ = scan.scan_daily({"HL": full, "CL": spark}, ["HL", "CL"], now, 0, 0)
+        by = {h["symbol"]: h for h in hits}
+        self.assertEqual(by["HL"]["setups"], ["swing_pullback"])
+        self.assertEqual((by["HL"]["level"], by["HL"]["coc"], by["HL"]["swing_basis"]), (12.6, 10.2, "highs_lows"))
+        # closes only: the swing high is the highest close (12.4), the pullback low the lowest close (10.4)
+        self.assertEqual(by["CL"]["setups"], ["swing_pullback"])
+        self.assertEqual((by["CL"]["level"], by["CL"]["coc"], by["CL"]["swing_basis"]), (12.4, 10.4, "closes"))
+
+    def test_daily_cache_end_to_end_and_the_6mo_request(self):
+        d = tempfile.mkdtemp()
+        cwd = os.getcwd()
+        os.chdir(d)
+        saved = scan.yahoo_get
+        try:
+            os.makedirs(os.path.join("trader", "data", "daily"))
+            with open(os.path.join("trader", "data", "daily", "SWNG.csv"), "w") as fh:
+                fh.write("date,open,high,low,close,volume\n")
+                for r in self.rows(swing_daily_bars()):
+                    fh.write("%s,%s,%s,%s,%s,%d\n" % (r[0].isoformat(), r[1], r[2], r[3], r[4], r[5]))
+            code, text, err = run(["daily", "--cache", "--symbols", "SWNG", "--now", "2026-10-19 08:45", "--json",
+                                   "--no-write", "--min-price", "0", "--min-volume", "0"])
+            self.assertEqual(code, 0, err)
+            h = json.loads(text)["hits"][0]
+            self.assertEqual((h["setups"], h["level"], h["coc"], h["swing_basis"]),
+                             (["swing_pullback"], 12.6, 10.2, "highs_lows"))
+            code, text, _ = run(["daily", "--cache", "--symbols", "SWNG", "--now", "2026-10-19 08:45", "--no-write",
+                                 "--min-price", "0", "--min-volume", "0"])
+            self.assertIn("swing pullback", text)
+            self.assertIn("[level 12.60, coc 10.20]", text)
+            self.assertIn("highs and lows", text)
+            seen = []
+
+            def boom(path):
+                seen.append(path)
+                raise scan.ScanError("blocked")
+            scan.yahoo_get = boom
+            run(["daily", "--symbols", "SWNG", "--now", "2026-10-19 08:45", "--no-write", "--pause", "0"])
+            self.assertIn("range=6mo&interval=1d", seen[0])
+        finally:
+            scan.yahoo_get = saved
+            os.chdir(cwd)
+            shutil.rmtree(d)
+
+    # ---- orb --trend-filter
+
+    def test_trend_filter_helper(self):
+        up = self.rows(SERIES_A[:6])
+        down = self.rows(SERIES_A)
+        short = self.rows(SERIES_A[:3])
+        hits = [{"symbol": "UPS", "setups": ["orb"]}, {"symbol": "DWN", "setups": ["orb"]},
+                {"symbol": "SHT", "setups": ["orb"]}, {"symbol": "NOC", "setups": ["orb"]}]
+        kept, dropped = scan.trend_filter(hits, {"UPS": up, "DWN": down, "SHT": short}, 5, 5)
+        self.assertEqual(dropped, ["DWN"])
+        self.assertEqual([h["symbol"] for h in kept], ["UPS", "SHT", "NOC"])
+        self.assertEqual(kept[0]["daily_trend"], "up")
+        self.assertNotIn("trend_note", kept[0])
+        self.assertEqual(kept[1]["daily_trend"], "unknown")
+        self.assertIn("trend unknown", kept[1]["trend_note"])
+        self.assertIn("no daily cache", kept[2]["trend_note"])
+        self.assertEqual(hits[0], {"symbol": "UPS", "setups": ["orb"]})           # the input is not changed
+        # the default warm-up is 40 bars: 6 bars of a downtrend is "unknown", not dropped
+        kept, dropped = scan.trend_filter(hits[:2], {"UPS": up, "DWN": down})
+        self.assertEqual((len(kept), dropped), (2, []))
+
+    def test_trend_filter_on_the_orb_scan(self):
+        d = tempfile.mkdtemp()
+        cwd = os.getcwd()
+        os.chdir(d)
+        try:
+            os.makedirs(os.path.join("trader", "data", "daily"))
+
+            def put(sym, bars, extra=()):
+                with open(os.path.join("trader", "data", "daily", "%s.csv" % sym), "w") as fh:
+                    fh.write("date,open,high,low,close,volume\n")
+                    for r in self.rows(bars) + list(extra):
+                        fh.write("%s,%s,%s,%s,%s,%d\n" % (r[0].isoformat(), r[1], r[2], r[3], r[4], r[5]))
+            put("BLUESTARCO", [SERIES_A[0]] * 36 + SERIES_A[1:6],          # up: a bos on the last bar
+                extra=[(D(2026, 10, 19), 1.0, 1.0, 1.0, 1.0, 1000.0)])      # a crash dated the session day: not read
+            put("CHALET", [SERIES_A[0]] * 35 + SERIES_A[1:])                # down: a reversal on the last bar
+            base = ["--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--json", "--no-write"]
+            code, text, _ = run(["orb"] + base)
+            plain = json.loads(text)
+            self.assertEqual(len(plain["hits"]), 42)
+            self.assertNotIn("trend_filter", plain)
+            code, text, err = run(["orb"] + base + ["--trend-filter"])
+            self.assertEqual(code, 0, err)
+            doc = json.loads(text)
+            by = {h["symbol"]: h for h in doc["hits"]}
+            self.assertEqual(len(doc["hits"]), 41)
+            self.assertNotIn("CHALET", by)
+            self.assertEqual(by["BLUESTARCO"]["daily_trend"], "up")
+            self.assertEqual(by["GLENMARK"]["daily_trend"], "unknown")
+            self.assertIn("trend unknown", by["GLENMARK"]["trend_note"])
+            self.assertEqual(doc["trend_filter"], {"kept": 41, "dropped": ["CHALET"], "unknown": 40})
+            self.assertEqual(doc["counts"]["hits"], 41)
+            code, text, _ = run(["orb"] + base[:-2] + ["--no-write", "--trend-filter"])
+            self.assertIn("Daily trend filter: dropped 1 whose daily swing trend is down (CHALET); 40 kept", text)
+            self.assertIn("(trend unknown (no daily cache))", text)
         finally:
             os.chdir(cwd)
             shutil.rmtree(d)

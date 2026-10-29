@@ -8,6 +8,7 @@
     python3 scan.py orb                               # after 9:35 AM IST: opening-range breakouts so far
     python3 scan.py orb --at 10:00 --or-minutes 15    # cut the clock at 10:00 AM IST
     python3 scan.py orb --offline wall5m.json.gz --now "2026-10-19 10:00" --min-price 0
+    python3 scan.py orb --trend-filter                # drop names whose daily swing trend is down
     python3 scan.py daily --cache                     # daily closes from trader/data/daily (trader-data)
     python3 scan.py longterm                          # long-term screen of the daily cache
     python3 scan.py longterm --screen near_52w_low --near-low 10
@@ -26,7 +27,7 @@ universe  Downloads an NSE symbol list and writes one SYMBOL|Name a line.
           characters (RELIANCE, M&M, BAJAJ-AUTO).
 
 daily     Pre-market scan of daily CLOSES (Yahoo spark: 20 symbols a request,
-          3 months of 1-day bars, closes only). Liquidity from the spark meta:
+          6 months of 1-day bars, closes only). Liquidity from the spark meta:
           regularMarketPrice >= --min-price (50) and regularMarketVolume >=
           --min-volume (500,000). Setups, from closes only:
             breakout_20d     the last close is above every close of the 20 before it
@@ -35,6 +36,15 @@ daily     Pre-market scan of daily CLOSES (Yahoo spark: 20 symbols a request,
             reclaim_ma20     closed under the 20-day average, then closed above it
             oversold         RSI 14 (Wilder) under 30
             oversold_bounce  RSI 14 was under 30 yesterday and today closed up
+            swing_pullback   the swing engine (see longterm) says up and stable, a swing
+                             high is pending, the close is over the change-of-character
+                             level and the swing high formed 3 to 15 bars ago
+            swing_reversal_up  the swing trend turned up on the last bar
+          The swing engine runs on closes alone with Yahoo spark (high = low =
+          close, a closing-basis structure) and on real highs and lows with
+          --cache. Each hit carries level (the pending swing high, what
+          trader-entry's watchlist --setup level reads), coc (the structural
+          stop reference), swing_trend and swing_basis.
           Today's daily bar is dropped until the session's close (15:30 IST).
 
 longterm  Long-term screen of the trader-data daily cache
@@ -70,7 +80,10 @@ orb       Opening-range breakouts, 5-minute bars. The session is 09:15 to
           so when it stops short. A chart is usable only when every 5-minute
           bar from 09:15 to the cutoff is there (a missing bar is a halt, a
           circuit lock or no trades). Floors: --min-price 50 (last close),
-          --min-volume 0.
+          --min-volume 0. --trend-filter drops hits whose daily swing trend
+          (the engine on the trader-data daily cache, bars before the session
+          day) is down; a name with no cache or no stable trend stays, flagged
+          "trend unknown" in daily_trend and trend_note.
 
 Bars: null closes are dropped, a bar off the 5-minute grid (the live tick,
 like 10:49:45) is dropped, and a bar counts only once it is complete
@@ -136,6 +149,7 @@ YEAR_BARS = 252     # about a year of NSE sessions
 SWING_RETRACE = 5.0   # daily swing engine: pullbacks under this percent of the swing high do not move the stop (ours)
 SWING_MIN_BARS = 40   # the engine's trend counts as stable only after this many bars (SwingTrend docs: feed 60+)
 SWING_FEED = YEAR_BARS   # bars fed to the engine for the long-term tags: a fixed warm-up window
+SWING_PULLBACK_MIN, SWING_PULLBACK_MAX = 3, 15   # swing_pullback: bars since the swing high formed (ours)
 NIFTY500_FILE = "ind_nifty500list.csv"
 NIFTY500_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 EQUITY_FILE = "EQUITY_L.csv"
@@ -185,6 +199,8 @@ SETUPS = [
     ("reclaim_ma20", "reclaimed the 20-day average"),
     ("oversold", "oversold (RSI under 30)"),
     ("oversold_bounce", "oversold bounce"),
+    ("swing_pullback", "swing pullback (uptrend, pending swing high)"),
+    ("swing_reversal_up", "swing trend just reversed up"),
 ]
 LABEL = dict(SETUPS)
 
@@ -710,22 +726,32 @@ def rsi(closes, n=14):
     return 100 - 100 / (1 + ag / al) if al else 100.0
 
 
-def daily_closes(series, now_utc):
-    """[(date, close)] of COMPLETE daily bars: null closes dropped, today's bar dropped
-    until the session closes, anything dated after the clock dropped."""
+def daily_hlc(series, now_utc):
+    """[(date, high, low, close)] of COMPLETE daily bars: null closes dropped, today's bar dropped
+    until the session closes, anything dated after the clock dropped. A bar with no high or low
+    (spark has closes only) takes its close for both."""
     now = to_ist(now_utc)
     today = now.date()
     s = session(today)
     today_done = s is None or now.time() >= s[1]
+    hs, ls = series.get("h"), series.get("l")
     out = {}
-    for ts, c in zip(series["t"], series["c"]):
+    for i, (ts, c) in enumerate(zip(series["t"], series["c"])):
         if c is None:
             continue
         d = ts_to_ist(ts).date()
         if d > today or (d == today and not today_done):
             continue
-        out[d] = float(c)  # one bar a day: a late duplicate (the live tick) wins
-    return sorted(out.items())
+        h = hs[i] if hs and i < len(hs) else None
+        lo = ls[i] if ls and i < len(ls) else None
+        c = float(c)
+        out[d] = (float(h) if h is not None else c, float(lo) if lo is not None else c, c)  # a late duplicate wins
+    return [(d,) + out[d] for d in sorted(out)]
+
+
+def daily_closes(series, now_utc):
+    """[(date, close)] of COMPLETE daily bars (see daily_hlc)."""
+    return [(b[0], b[3]) for b in daily_hlc(series, now_utc)]
 
 
 def find_setups(closes):
@@ -754,6 +780,26 @@ def find_setups(closes):
                   "run_pct": run * 100, "range5_pct": rng5 * 100}
 
 
+def find_swing(bars, retrace=SWING_RETRACE, min_bars=SWING_MIN_BARS):
+    """bars (high, low, close) oldest first -> (setup tags, numbers). The engine runs on the last SWING_FEED
+    bars and counts only once it is stable. swing_pullback: trend up, a swing high pending, the change-of-
+    character level under the close, and SWING_PULLBACK_MIN to SWING_PULLBACK_MAX bars since the swing high
+    formed. swing_reversal_up: the trend turned up on the last bar. `level` is the pending swing high (the
+    high of the leg when none is pending), `coc` the structural stop; both None unless the trend is up."""
+    sw = swing_info(bars[-SWING_FEED:], retrace, min_bars)
+    up = sw["trend"] == "up" and sw["stable"]
+    tags = []
+    if up:
+        if sw["event"] == "reversal":
+            tags.append("swing_reversal_up")
+        elif (sw["pivot"] is not None and sw["coc"] < bars[-1][2]
+              and SWING_PULLBACK_MIN <= sw["bars_since"] <= SWING_PULLBACK_MAX):
+            tags.append("swing_pullback")
+    return tags, {"trend": sw["trend"] if sw["stable"] else None, "bars_since": sw["bars_since"],
+                  "level": (sw["pivot"] if sw["pivot"] is not None else sw["hi"]) if up else None,
+                  "coc": sw["coc"] if up else None}
+
+
 def scan_daily(data, symbols, now_utc, min_price, min_volume):
     """Pure. data = {SYM: series}. Returns (hits, counts, last_date)."""
     hits, dates = [], {}
@@ -763,7 +809,8 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume):
         if not s:
             continue
         counts["fetched"] += 1
-        bars = daily_closes(s, now_utc)
+        hlc = daily_hlc(s, now_utc)
+        bars = [(b[0], b[3]) for b in hlc]
         meta = s.get("meta") or {}
         price = meta.get("regularMarketPrice")
         if price is None and bars:
@@ -780,10 +827,16 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume):
         dates[d_last] = dates.get(d_last, 0) + 1
         closes = [c for _, c in bars]
         tags, nums = find_setups(closes)
+        stags, sw = find_swing([b[1:] for b in hlc])   # highs and lows when the series has them, else closes
+        tags = tags + stags
         if tags:
             hits.append({"symbol": sym, "setups": tags, "price": round(closes[-1], 2),
                          "close_date": d_last.isoformat(), "rsi": round(nums["rsi"], 1),
-                         "volume": int(vol) if vol is not None else None})
+                         "volume": int(vol) if vol is not None else None,
+                         "level": round(sw["level"], 2) if sw["level"] is not None else None,
+                         "coc": round(sw["coc"], 2) if sw["coc"] is not None else None,
+                         "swing_trend": sw["trend"],
+                         "swing_basis": "highs_lows" if s.get("h") and s.get("l") else "closes"})
     hits.sort(key=lambda h: (-(h["price"] * (h["volume"] or 0)), h["symbol"]))  # most rupees traded first
     last_date = max(dates, key=lambda d: (dates[d], d)) if dates else None
     counts["hits"] = len(hits)
@@ -950,6 +1003,25 @@ def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume
         del h["_t"]
     counts["hits"] = len(hits)
     return hits, counts, failed
+
+
+def trend_filter(hits, rows_by_sym, retrace=SWING_RETRACE, min_bars=SWING_MIN_BARS):
+    """Keep opening-range hits whose daily swing trend is up. A name with no daily rows, too few bars for a
+    stable reading, or no trend yet stays, flagged `trend unknown` in the hit. -> (kept, dropped symbols)."""
+    kept, dropped = [], []
+    for h in hits:
+        rows = rows_by_sym.get(h["symbol"]) or []
+        sw = swing_info([(r[2], r[3], r[4]) for r in rows[-SWING_FEED:]], retrace, min_bars) if rows else None
+        if sw and sw["stable"] and sw["trend"] == "down":
+            dropped.append(h["symbol"])
+            continue
+        if sw and sw["stable"] and sw["trend"] == "up":
+            kept.append(dict(h, daily_trend="up"))
+            continue
+        why = ("no daily cache" if not rows else "under %d daily bars" % (min_bars + 1) if not sw["stable"]
+               else "no daily trend yet")
+        kept.append(dict(h, daily_trend="unknown", trend_note="trend unknown (%s)" % why))
+    return kept, dropped
 
 
 # ---------------------------------------------------------------- fetching
@@ -1419,7 +1491,7 @@ def cmd_daily(a):
     else:
         progress(a, "Fetching daily closes for %s symbols (%d spark requests)..."
                  % (indian(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
-        data, failed = fetch_spark(symbols, "3mo", "1d", a.pause, a)
+        data, failed = fetch_spark(symbols, "6mo", "1d", a.pause, a)
         if failed:
             got, _, lasts = load_daily_cache(sorted(failed))
             data.update(got)
@@ -1449,10 +1521,10 @@ def cmd_daily(a):
         print(json.dumps(dict(doc, counts=counts, seconds=round(time.time() - t0, 1)), indent=2))
         return 0 if hits else 1
     local = to_ist(now)
-    print("Daily scan, %s IST, closes through %s (%s, daily closes only)." % (
+    print("Daily scan, %s IST, closes through %s (%s)." % (
         local.strftime("%a %Y-%m-%d %H:%M"), last_date.isoformat() if last_date else "nothing",
-        {"yahoo": "Yahoo spark", "cache": "trader-data cache", "yahoo+cache": "Yahoo spark + trader-data cache"}
-        [source]))
+        {"yahoo": "Yahoo spark, daily closes only", "cache": "trader-data cache, highs and lows",
+         "yahoo+cache": "Yahoo spark + trader-data cache"}[source]))
     note_out(a, cnote)
     print("Fetched %s of %s charts%s. %s passed the liquidity filter (₹%s+ and %s+ shares)%s; "
           "%s scanned." % (indian(counts["fetched"]), indian(len(symbols)),
@@ -1471,8 +1543,11 @@ def cmd_daily(a):
     else:
         print("No setups.")
     for h in hits[:a.show]:
-        print("  %-10s %14s  RSI %5.1f  %s" % (h["symbol"], money(h["price"]), h["rsi"],
-                                              ", ".join(LABEL[t] for t in h["setups"])))
+        print("  %-10s %14s  RSI %5.1f  %s%s" % (h["symbol"], money(h["price"]), h["rsi"],
+                                                ", ".join(LABEL[t] for t in h["setups"]),
+                                                ("  [level %s, coc %s]" % (_p(h["level"]), _p(h["coc"])))
+                                                if h["level"] is not None and h["coc"] is not None
+                                                and any(t.startswith("swing_") for t in h["setups"]) else ""))
     if len(hits) > a.show:
         print("  ... and %d more in the watchlist (--show N for more)." % (len(hits) - a.show))
     if not a.no_write:
@@ -1557,6 +1632,19 @@ def cmd_orb(a):
                 raise ScanError("%s; no intraday cache either" % e)
     hits, counts, failed2 = scan_orb(data, symbols, day, cutoff, a.or_minutes, a.min_price, a.min_volume, confirm,
                                      a.max_confirm)
+    tfilter = None
+    if a.trend_filter:
+        daily_rows = {}
+        for h in hits:
+            path = daily_cache_path(h["symbol"], a.data_dir)
+            try:
+                daily_rows[h["symbol"]] = [r for r in read_daily_csv(path) if r[0] < day] if os.path.exists(path) else []
+            except OSError:
+                daily_rows[h["symbol"]] = []
+        hits, dropped = trend_filter(hits, daily_rows)
+        counts["hits"] = len(hits)
+        tfilter = {"kept": len(hits), "dropped": dropped,
+                   "unknown": sum(1 for h in hits if h["daily_trend"] == "unknown")}
     failed = dict(failed or {})
     failed.update(failed2)
     nfailed = len([s for s in symbols if s in failed])
@@ -1571,6 +1659,8 @@ def cmd_orb(a):
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
     if cnote:
         doc["cache_note"] = cnote
+    if tfilter:
+        doc["trend_filter"] = tfilter
     if not a.no_write:
         write_json(a.out, doc)
     if a.json:
@@ -1588,6 +1678,12 @@ def cmd_orb(a):
              indian(counts["candidates"]), indian(counts["confirmed"])))
     if calendar_note(day):
         print(calendar_note(day) + ".")
+    if tfilter:
+        print("Daily trend filter: dropped %d whose daily swing trend is down%s; %d kept with the daily trend "
+              "unknown." % (len(tfilter["dropped"]),
+                            (" (" + ", ".join(tfilter["dropped"][:10]) + (", ..." if len(tfilter["dropped"]) > 10
+                                                                          else "") + ")") if tfilter["dropped"] else "",
+                            tfilter["unknown"]))
     if counts["unconfirmed"]:
         print("PARTIAL: %s more candidates were not checked (only the %s most traded are; --max-confirm 0 "
               "checks all)." % (indian(counts["unconfirmed"]), indian(a.max_confirm)))
@@ -1596,8 +1692,9 @@ def cmd_orb(a):
               % (len(hits), ("the %s checked" % indian(counts["confirmed"])) if counts["unconfirmed"]
                  else indian(counts["scanned"]), clock_label(cutoff)))
         for h in hits[:a.show]:
-            print("  %8s  %-10s %14s  range %s to %s  %+.2f%% over" % (
-                h["at"], h["symbol"], money(h["price"]), _p(h["or_low"]), _p(h["or_high"]), h["pct_over"]))
+            print("  %8s  %-10s %14s  range %s to %s  %+.2f%% over%s" % (
+                h["at"], h["symbol"], money(h["price"]), _p(h["or_low"]), _p(h["or_high"]), h["pct_over"],
+                "  (%s)" % h["trend_note"] if h.get("trend_note") else ""))
         if len(hits) > a.show:
             print("  ... and %d more in the watchlist (--show N for more)." % (len(hits) - a.show))
     else:
@@ -1740,6 +1837,9 @@ def main(argv=None):
     p.add_argument("--at", help="cut the clock at this IST time, HH:MM")
     p.add_argument("--until", help="no new entries after HH:MM IST (default: config no_entries_after, %s)" % DEFAULT_UNTIL)
     p.add_argument("--config", default="trader/config.json")
+    p.add_argument("--trend-filter", action="store_true",
+                   help="drop names whose daily swing trend (trader-data daily cache) is down; no cache = kept, flagged")
+    p.add_argument("--data-dir", help="the trader-data folder for --trend-filter (default %s)" % DATA_DIR)
     p = sub.add_parser("longterm", help="long-term screen of the trader-data daily cache (no network)")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--symbols", help="comma-separated NSE symbols instead of the universe")

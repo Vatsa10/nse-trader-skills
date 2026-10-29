@@ -6,8 +6,10 @@ description: >-
   from the Nifty 500 constituents (niftyindices.com) or, optionally, every
   EQ-series stock in NSE's EQUITY_L.csv, runs a pre-market scan of daily
   closes (20-day closing-high breakout, bull flag, reclaimed the 20-day
-  average, oversold, oversold bounce) and an intraday opening-range breakout
-  scan on 5-minute bars from the 09:15 IST open, then writes
+  average, oversold, oversold bounce, swing pullback in an uptrend, swing
+  reversal up) and an intraday opening-range breakout scan on 5-minute bars
+  from the 09:15 IST open, optionally dropping names whose daily swing trend
+  is down (--trend-filter), then writes
   trader/watchlist.json for trader-news and trader-entry. Also a long-term
   screen of the trader-data daily cache (above the 200-day average, near the
   52-week high, near the 52-week low as a value screen, RSI, and market
@@ -19,9 +21,10 @@ description: >-
   the Nifty 500", "scan for bull flags", "oversold stocks", "pre-market scan",
   "build my watchlist", "what should I look at today", "stocks above the
   200 DMA", "near 52-week high", "52-week low value stocks", "stocks in a
-  swing uptrend", "swing reversal", "change of character level", or at the
-  start of a trading day before /trader-news.
-argument-hint: "[universe | daily | orb | longterm] [--at HH:MM] [--cache]"
+  swing uptrend", "swing reversal", "pullback in an uptrend", "change of
+  character level", "only breakouts in an uptrend", or at the start of a
+  trading day before /trader-news.
+argument-hint: "[universe | daily | orb | longterm] [--at HH:MM] [--cache] [--trend-filter]"
 ---
 
 # trader-scanner
@@ -43,6 +46,7 @@ python3 "${CLAUDE_SKILL_DIR}/scan.py" daily --symbols RELIANCE,HDFCBANK,TCS   # 
 python3 "${CLAUDE_SKILL_DIR}/scan.py" orb                            # after 9:35 AM IST -> trader/watchlist.json
 python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --at 10:00                 # cut the clock at 10:00 AM IST
 python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --watchlist trader/watchlist.json --json
+python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --trend-filter             # drop names whose daily swing trend is down
 python3 "${CLAUDE_SKILL_DIR}/scan.py" daily --cache                  # closes from trader/data/daily, no Yahoo
 python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --cache                    # bars from trader/data/intraday, no Yahoo
 python3 "${CLAUDE_SKILL_DIR}/scan.py" longterm                       # long-term screen -> trader/longterm.json
@@ -65,7 +69,7 @@ scanner asks Yahoo for `SYMBOL.NS` (with `&` sent as `%26`) and drops a
 | file | what |
 | --- | --- |
 | `trader/universe.txt` | written by `universe`: one `SYMBOL\|Name` a line, read by `daily` and `orb` |
-| `trader/watchlist.json` | written by `daily` and `orb`: `mode`, `as_of`, `universe`, `scanned`, `failed`, `hits[]`. trader-news and trader-entry read `hits[].symbol` |
+| `trader/watchlist.json` | written by `daily` and `orb`: `mode`, `as_of`, `universe`, `scanned`, `failed`, `hits[]`. trader-news and trader-entry read `hits[].symbol`; daily hits carry `level` and `coc`, which `entry.py watchlist --setup level` reads unchanged |
 | `trader/config.json` | read by `orb`: `no_entries_after` (default 15:00 IST) |
 | `trader/data/daily/<SYMBOL>.csv` | read by `daily --cache`, `longterm`, and `daily` when Yahoo fails (written by trader-data; `<SYMBOL>.adj.csv` wins when present) |
 | `trader/data/intraday/<SYMBOL>-5m.json` | read by `orb --cache` and `orb` when Yahoo fails (written by trader-data, Yahoo v8 shape) |
@@ -101,8 +105,10 @@ at all, `daily` and `orb` scan the same fallback list and say so.
 
 ## The daily scan (before the open)
 
-Yahoo's spark endpoint returns closes for 20 symbols a request, so the Nifty
-500 takes 25 requests and about 15 seconds with the polite pause (0.3 s).
+Yahoo's spark endpoint returns closes for 20 symbols a request (six months
+of daily bars, about 125, enough for the swing engine's 40-bar warm-up), so
+the Nifty 500 takes 25 requests and about 15 seconds with the polite pause
+(0.3 s).
 Liquidity comes from the spark meta: last price at least `--min-price`
 (₹50) and last session's volume at least `--min-volume` (5,00,000 shares).
 Run it before the 09:15 open or after the 15:30 close: during the session
@@ -118,9 +124,22 @@ The setups are computed from daily closes only (spark has no highs or lows):
 | `reclaim_ma20` | the close before was under its 20-day average, the last close is above it |
 | `oversold` | RSI 14 (Wilder) under 30 |
 | `oversold_bounce` | RSI 14 was under 30 yesterday and today closed up |
+| `swing_pullback` | the swing engine (see the long-term screen) says up and stable, a swing high is pending, the close is over the change-of-character level, and the swing high formed 3 to 15 bars ago (`SWING_PULLBACK_MIN`, `SWING_PULLBACK_MAX`) |
+| `swing_reversal_up` | the swing trend turned up on the last bar |
 
 A closing-high breakout fires more often than an intraday-high one. Hits are
 listed most traded first (price times volume, in rupees).
+
+The swing setups run the engine on closes alone with Yahoo spark (high = low
+= close, a closing-basis structure) and on the real highs and lows with
+`--cache` (`swing_basis` in the hit says which). Every daily hit with an
+uptrend carries `level` (the pending swing high, or the leg's high when none
+is pending) and `coc` (the change-of-character level, a structural stop
+reference). `level` is the key `entry.py watchlist --setup level` reads, so
+`/trader-entry` can watch for the first completed 5-minute bar to close over
+it; `coc` is a daily stop, usually far from price for an intraday trade, so
+size a day trade with trader-exit's own stops and keep `coc` for a swing or
+delivery hold.
 
 ## The long-term screen (no network)
 
@@ -197,6 +216,13 @@ tick, like 10:43:07) is dropped, and a bar counts only once it is complete
 close, or after `no_entries_after` (default 15:00, before the broker's ~15:20
 MIS square-off) it prints one plain line and writes nothing.
 
+`--trend-filter` runs the swing engine on each hit's daily bars from the
+trader-data cache (only bars before the session day, `--data-dir` to point
+elsewhere) and drops the hits whose daily trend is down. A name with no
+cache, under 41 daily bars, or no trend yet stays in the list, marked
+`daily_trend: "unknown"` with a `trend_note`; the others get
+`daily_trend: "up"`. The file and the printout say how many were dropped.
+
 ## Data and limits
 
 - Yahoo's chart and spark endpoints are free, unofficial and can lag. Bars are
@@ -230,9 +256,10 @@ MIS square-off) it prints one plain line and writes nothing.
 1. Once a week or so: `scan.py universe`.
 2. Before the open: `scan.py daily`. Tell the user the counts (fetched,
    liquid, scanned, hits) and the top few by setup.
-3. After 9:35 AM IST (10:00 is a common time): `scan.py orb`. Tell the user
-   how many usable charts broke their range and when, and that a later hit is
-   closer to the price now.
+3. After 9:35 AM IST (10:00 is a common time): `scan.py orb`, with
+   `--trend-filter` when the user wants breakouts only in a daily uptrend. Tell
+   the user how many usable charts broke their range and when, and that a
+   later hit is closer to the price now.
 4. The user picks one chart. Hand it on: `/trader-news SYMBOL` (what is
    moving it), then `/trader-entry SYMBOL` (the entry bar by bar). Never pick
    for them.
