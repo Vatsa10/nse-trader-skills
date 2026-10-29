@@ -1,0 +1,10 @@
+{
+  "source": "example targets: your own list, edit the symbols and weights",
+  "note": "Weights need not add to 100: they are renormalised. Whole shares only, so prices are needed (trader/prices.json).",
+  "weights": [
+    {"symbol": "NIFTYBEES", "name": "Nifty 50 ETF", "weight": 50},
+    {"symbol": "GOLDBEES", "name": "Gold ETF", "weight": 20},
+    {"symbol": "BANKBEES", "name": "Bank Nifty ETF", "weight": 15},
+    {"symbol": "ITBEES", "name": "Nifty IT ETF", "weight": 15}
+  ]
+}
