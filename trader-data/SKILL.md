@@ -125,6 +125,16 @@ it reports the first answer. Cookies are saved to `trader/data/nse_cookies.txt`
 a file under 30 minutes old skips the home page prime, and a 401 primes once
 more. A cookie file that cannot be read is a cold start, never an error.
 
+Report readiness: when a bhavcopy run is about to fetch today's file (after
+18:00 IST on a trading day), it first asks `GET /api/daily-reports?key=CM` once
+per run. If `currentDate` is not today, or `CurrentDay` lists neither
+`CM-UDIFF-BHAVCOPY-CSV` nor `CM-BHAVDATA-FULL`, it says "today's bhavcopy is
+not published yet", requests nothing for today (no 404s to hammer) and exits 0;
+earlier missing sessions are still filled. Only the files that are listed are
+requested (UDiFF alone: no delivery file, so the day goes into `pending.json`).
+If the call fails or has no file list, it says so and falls back to the 18:00
+rule above. The `delivery` command skips an unlisted file the same way.
+
 Only dates after the last cached session are fetched. The last complete
 session is today after 18:00 IST on a trading day (bhavcopy is published in
 the evening), else the trading day before.
@@ -375,7 +385,7 @@ trader-alerts the skills that load it by path.
 ## doctor
 
 Probes Yahoo query1 and query2, the NSE home page and quote API, the NSE
-holiday-master, circulars and corporate-actions endpoints (a changed shape
+holiday-master, circulars, corporate-actions and daily-reports endpoints (a changed shape
 is reported, not silently empty), the index snapshot archive
 (`ind_close_all_DDMMYYYY.csv`), the nsearchives bhavcopy, the niftyindices
 Nifty 500 list, Google News RSS and the Kite MCP endpoint, each with a timeout, prints a table (ok / FAIL,

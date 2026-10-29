@@ -132,6 +132,8 @@ VALUATION_INDEX = "NIFTY 50"
 PE_EXPENSIVE = 25.0           # Nifty 50 P/E at or above this is flagged expensive (eod2's rule of thumb)
 PE_CHEAP = 20.0               # at or below this, cheap
 PE_MIN_ROWS = 250             # P/E rows needed before a percentile means anything
+REPORTS_REFERER = NSE + "/all-reports"
+REPORT_KEYS = {"sec_bhavdata_full": "CM-BHAVDATA-FULL", "BhavCopy_NSE_CM": "CM-UDIFF-BHAVCOPY-CSV"}
 
 # ---------------------------------------------------------------- NSE trading calendar
 # 2026 comes from trader-alerts/alerts.py (loaded below, with this copy as the fallback).
@@ -1045,16 +1047,72 @@ def parse_bhav(text, want=None):
     return out
 
 
+class NotPublished(SourceError):
+    """NSE says today's files are not out yet: not a failure, so nothing is hammered and nothing is retried."""
+
+
+def report_key(url):
+    for part, key in REPORT_KEYS.items():
+        if part in url:
+            return key
+    return None
+
+
+def daily_reports(sess, key="CM"):
+    """/api/daily-reports?key=CM -> (currentDate or None, set of fileKeys in CurrentDay)."""
+    doc = nse_api(sess, "/api/daily-reports?key=%s" % key, REPORTS_REFERER)
+    cur = doc.get("CurrentDay") if isinstance(doc, dict) else None
+    if not isinstance(cur, list):
+        raise SourceError("nse-api", "daily-reports has no CurrentDay list",
+                          "NSE changed the feed, or this is a bot wall; run doctor")
+    try:
+        day = parse_date(doc.get("currentDate"))
+    except DataError:
+        day = None
+    return day, set(str(x.get("fileKey")) for x in cur if isinstance(x, dict) and x.get("fileKey"))
+
+
 class Bhav(object):
     """Fetches each trading day once per run and serves every symbol from it. The same file also
     feeds the delivery analytics: `deliv` holds each day's delivery rows, `full` the days whose
     rows came from sec_bhavdata_full (the only file with delivery), `sec_missing` the days that
-    have a bar table but no delivery file yet."""
+    have a bar table but no delivery file yet.
+
+    Set `today` to the day being fetched live and the first request for it asks NSE's report list
+    which files are out: the ones not listed are not requested (`unpublished` holds the days with
+    nothing out yet). If that call fails, `listed` stays None and the 18:00 rule decides, as before."""
 
     def __init__(self, sess):
         self.sess, self.days, self.errors = sess, {}, {}
         self.deliv, self.full, self.sec_missing = {}, set(), set()
         self.tried, self.deliv_errors = set(), {}
+        self.today, self.checked, self.listed = None, False, None
+        self.unpublished, self.waiting, self.ready_note = set(), set(), None
+
+    def check_ready(self):
+        self.checked = True
+        try:
+            day, keys = daily_reports(self.sess, "CM")
+        except (SourceError, DataError) as e:
+            self.ready_note = "could not read NSE's report list (%s); going by the 18:00 rule" % e
+            return
+        if day is None:
+            self.ready_note = "NSE's report list has no date; going by the 18:00 rule"
+            return
+        self.listed = (keys & set(REPORT_KEYS.values())) if day == self.today else set()
+        if day != self.today:
+            self.ready_note = "NSE's report list still shows %s, nothing for %s is out yet" % (day, self.today)
+        elif not self.listed:
+            self.ready_note = "NSE lists no CM-UDIFF-BHAVCOPY-CSV or CM-BHAVDATA-FULL for %s yet" % self.today
+
+    def urls_for(self, d):
+        """The bhavcopy URLs worth asking for on day d."""
+        urls = bhav_urls(d)
+        if d != self.today:
+            return urls
+        if not self.checked:
+            self.check_ready()
+        return urls if self.listed is None else [u for u in urls if report_key(u) in self.listed]
 
     def take_delivery(self, d, text, full):
         try:
@@ -1071,7 +1129,12 @@ class Bhav(object):
             return self.days[d]
         table, last = None, None
         self.tried.add(d)
-        for url in bhav_urls(d):
+        urls = self.urls_for(d)
+        if not urls:
+            self.days[d], self.errors[d] = None, "not published yet"
+            self.unpublished.add(d)
+            return None
+        for url in urls:
             try:
                 code, body = self.sess.get(url, {"Accept": "*/*", "Referer": NSE + "/"}, gap=BHAV_PAUSE)
             except SourceError as e:
@@ -1112,6 +1175,8 @@ class Bhav(object):
         self.tried.add(d)
         url = bhav_urls(d)[0]
         try:
+            if url not in self.urls_for(d):
+                raise SourceError("nsearchives", "not published yet (NSE does not list CM-BHAVDATA-FULL)")
             code, body = self.sess.get(url, {"Accept": "*/*", "Referer": NSE + "/"}, gap=BHAV_PAUSE)
             if code != 200:
                 raise SourceError("nsearchives", "HTTP %d (%s)" % (code, hint("bhav", code)))
@@ -1131,12 +1196,16 @@ def fetch_bhav_daily(bhav, sym, days, max_days):
     for d in days:
         t = bhav.day(d)
         if t is None:
+            if d in bhav.unpublished:      # NSE says it is not out yet: wait, do not count it as a failure
+                continue
             fails.append(d)
             if len(fails) >= 3 and not rows:   # blocked, not a few missing files
                 raise SourceError("bhavcopy", "nsearchives bhavcopy: %s" % bhav.errors.get(d), "")
             continue
         if sym in t:
             rows.append(t[sym])
+    if not rows and bhav.unpublished and not fails:
+        raise NotPublished("bhavcopy", "today's bhavcopy is not published yet", bhav.ready_note or "")
     if not rows:
         raise SourceError("bhavcopy", "no bhavcopy rows for %s (%s)" % (
             sym, bhav.errors.get(fails[-1], "symbol not in the files") if fails else "symbol not in the files"))
@@ -1233,6 +1302,9 @@ def get_daily(sess, bhav, sym, miss, end, source, years, max_days):
                 return rows, None, "nse-api", errors, []
             if src == "bhavcopy":
                 return fetch_bhav_daily(bhav, sym, miss, max_days), None, "nse-bhavcopy", errors, []
+        except NotPublished as e:
+            bhav.waiting.add(sym)
+            errors.append("%s: %s" % (src, e))
         except SourceError as e:
             errors.append("%s: %s" % (src, e))
     return None, None, None, errors, []
@@ -1242,6 +1314,7 @@ def cmd_daily(a):
     now = parse_now(a.now)
     sess, rc = Session(a.data), 0
     bhav = Bhav(sess)
+    bhav.today = now.date()
     for s in a.symbols:
         sym = norm_symbol(s)
         raw_p, adj_p, _ = data_paths(a.data, sym)
@@ -1251,6 +1324,11 @@ def cmd_daily(a):
             print("%s: up to date (last session %s)." % (sym, old[-1]["date"] if old else end))
             continue
         raw, adj, src, errors, splits = get_daily(sess, bhav, sym, miss, end, a.source, a.years, a.max_days)
+        if raw is None and sym in bhav.waiting:     # not a failure: NSE has not published the file yet
+            print("%s: today's bhavcopy is not published yet (%s); run again later." % (sym, bhav.ready_note))
+            for e in errors[:-1]:
+                print("  tried first: " + e)
+            continue
         if raw is None:
             rc = 1
             print("%s: every source failed:" % sym)
@@ -1303,6 +1381,11 @@ def cmd_daily(a):
         if src != "yahoo":    # Yahoo already sent an adjusted series; any other source needs the actions
             for line in auto_adjust(a.data, sym):
                 print(line)
+    if bhav.unpublished and not bhav.waiting:
+        print("note: today's bhavcopy is not published yet (%s); the earlier sessions were filled, "
+              "run again later for today." % bhav.ready_note)
+    elif bhav.ready_note and not bhav.unpublished:
+        print("note: " + bhav.ready_note)
     for line in fill_delivery(a.data, bhav, [norm_symbol(x) for x in a.symbols], now.date()):
         print(line)
     return rc
@@ -1526,6 +1609,7 @@ def cmd_delivery(a):
         need = [d for d in sessions if any(d.isoformat() not in have[s] for s in syms)]
         need += [d for d in read_pending(a.data) if d not in need and (today - d).days <= PENDING_DAYS]
         bhav = Bhav(Session(a.data))
+        bhav.today = today
         for d in sorted(need):
             bhav.delivery_day(d)
         for line in fill_delivery(a.data, bhav, syms, today):
@@ -2796,6 +2880,7 @@ def probes(now_ist):
          "&from_date=%s&to_date=%s" % ((now_ist.date() - datetime.timedelta(days=365)).strftime("%d-%m-%Y"),
                                        now_ist.strftime("%d-%m-%Y")), "actions"),
         ("nse-index", "index", index_url(bd), "index"),
+        ("nse-reports", "cal", NSE + "/api/daily-reports?key=CM", "reports"),
         ("nsearchives", "price", bhav_urls(bd)[0], "bhav"),
         ("niftyindices", "list", NIFTY_LIST, "csv"),
         ("google-news", "news", GNEWS, "rss"),
@@ -2819,9 +2904,11 @@ def check_body(kind, code, body):
             return "priceInfo" in json.loads(body), ""
         except ValueError:
             return False, "not JSON (bot wall)"
-    if kind in ("holidays", "circulars", "actions"):
+    if kind in ("holidays", "circulars", "actions", "reports"):
         try:
             doc = json.loads(body)
+            if kind == "reports":
+                return isinstance(doc.get("CurrentDay"), list), "no CurrentDay file list in the answer"
             if kind == "actions":
                 return isinstance(doc, list) or isinstance(doc.get("data"), list), "no list of actions in the answer"
             if kind == "holidays":
@@ -2854,8 +2941,8 @@ def cmd_doctor(a):
                 hdr["Range"] = "bytes=0-2047"
             if name == "nse-api":
                 hdr.update({"Accept": "application/json", "Referer": NSE + "/get-quotes/equity?symbol=RELIANCE"})
-            if check in ("holidays", "circulars", "actions"):
-                ref = ACTIONS_REFERER if check == "actions" else CAL_REFERER
+            if check in ("holidays", "circulars", "actions", "reports"):
+                ref = {"actions": ACTIONS_REFERER, "reports": REPORTS_REFERER}.get(check, CAL_REFERER)
                 hdr.update({"Accept": "application/json", "Referer": ref, "X-Requested-With": "XMLHttpRequest"})
             code, body = sess.get(url, hdr, timeout=a.timeout, gap=0, retries=0)   # a probe reports the first answer
             ok, why = check_body(check, code, body)

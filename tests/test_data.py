@@ -2094,6 +2094,137 @@ class IndexCommand(Net):
         self.assertIn("2 rows 2026-10-22..2026-10-23", out)
 
 
+# ---------------------------------------------------------------- report readiness
+
+class Readiness(Net):
+    NOW = "2026-10-23 19:00"
+
+    def reports(self, current="23-Oct-2026", keys=("CM-UDIFF-BHAVCOPY-CSV", "CM-BHAVDATA-FULL", "CM-MII-SECURITY")):
+        return json.dumps({"currentDate": current, "CurrentDay": [{"fileKey": k, "displayName": k} for k in keys],
+                           "PreviousDay": [{"fileKey": "CM-BHAVDATA-FULL"}]}).encode()
+
+    def feed(self, reports):
+        """reports: bytes, or (code, bytes). Bhavcopy files are served for the two fixture days."""
+        def bhav(url):
+            name = url.rsplit("/", 1)[-1]
+            if "sec_bhavdata_full" in name and os.path.exists(os.path.join(DFIX, name)):
+                return 200, fx(name)
+            return 404, b""
+        code, body = reports if isinstance(reports, tuple) else (200, reports)
+        return self.net([("api/daily-reports", code, body), ("sec_bhavdata_full", None, bhav),
+                         ("BhavCopy_NSE_CM", None, bhav), ("yahoo.com", 403, b""),
+                         ("www.nseindia.com/", 200 if code == 200 else 403, b"home")])
+
+    def bhavcopy(self, *extra):
+        return self.run_d("daily", "RELIANCE", "--source", "bhavcopy", "--now", self.NOW, *extra)
+
+    def test_a_stale_report_list_stops_cleanly_without_asking_for_the_files(self):
+        self.seed("RELIANCE", "2026-10-22")
+        f = self.feed(self.reports(current="22-Oct-2026"))
+        code, out, _ = self.bhavcopy()
+        self.assertEqual(code, 0, out)
+        self.assertIn("RELIANCE: today's bhavcopy is not published yet", out)
+        self.assertIn("NSE's report list still shows 2026-10-22", out)
+        self.assertNotIn("every source failed", out)
+        self.assertEqual(f.urls("sec_bhavdata_full") + f.urls("BhavCopy_NSE_CM"), [])      # no 404s to hammer
+        self.assertEqual(len(f.urls("api/daily-reports")), 1)
+        self.assertIn("key=CM", f.urls("api/daily-reports")[0])
+        self.assertEqual(self.daily("RELIANCE")[-1]["date"], "2026-10-22")
+
+    def test_an_empty_current_day_is_not_published_either(self):
+        self.seed("RELIANCE", "2026-10-22")
+        f = self.feed(self.reports(keys=("CM-MII-SECURITY",)))
+        code, out, _ = self.bhavcopy()
+        self.assertEqual(code, 0, out)
+        self.assertIn("NSE lists no CM-UDIFF-BHAVCOPY-CSV or CM-BHAVDATA-FULL for 2026-10-23 yet", out)
+        self.assertEqual(f.urls("sec_bhavdata_full"), [])
+
+    def test_listed_files_are_downloaded_and_the_list_is_asked_once(self):
+        self.seed("RELIANCE", "2026-10-21")
+        self.seed("TCS", "2026-10-21")
+        f = self.feed(self.reports())
+        code, out, _ = self.run_d("daily", "RELIANCE", "TCS", "--source", "bhavcopy", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(f.urls("api/daily-reports")), 1)
+        self.assertEqual(self.daily("RELIANCE")[-1]["date"], "2026-10-23")
+        self.assertEqual(self.daily("TCS")[-1]["date"], "2026-10-23")
+        self.assertNotIn("not published", out)
+
+    def test_only_the_listed_file_is_requested(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("BhavCopy_NSE_CM_0_0_0_20261023_F_0000.csv",
+                       "TradDt,TckrSymb,SctySrs,OpnPric,HghPric,LwPric,ClsPric,TtlTradgVol,TtlNbOfTxsExctd\n"
+                       "2026-10-23,RELIANCE,EQ,1184.00,1201.90,1163.10,1190.00,14905641,241397\n")
+        self.seed("RELIANCE", "2026-10-22")
+        f = self.net([("api/daily-reports", 200, self.reports(keys=("CM-UDIFF-BHAVCOPY-CSV",))),
+                      ("BhavCopy_NSE_CM", 200, buf.getvalue()), ("www.nseindia.com/", 200, b"home")])
+        code, out, _ = self.bhavcopy()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(f.urls("sec_bhavdata_full"), [])                    # the delivery file is not out: not asked for
+        self.assertEqual(len(f.urls("BhavCopy_NSE_CM")), 1)
+        self.assertEqual(self.daily("RELIANCE")[-1]["close"], 1190.0)
+        self.assertEqual(self.pending_days(), ["2026-10-23"])                # its delivery waits in pending.json
+
+    def pending_days(self):
+        return json.loads(rd(os.path.join(self.dd, "delivery", "pending.json")))["pending"]
+
+    def test_a_failed_call_falls_back_to_the_time_rule(self):
+        self.seed("RELIANCE", "2026-10-22")
+        f = self.feed((403, b"Access Denied"))
+        code, out, _ = self.bhavcopy()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.daily("RELIANCE")[-1]["date"], "2026-10-23")      # fetched as before
+        self.assertIn("going by the 18:00 rule", out)
+        self.assertEqual(len(f.urls("sec_bhavdata_full")), 1)
+        # an answer with no file list is a failed call as well
+        shutil.rmtree(self.dd)
+        self.seed("RELIANCE", "2026-10-22")
+        self.feed(self.reports().replace(b"CurrentDay", b"Other"))
+        code, out, _ = self.bhavcopy()
+        self.assertEqual(self.daily("RELIANCE")[-1]["date"], "2026-10-23")
+        self.assertIn("daily-reports has no CurrentDay list", out)
+
+    def test_earlier_sessions_are_filled_while_today_waits(self):
+        self.seed("RELIANCE", "2026-10-21")
+        f = self.feed(self.reports(current="22-Oct-2026", keys=("CM-BHAVDATA-FULL",)))
+        # the list is still on the 22nd, so only the 22nd is real; today's file is not requested
+        code, out, _ = self.bhavcopy()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.daily("RELIANCE")[-1]["date"], "2026-10-22")
+        self.assertIn("the earlier sessions were filled, run again later for today", out)
+        self.assertEqual([u.rsplit("_", 1)[-1] for u in f.urls("sec_bhavdata_full")], ["22102026.csv"])
+
+    def test_no_check_when_today_is_not_being_fetched(self):
+        self.seed("RELIANCE", "2026-10-21")
+        f = self.feed(self.reports())
+        self.run_d("daily", "RELIANCE", "--source", "bhavcopy", "--now", "2026-10-23 12:00")     # last session is the 22nd
+        self.assertEqual(f.urls("api/daily-reports"), [])
+        f = self.feed(self.reports())
+        self.run_d("daily", "RELIANCE", "--source", "nse", "--now", self.NOW)
+        self.assertEqual(f.urls("api/daily-reports"), [])                                   # not the bhavcopy source
+
+    def test_delivery_command_does_not_ask_for_a_file_that_is_not_listed(self):
+        self.seed("RELIANCE", "2026-10-23")
+        f = self.feed(self.reports(current="22-Oct-2026"))
+        code, out, _ = self.run_d("delivery", "RELIANCE", "--window", "5", "--now", self.NOW)
+        self.assertEqual([u for u in f.urls("sec_bhavdata_full") if "23102026" in u], [])
+        self.assertIn("2026-10-23", self.pending_days())             # it waits in pending.json instead
+
+    def test_doctor_probes_the_report_list(self):
+        f = self.net([("api/daily-reports", 200, self.reports()), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertTrue(s["nse-reports"]["ok"])
+        hdr = [h for u, h in f.calls if "daily-reports" in u][0]
+        self.assertIn("all-reports", hdr["Referer"])
+        self.net([("api/daily-reports", 200, b'{"CurrentDay": "x"}'), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertFalse(s["nse-reports"]["ok"])
+        self.assertIn("no CurrentDay", s["nse-reports"]["error"])
+
+
 class Style(unittest.TestCase):
     def test_no_em_dash_and_skill_frontmatter(self):
         for f in ("data.py", "SKILL.md"):
