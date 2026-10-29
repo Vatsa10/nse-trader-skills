@@ -9,17 +9,18 @@ places an order on its own; paper mode (log only, never sent) is the default.
 
 ## Install
 
-In Claude Code, from the folder that holds this repo:
+In Claude Code:
 
 ```
-/plugin marketplace add ./nse-trader-skill
+/plugin marketplace add Vatsa10/nse-trader-skills
 /plugin install nse-trader-skill@nse-trader-skill
 ```
 
-Or as plain skills (`/trader-invest` and so on):
+Or as plain skills (`/trader-invest` and so on) from a clone:
 
 ```bash
-cp -r nse-trader-skill/trader-* ~/.claude/skills/
+git clone https://github.com/Vatsa10/nse-trader-skills
+cp -r nse-trader-skills/trader-* ~/.claude/skills/
 ```
 
 ## The thirteen
@@ -28,24 +29,24 @@ cp -r nse-trader-skill/trader-* ~/.claude/skills/
 
 | command | job | what it does |
 | --- | --- | --- |
-| `/trader-data` | Data Layer | Fetches and caches daily, intraday and circuit-band data with fallbacks (Yahoo, NSE API, NSE bhavcopy, Kite MCP, CSV import); `doctor` tells you which sources work from your network. |
+| `/trader-data` | Data Layer | Fetches and caches daily, intraday and circuit-band data with fallbacks (Yahoo, NSE API, NSE bhavcopy, Kite MCP, CSV import); `doctor` tells you which sources work from your network. Also: a self-updating NSE holiday calendar, delivery % and ticket size, exact split/bonus adjustment from NSE corporate actions, index P/E and India VIX, and the NIFTY option chain (PCR, OI walls, max pain). |
 
 **Long-term investing**
 
 | command | job | what it does |
 | --- | --- | --- |
-| `/trader-invest` | Long-term Analyst | Fundamentals from screener.in / NSE / Kite, a transparent 0 to 100 scorecard (valuation, quality, growth, stability, technicals), cyclical and PSU flags, a verdict, and a staggered CNC buy plan with tax notes. |
-| `/trader-backtest` | Backtester | Years of daily data: buy-and-hold, SIP (with XIRR), SMA cross, 52-week breakout, dip-buy and rebalance. Real Zerodha charges, LTCG/STCG tax, benchmark vs NIFTYBEES, walk-forward and overfitting warnings, HTML report. |
+| `/trader-invest` | Long-term Analyst | Fundamentals from screener.in / NSE / Kite, a transparent 0 to 100 scorecard (valuation, quality, growth, stability, technicals), cyclical and PSU flags, a verdict, and a staggered CNC buy plan with tax notes. Technicals include the swing-structure cushion; hints for Nifty 50 P/E (slower buying when the market is rich) and institutional delivery days. |
+| `/trader-backtest` | Backtester | Years of daily data: buy-and-hold, SIP (with XIRR), SMA cross, 52-week breakout, dip-buy, swing-structure trend and rebalance. Real Zerodha charges, LTCG/STCG tax, benchmark vs NIFTYBEES, walk-forward and overfitting warnings, HTML report. |
 | `/trader-portfolio` | Portfolio Manager | Imports Kite holdings or Console tradebook, shows lots and LTCG dates, flags concentration (stock, sector, group, PSU, gold/silver, no index), tax-aware rebalancing, FY tax estimate, SIP planner. |
 
 **Intraday and swing**
 
 | command | job | what it does |
 | --- | --- | --- |
-| `/trader-scanner` | Chart Scanner | Nifty 500 setups: opening-range breakouts, swing setups, and a `longterm` screen (above 200-DMA, near 52w high/low, oversold). |
-| `/trader-news` | News Monitor | Yahoo and Google News India, falling back to NSE corporate announcements. |
+| `/trader-scanner` | Chart Scanner | Nifty 500 setups: opening-range breakouts (optional daily-trend filter), swing pullbacks and reversals, chart `patterns` (VCP, double bottom, flag, ascending triangle, inverse head and shoulders, rising-support retest) with level, stop and target, a `longterm` screen (200-DMA, 52w high/low, swing trend, relative strength vs Nifty, delivery spikes) and market `breadth`. |
+| `/trader-news` | News Monitor | Yahoo and Google News India, falling back to NSE corporate announcements; bulk, block and short-sell deals; a "results soon" gap-risk flag from NSE board meetings. |
 | `/trader-entry` | Entry Timer | Watches a setup bar by bar from 09:15 and tells you the moment to get in. |
-| `/trader-exit` | Exit Planner | Stop and target, reward:risk after charges, real circuit band. |
+| `/trader-exit` | Exit Planner | Stop and target (range, percent, ATR or swing structure), reward:risk after charges, real circuit band, and a CNC mode for swing and delivery holds. |
 | `/trader-timemachine` | Time Machine | 10,000 simulated sessions plus every past time the setup fired. |
 | `/trader-risk` | Risk Manager | PASS or BLOCK against your INR limits, charges and circuit bands. |
 | `/trader-budget` | Budget Manager | Whole-share sizing to your max loss per trade. |
@@ -55,7 +56,11 @@ cp -r nse-trader-skill/trader-* ~/.claude/skills/
 ## Long-term workflow
 
 ```
+python3 trader-data/data.py calendar
 python3 trader-data/data.py daily IOC NIFTYBEES --years 5
+python3 trader-data/data.py actions IOC && python3 trader-data/data.py adjust IOC
+python3 trader-data/data.py index --days 30
+python3 trader-scanner/scan.py longterm
 python3 trader-invest/invest.py fetch IOC
 python3 trader-invest/invest.py analyse IOC
 python3 trader-backtest/backtest.py run --strategy sip --symbol IOC --param amount=5000 --tax
@@ -64,6 +69,18 @@ python3 trader-portfolio/portfolio.py import kite-holdings.json && python3 trade
 ```
 
 Or just ask Claude: "should I buy IOC for the long term?" and it runs these.
+
+## Intraday and swing workflow
+
+```
+python3 trader-data/data.py chain NIFTY                 # sentiment context: PCR, OI walls, VIX
+python3 trader-scanner/scan.py daily --cache            # pre-market setups, with level and swing stop
+python3 trader-scanner/scan.py patterns                 # chart patterns from the daily cache
+python3 trader-news/news.py                             # deals and "results soon" first
+python3 trader-scanner/scan.py orb --trend-filter       # after 09:35, only stocks in a daily uptrend
+python3 trader-entry/entry.py watchlist --setup level   # the moment a level breaks
+python3 trader-exit/exit.py plan                        # then timemachine, budget, risk, broker
+```
 
 ## How the old limitations are handled
 
@@ -85,6 +102,11 @@ the offline suite then runs its real-data checks on those files and skips
 them when the folder is absent. Run `NSE_LIVE=1 python3 -m unittest tests.test_live`
 to test every live source end to end.
 
+**The holiday list was hard-coded.** `data.py calendar` reads NSE's
+holiday master and its trading-department circulars (ad-hoc closures, special
+and Muhurat sessions) into `trader/data/calendar.json`, which every skill
+reads; the built-in tables remain the offline fallback.
+
 **Charges and circuit limits were estimates.** Charges now use Zerodha's
 published rates (checked 2026-10-29, including the ₹15.34 DP charge on
 delivery sells) from one model you can override in `trader/charges.json`.
@@ -105,5 +127,9 @@ NSE_LIVE=1 python3 -m unittest tests.test_live   # live sources, on your machine
 
 Not financial advice. Scorecards and backtests describe the past and your
 inputs; they do not predict prices. Tax figures are estimates; check with a CA.
-Most intraday traders in India lose money (SEBI, FY23). Update the NSE holiday
-lists each year. MIT licence, see LICENSE; original work by Jake Schincariol.
+Most intraday traders in India lose money (SEBI, FY23). Run `data.py calendar`
+each year so the holiday list stays current. MIT licence, see LICENSE; original
+work by Jake Schincariol. The calendar, delivery, corporate-action, index,
+option-chain, swing-structure and chart-pattern features were written fresh
+from plain-language notes on Benny Thadikaran's GPL-3.0 projects (eod2,
+NseIndiaApi, SwingTrend, stock-pattern); no code from them is included.
