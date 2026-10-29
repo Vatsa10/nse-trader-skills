@@ -1,0 +1,19 @@
+{
+ "fetched_at": "2027-03-08T04:30:00Z",
+ "years": [
+  2026,
+  2027
+ ],
+ "holidays": {
+  "2026-10-20": "Dussehra",
+  "2027-01-26": "Republic Day",
+  "2027-03-22": "Holi",
+  "2027-04-08": "Circular: Trading Holiday on account of Special Holiday on Thursday, April 8, 2027"
+ },
+ "special_sessions": {
+  "2027-03-06": "Circular: Live Trading Session on Saturday, March 6, 2027",
+  "2027-10-29": "Diwali Laxmi Pujan (Muhurat)"
+ },
+ "last_circular_check": "2027-03-08",
+ "warnings": []
+}

@@ -28,7 +28,7 @@ what happened and when it is time to be flat.
 
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" clock                          # NSE open or closed, next open (IST)
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --from-plan                # stop, target, flat by 15:15 from trader/plan.json
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --from-plan                # stop, target, flat by 15:15 (no flat-by for a CNC plan) from trader/plan.json
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --opening-bell
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --symbol HINDCOPPER --stop 308.10
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --symbol HINDCOPPER --target 320.50
@@ -97,7 +97,7 @@ NSE symbols (RELIANCE, M&M, BAJAJ-AUTO); a typed `.NS` is stripped.
 
 Normal market 09:15 to 15:30 IST (UTC+05:30, no daylight saving). Pre-open
 09:00-09:08 is order collection only and is not treated as open. No early
-closes. Closed on weekends and these 2026 NSE equity holidays:
+closes. Closed on weekends and these 2026 NSE equity holidays (built in):
 
 Jan 26 Republic Day, Mar 3 Holi, Mar 26 Shri Ram Navami, Mar 31 Shri Mahavir
 Jayanti, Apr 3 Good Friday, Apr 14 Ambedkar Jayanti, May 1 Maharashtra Day,
@@ -105,14 +105,30 @@ May 28 Bakri Id, Jun 26 Muharram, Sep 14 Ganesh Chaturthi, Oct 2 Gandhi
 Jayanti, Oct 20 Dussehra, Nov 10 Diwali Balipratipada, Nov 24 Guru Nanak
 Jayanti, Dec 25 Christmas.
 
-The Muhurat session (Sunday 8 Nov 2026, timings by NSE circular) is treated
-as closed. For any other year the clock says "holiday list covers 2026 only:
-check nseindia.com".
+Other years come from `trader/data/calendar.json`, which trader-data keeps
+current (`python3 trader-data/data.py calendar`). When the file exists its
+holidays and special sessions are merged over the built-in table, and a year
+it lists is treated as fully known. A missing or unreadable file means the
+built-in table only, never an error. For a year with no calendar the clock
+says "holiday list covers 2026 only: check nseindia.com, or run python3
+trader-data/data.py calendar".
+
+Special sessions are not the same as closures. A session on a weekend or
+holiday with normal hours (Budget day, a Saturday session) counts as a
+trading day, and the clock adds a "Special session today" line. The Muhurat
+session (Diwali Laxmi Pujan, Sunday 8 Nov 2026; about an hour in the evening,
+timings by NSE circular) is reported as a special session, not as a plain
+holiday: the regular 09:15-15:30 market is closed that day, so price alerts
+and the clock treat it as closed and say "regular market closed, special
+session: ...". Alert times are not tracked for the Muhurat hour.
 
 ## Steps
 
 1. Right after trader-exit writes the plan, run `add --from-plan`. Confirm
    the three alerts back to the user: the stop, the target and the flat-by time.
+   A plan from trader-exit with `"product": "CNC"` (a delivery hold) has no
+   flat-by time: it gets only the stop and the target alert, and you confirm
+   those two.
 2. Run `check` while the trade is open: every few minutes from a Claude
    scheduled task or `/loop`. Each run fetches only the symbols in today's
    rules and rings each alert once. A check reads the latest delayed quote;

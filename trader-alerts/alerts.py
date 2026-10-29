@@ -46,9 +46,20 @@ Quotes (free, delayed, unofficial; for alerts only, never for timing an order):
   --offline DIR reads DIR/yahoo-<SYMBOL>.json (or .json.gz) instead.
 
 NSE calendar: normal market 09:15-15:30 IST (pre-open 09:00-09:08 is not
-tradable here), the 2026 NSE equity holidays, no early closes. The Muhurat
-session (Sun 8 Nov 2026) is treated as closed. Outside 2026 the clock warns:
-"holiday list covers 2026 only: check nseindia.com".
+tradable here), the 2026 NSE equity holidays, no early closes. Other years
+come from trader/data/calendar.json when it exists (python3
+trader-data/data.py calendar writes and refreshes it): its holidays and
+special sessions are merged over the built-in 2026 table, and a year listed
+in the file is treated as fully known. A missing or unreadable file means the
+built-in table only, never an error. Without a calendar for the year the
+clock warns: "holiday list covers 2026 only: check nseindia.com".
+
+Special sessions: a session on a weekend or holiday with normal hours (Budget
+day, a Saturday DR session) counts as a trading day. The Muhurat session
+(Diwali Laxmi Pujan, about one hour in the evening, timings set by an NSE
+circular) is reported as a special session, not as a plain holiday, but the
+normal 09:15-15:30 market is closed that day, so alerts and the clock treat
+the regular market as closed and say why.
 """
 
 import argparse
@@ -95,8 +106,16 @@ NSE_HOLIDAYS = {
     "2026-12-25": "Christmas",
 }
 NSE_EARLY_CLOSE = {}   # NSE has no early closes; kept as a hook
-SPECIAL_CLOSED = {"2026-11-08": "Muhurat trading (Sunday, timings by NSE circular): treated as closed"}
-CALENDAR_YEARS = (2026,)
+BUILTIN_HOLIDAYS = dict(NSE_HOLIDAYS)   # the offline fallback; NSE_HOLIDAYS below also holds calendar.json
+BUILTIN_YEARS = (2026,)
+# Normal-hours sessions on a weekend or holiday: the market is open 09:15-15:30.
+BUILTIN_SPECIAL = {"2026-02-01": "Union Budget (Sunday)"}
+# Muhurat: one evening hour, times set by circular and not tracked here; the regular market is closed.
+BUILTIN_MUHURAT = {"2026-11-08": "Diwali Laxmi Pujan (Muhurat), Sunday"}
+SPECIAL_SESSIONS = dict(BUILTIN_SPECIAL)
+MUHURAT_SESSIONS = dict(BUILTIN_MUHURAT)
+CALENDAR_YEARS = BUILTIN_YEARS
+CALENDAR_PATH = os.path.join(DATA_DIR, "calendar.json")
 OPEN = datetime.time(9, 15)
 CLOSE = datetime.time(15, 30)
 PRE_OPEN = datetime.time(9, 0)
@@ -130,13 +149,82 @@ def parse_now(text):
     return (dt - dt.utcoffset()).replace(tzinfo=None)
 
 
+def _iso_map(m):
+    """{"2027-01-26": "Republic Day"} -> the same with bad keys dropped; anything else is corrupt."""
+    if m is None:
+        return {}
+    if not isinstance(m, dict):
+        raise ValueError("not an object")
+    out = {}
+    for k, v in m.items():
+        try:
+            datetime.date.fromisoformat(k)
+        except (TypeError, ValueError):
+            continue
+        out[k] = str(v)
+    return out
+
+
+def load_calendar(path=None):
+    """trader/data/calendar.json (trader-data: data.py calendar) -> dict, or None when it is
+    missing or unreadable. Never raises: the built-in table is the fallback."""
+    try:
+        with open(path or CALENDAR_PATH, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        if not isinstance(doc, dict):
+            return None
+        return {"years": sorted(set(int(y) for y in (doc.get("years") or []))),
+                "holidays": _iso_map(doc.get("holidays")),
+                "special_sessions": _iso_map(doc.get("special_sessions")),
+                "fetched_at": doc.get("fetched_at"), "last_circular_check": doc.get("last_circular_check")}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def is_muhurat(name):
+    low = str(name).lower()
+    return "muhurat" in low or "laxmi pujan" in low
+
+
+def apply_calendar(path=None):
+    """Rebuild NSE_HOLIDAYS, SPECIAL_SESSIONS, MUHURAT_SESSIONS and CALENDAR_YEARS from the built-in
+    tables plus calendar.json. For a year the file lists, the file replaces the built-in holidays."""
+    global CALENDAR_YEARS
+    cal = load_calendar(path)
+    for table, base in ((NSE_HOLIDAYS, BUILTIN_HOLIDAYS), (SPECIAL_SESSIONS, BUILTIN_SPECIAL),
+                        (MUHURAT_SESSIONS, BUILTIN_MUHURAT)):
+        table.clear()
+        table.update(base)
+    CALENDAR_YEARS = BUILTIN_YEARS
+    if not cal:
+        return None
+    for y in cal["years"]:
+        for iso in [k for k in NSE_HOLIDAYS if k.startswith("%04d-" % y)]:
+            del NSE_HOLIDAYS[iso]
+    NSE_HOLIDAYS.update(cal["holidays"])
+    for iso, name in cal["special_sessions"].items():
+        SPECIAL_SESSIONS.pop(iso, None)
+        MUHURAT_SESSIONS.pop(iso, None)
+        (MUHURAT_SESSIONS if is_muhurat(name) else SPECIAL_SESSIONS)[iso] = name
+    CALENDAR_YEARS = tuple(sorted(set(BUILTIN_YEARS) | set(cal["years"])))
+    return cal
+
+
+apply_calendar()   # at import: other skills load this file by path and read NSE_HOLIDAYS / trading_day
+
+
 def trading_day(d):
-    """(is_trading_day, reason). Weekends and the NSE holiday list."""
-    if d.isoformat() in SPECIAL_CLOSED:
-        return False, SPECIAL_CLOSED[d.isoformat()]
+    """(is_trading_day, reason). Normal-hours special sessions open, weekends and the NSE holiday
+    list closed. The Muhurat evening session is closed for the regular market, with its own reason."""
+    iso = d.isoformat()
+    if iso in MUHURAT_SESSIONS:
+        return False, ("special session: %s, about an hour in the evening at times set by NSE; "
+                       "no normal 09:15-15:30 market" % MUHURAT_SESSIONS[iso])
+    if iso in SPECIAL_SESSIONS:
+        return True, ""
     if d.weekday() >= 5:
         return False, "weekend"
-    name = NSE_HOLIDAYS.get(d.isoformat())
+    name = NSE_HOLIDAYS.get(iso)
     if name:
         return False, "NSE holiday: " + name
     return True, ""
@@ -156,7 +244,9 @@ def market_status(now_utc):
     ok, reason = trading_day(d)
     st = {"now_ist": local.strftime("%Y-%m-%d %H:%M"), "date": d.isoformat(),
           "weekday": local.strftime("%A"), "calendar_known": d.year in CALENDAR_YEARS,
-          "open": False, "reason": reason, "early_close": None}
+          "open": False, "reason": reason, "early_close": None,
+          "special_session": SPECIAL_SESSIONS.get(d.isoformat()) or MUHURAT_SESSIONS.get(d.isoformat()),
+          "muhurat": d.isoformat() in MUHURAT_SESSIONS}
     s = session(d)
     if s:
         o, c = s
@@ -551,7 +641,8 @@ def _n(x):
 
 
 def rules_from_plan(plan, cfg_flat_by=None):
-    """trader/plan.json -> a stop alert, a target alert and a flat-by-close time alert, for the plan's day."""
+    """trader/plan.json -> a stop alert, a target alert and a flat-by-close time alert, for the plan's day.
+    A CNC (delivery) plan is held past the close, so it gets no flat-by alert."""
     if not isinstance(plan, dict) or not plan.get("symbol"):
         raise AlertError("the plan has no symbol (run trader-exit first)")
     sym = str(plan["symbol"]).upper()
@@ -563,11 +654,12 @@ def rules_from_plan(plan, cfg_flat_by=None):
         label = plan.get("%s_label" % key)
         out.append({"id": "%s-plan-%s" % (sym.lower(), key), "symbol": sym, "type": typ, "price": float(v),
                     "note": word + (": " + label if label else "")})
-    flat = plan.get("flat_by") or cfg_flat_by or "15:15"
-    if _hhmm(flat) is None:
-        raise AlertError("the plan's flat_by %r is not a time like 15:15" % flat)
-    out.append({"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
-                "label": "flat by %s" % flat})
+    if str(plan.get("product") or "").upper() != "CNC":
+        flat = plan.get("flat_by") or cfg_flat_by or "15:15"
+        if _hhmm(flat) is None:
+            raise AlertError("the plan's flat_by %r is not a time like 15:15" % flat)
+        out.append({"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
+                    "label": "flat by %s" % flat})
     if plan.get("date"):
         for r in out:
             r["date"] = str(plan["date"])
@@ -600,14 +692,17 @@ def cmd_clock(a):
     if a.json:
         print(json.dumps(st, indent=2))
     else:
-        print("IST %s (%s): NSE %s, %s." % (st["now_ist"], st["weekday"],
-                                                  "OPEN" if st["open"] else "closed", st["reason"]))
+        word = "OPEN" if st["open"] else ("regular market closed" if st["muhurat"] else "closed")
+        print("IST %s (%s): NSE %s, %s." % (st["now_ist"], st["weekday"], word, st["reason"]))
+        if st["special_session"] and not st["muhurat"]:
+            print("Special session today: %s." % st["special_session"])
         if st.get("opens"):
             print("Today's session: %s to %s IST." % (st["opens"], st["closes"]))
         if not st["open"] and st.get("next_open"):
             print("Next open: %s IST." % st["next_open"])
         if not st["calendar_known"]:
-            print("holiday list covers 2026 only: check nseindia.com")
+            print("holiday list covers %s only: check nseindia.com, or run python3 trader-data/data.py calendar"
+                  % ", ".join(str(y) for y in CALENDAR_YEARS))
     return 0 if st["open"] else 1
 
 

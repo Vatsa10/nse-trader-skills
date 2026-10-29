@@ -11,6 +11,8 @@ saved yourself (Kite MCP JSON, Kite Console / NSE website CSV).
     python3 data.py import-kite kite-hist.json --kind historical --symbol RELIANCE
     python3 data.py import-kite kite-quotes.json --kind quotes
     python3 data.py import-csv RELIANCE.csv --symbol RELIANCE [--adjusted]
+    python3 data.py calendar [--refresh]
+    python3 data.py delivery RELIANCE TCS [--window 30] [--no-fetch]
     python3 data.py doctor
     python3 data.py record RELIANCE [--date 2026-10-23]
     python3 data.py status
@@ -22,23 +24,34 @@ Writes (shared contracts, see PORT_V4_SPEC.md):
   trader/data/bands.json             {"as_of","source","bands":{SYM:{band_pct,lower,upper}},"unknown":[...]}
   trader/data/sources.json           doctor's per-source health
   trader/data/cache_meta.json        where each cached file came from and when
+  trader/data/calendar.json          {"fetched_at","years","holidays","special_sessions","last_circular_check","warnings"}
+  trader/data/delivery/<SYM>.csv     date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series (blank = unknown)
+  trader/data/delivery/pending.json  {"pending": [dates whose delivery file is not published yet]}
+
+NSE requests (www.nseindia.com, nsearchives) retry up to 5 times on a 429, 502, 503, 504
+or a timeout, waiting 2^n seconds with jitter (never over 8 s, or the Retry-After the server
+sends); a 404 on an archive file is final. Cookies persist in trader/data/nse_cookies.txt.
 
 Daily chain (auto): Yahoo query1 -> Yahoo query2 -> NSE JSON API (cookie
 primed) -> NSE bhavcopy archives (one file per trading day). Only dates after
 the last cached session are fetched (--fill-gaps also refetches holes).
 Every write is validated: OHLC sanity, no duplicate dates, ascending dates,
-gaps checked against the NSE trading calendar (2024, 2025, 2026).
+gaps checked against the NSE trading calendar (built-in 2024 to 2026, any other year
+from trader/data/calendar.json, which the calendar command keeps up to date).
 """
 
 import argparse
 import csv
 import datetime
+import email.utils
 import gzip
+import http.client
 import http.cookiejar
 import importlib.util
 import io
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -65,6 +78,13 @@ PAUSE = 0.6          # seconds between requests to the same site
 BHAV_PAUSE = 1.0     # bhavcopy archive: one file a second
 RETRIES = 2          # extra tries per Yahoo host on a 429 / 5xx
 BACKOFF = 2.0        # first back-off in seconds, doubles each try
+NSE_RETRIES = 5      # extra tries on an NSE host after a 429 / 502 / 503 / 504 or a timeout
+RETRY_STATUS = (429, 502, 503, 504)
+RETRY_CAP = 8.0      # longest wait before an NSE retry, Retry-After included
+COOKIE_FILE = "nse_cookies.txt"
+COOKIE_FRESH = 1800  # seconds: a saved cookie file this young skips the home page prime
+UDIFF_FROM = datetime.date(2024, 7, 8)   # before this day NSE published only the legacy bhavcopy
+MONTH_UP = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 NSE_CHUNK_DAYS = 100
 TIMEOUT = 20
 IST = datetime.timedelta(hours=5, minutes=30)
@@ -74,6 +94,18 @@ BARS_PER_SESSION = 75
 SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9&\-]{0,19}$")
 HEADER = ["date", "open", "high", "low", "close", "volume"]
 STD_BANDS = (2, 5, 10, 20)
+CALENDAR_FILE = "calendar.json"
+CAL_REFERER = NSE + "/resources/exchange-communication-holidays"
+CIRCULAR_FIRST_DAYS = 5     # the first circular check looks this far back
+CIRCULAR_TAG = "Circular: "  # marks a calendar.json entry that came from a circular, not the holiday list
+MAX_WARNINGS = 20
+DELIVERY_HEADER = ["date", "volume", "trades", "deliv_qty", "deliv_pct", "qty_per_trade", "series"]
+DELIVERY_SERIES = ("EQ", "BE", "BZ")
+T2T_SERIES = ("BE", "BZ")     # trade-to-trade: every share is delivered
+DELIVERY_WINDOW = 30          # sessions the means are taken over
+DELIVERY_MIN = 5              # fewer delivery values than this is "not enough delivery data"
+IM_LEVEL = 1.2                # institutional money: DQ and TQ both above this
+PENDING_DAYS = 5              # a delivery file still missing after this many days is given up on
 
 # ---------------------------------------------------------------- NSE trading calendar
 # 2026 comes from trader-alerts/alerts.py (loaded below, with this copy as the fallback).
@@ -127,7 +159,8 @@ def _alerts_holidays():
         spec = importlib.util.spec_from_file_location("trader_alerts_for_data", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        got = {k: v for k, v in mod.NSE_HOLIDAYS.items() if k.startswith("2026-")}
+        got = {k: v for k, v in getattr(mod, "BUILTIN_HOLIDAYS", mod.NSE_HOLIDAYS).items()
+               if k.startswith("2026-")}
         return got or dict(NSE_HOLIDAYS_2026_COPY)
     except Exception:
         return dict(NSE_HOLIDAYS_2026_COPY)
@@ -145,21 +178,72 @@ class DataError(Exception):
 
 
 class SourceError(DataError):
-    def __init__(self, source, message, hint=""):
+    def __init__(self, source, message, hint="", transient=False):
         DataError.__init__(self, message)
-        self.source, self.hint = source, hint
+        self.source, self.hint, self.transient = source, hint, transient   # transient: worth a retry
 
     def __str__(self):
         msg = DataError.__str__(self)
         return msg + (" (%s)" % self.hint if self.hint else "")
 
 
+_CAL = None    # calendar.json as load_calendar reads it; None means the built-in tables only
+
+
+def _iso_map(m):
+    """{"2027-01-26": "Republic Day"} with bad keys dropped; a non-object is corrupt."""
+    if m is None:
+        return {}
+    if not isinstance(m, dict):
+        raise ValueError("not an object")
+    out = {}
+    for k, v in m.items():
+        try:
+            datetime.date.fromisoformat(k)
+        except (TypeError, ValueError):
+            continue
+        out[k] = str(v)
+    return out
+
+
+def load_calendar(data_dir):
+    """<data_dir>/calendar.json -> dict, or None when it is missing or corrupt (never raises)."""
+    doc = _read_json(os.path.join(data_dir, CALENDAR_FILE), None)
+    if not isinstance(doc, dict):
+        return None
+    try:
+        warns = doc.get("warnings")
+        return {"years": sorted(set(int(y) for y in (doc.get("years") or []))),
+                "holidays": _iso_map(doc.get("holidays")),
+                "special_sessions": _iso_map(doc.get("special_sessions")),
+                "fetched_at": doc.get("fetched_at"), "last_circular_check": doc.get("last_circular_check"),
+                "warnings": [str(w) for w in warns] if isinstance(warns, list) else []}
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def calendar_known(year):
+    return year in CALENDAR_YEARS or bool(_CAL and year in _CAL["years"])
+
+
+def closed_name(iso):
+    return (_CAL and _CAL["holidays"].get(iso)) or HOLIDAYS.get(iso, "weekend")
+
+
 def trading_day(d):
+    """Is NSE open on d? A special session is open, a weekend is closed, then calendar.json (a listed
+    holiday is closed, any other day of a year it covers is open), then the built-in tables."""
     iso = d.isoformat()
-    if iso in SPECIAL_SESSIONS:
+    cal = _CAL
+    if iso in SPECIAL_SESSIONS or (cal and iso in cal["special_sessions"]):
         return True
     if d.weekday() >= 5:
         return False
+    if cal:
+        if iso in cal["holidays"]:
+            return False
+        if d.year in cal["years"]:
+            return True
     return iso not in HOLIDAYS
 
 
@@ -338,21 +422,20 @@ def validate_daily(rows):
             errors.append("%s: %s" % (d, p))
         if r.get("volume") is not None and r["volume"] < 0:
             errors.append("%s: negative volume" % d)
-        if not trading_day(day) and day.year in CALENDAR_YEARS:
-            warnings.append("%s has a bar but NSE was closed (%s)" % (
-                d, HOLIDAYS.get(d, "weekend")))
+        if not trading_day(day) and calendar_known(day.year):
+            warnings.append("%s has a bar but NSE was closed (%s)" % (d, closed_name(d)))
     if rows and not errors:
         first = datetime.date.fromisoformat(rows[0]["date"])
         last = datetime.date.fromisoformat(rows[-1]["date"])
-        known = [x for x in trading_days(first, last) if x.year in CALENDAR_YEARS and x.isoformat() not in seen]
-        unknown = [x for x in trading_days(first, last) if x.year not in CALENDAR_YEARS
+        known = [x for x in trading_days(first, last) if calendar_known(x.year) and x.isoformat() not in seen]
+        unknown = [x for x in trading_days(first, last) if not calendar_known(x.year)
                    and x.isoformat() not in seen]
         if known:
             warnings.append("gap: %d NSE trading day(s) missing: %s" % (len(known), compress(known)))
         if unknown:
             yrs = sorted(set(x.year for x in unknown))
-            warnings.append("%d weekday(s) without a bar in %s (no holiday list for those years, not checked)"
-                            % (len(unknown), ", ".join(map(str, yrs))))
+            warnings.append("%d weekday(s) without a bar in %s (no holiday list for those years, not checked: "
+                            "run data.py calendar)" % (len(unknown), ", ".join(map(str, yrs))))
         for a, b in zip(rows, rows[1:]):
             ratio = a["close"] / b["open"] if b["open"] else 0
             for k in (2, 3, 4, 5, 10):
@@ -549,19 +632,76 @@ def to_5m(points):
 
 # ---------------------------------------------------------------- HTTP
 
-_transport = None    # tests: fn(url, headers, timeout) -> (status, bytes)
+_transport = None    # tests: fn(url, headers, timeout) -> (status, bytes) or (status, bytes, response headers)
 _sleep = time.sleep
 _clock = time.monotonic
+_jitter = random.random    # tests: fn() -> a number in [0, 1)
+
+
+def retry_after(headers):
+    """Retry-After (seconds or an HTTP date) -> seconds >= 0, or None when absent or unreadable."""
+    value = None
+    for k, v in (headers or {}).items():
+        if str(k).lower() == "retry-after":
+            value = str(v).strip()
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return max(0.0, (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
+
+
+def retry_wait(attempt, headers=None):
+    """Seconds to wait before retry number `attempt` (1, 2, ...): the Retry-After if the server sent
+    one, else 2^attempt with full random jitter. Never more than RETRY_CAP."""
+    sent = retry_after(headers)
+    if sent is not None:
+        return min(RETRY_CAP, sent)
+    return min(RETRY_CAP, 2.0 ** attempt) * _jitter()
 
 
 class Session(object):
-    """One cookie jar per run, browser-like headers, gzip handled."""
+    """One cookie jar per run (saved in the data folder when one is given), browser-like headers,
+    gzip handled, and retries with back-off on NSE hosts."""
 
-    def __init__(self):
-        self.jar = http.cookiejar.CookieJar()
+    def __init__(self, data_dir=None):
+        self.cookie_path = os.path.join(data_dir, COOKIE_FILE) if data_dir else None
+        self.jar = (http.cookiejar.MozillaCookieJar(self.cookie_path) if self.cookie_path
+                    else http.cookiejar.CookieJar())
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
-        self.nse_primed = False
+        self.nse_primed = self.load_cookies()
         self.last = {}
+        self.last_headers = {}
+
+    def load_cookies(self):
+        """Reload the saved cookies (expired ones dropped, session cookies kept). True when they are
+        NSE cookies young enough to skip the home page prime."""
+        if not self.cookie_path or not os.path.exists(self.cookie_path):
+            return False
+        try:
+            self.jar.load(ignore_discard=True, ignore_expires=False)
+            age = time.time() - os.path.getmtime(self.cookie_path)
+        except (OSError, ValueError):
+            self.jar.clear()    # an unreadable file is a cold start, never a crash
+            return False
+        return age < COOKIE_FRESH and any("nseindia.com" in c.domain for c in self.jar)
+
+    def save_cookies(self):
+        if not self.cookie_path or not len(self.jar):
+            return
+        try:
+            os.makedirs(os.path.dirname(self.cookie_path) or ".", exist_ok=True)
+            self.jar.save(ignore_discard=True, ignore_expires=True)
+        except OSError:
+            pass
 
     def polite(self, host, gap):
         t = self.last.get(host)
@@ -571,20 +711,47 @@ class Session(object):
                 _sleep(wait)
         self.last[host] = _clock()
 
-    def get(self, url, headers=None, timeout=TIMEOUT, gap=PAUSE):
+    def get(self, url, headers=None, timeout=TIMEOUT, gap=PAUSE, retries=None):
+        """(status, body). NSE hosts retry up to NSE_RETRIES times on a 429 / 502 / 503 / 504 or a
+        timeout or dropped connection; any other status (a 404 on an archive file above all) comes
+        straight back. Other hosts do not retry here (Yahoo has its own loop)."""
         host = urllib.parse.urlsplit(url).netloc
-        self.polite(host, gap)
+        if retries is None:
+            retries = NSE_RETRIES if host.endswith("nseindia.com") else 0
         h = dict(BROWSER)
         h.update(headers or {})
+        attempt = 0
+        while True:
+            self.polite(host, gap)
+            try:
+                code, body, reply = self.once(url, h, timeout, host)
+            except SourceError as e:
+                if not (e.transient and attempt < retries):
+                    if attempt:
+                        raise SourceError(e.source, "%s (gave up after %d retries)" % (DataError.__str__(e), attempt),
+                                          e.hint)
+                    raise
+                wait = retry_wait(attempt + 1)
+            else:
+                if code not in RETRY_STATUS or attempt >= retries:
+                    self.last_headers = reply
+                    return code, body
+                wait = retry_wait(attempt + 1, reply)
+            attempt += 1
+            _sleep(wait)
+
+    def once(self, url, h, timeout, host):
+        """One request -> (status, body, response headers)."""
         if _transport is not None:
-            return _transport(url, h, timeout)
+            got = _transport(url, h, timeout)
+            return got[0], got[1], (got[2] if len(got) > 2 else {})
         req = urllib.request.Request(url, headers=h)
         try:
             with self.opener.open(req, timeout=timeout) as r:
                 body = r.read()
                 if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
                     body = gzip.decompress(body)
-                return r.status, body
+                return r.status, body, dict(r.headers.items())
         except urllib.error.HTTPError as e:
             try:
                 body = e.read()
@@ -595,14 +762,21 @@ class Session(object):
                     e.close()
                 except Exception:
                     pass
-            return e.code, body
+            return e.code, body, dict(e.headers.items()) if e.headers else {}
         except socket.timeout:
-            raise SourceError(host, "%s timed out after %ss" % (host, timeout), "network or firewall")
+            raise SourceError(host, "%s timed out after %ss" % (host, timeout), "network or firewall",
+                              transient=True)
+        except http.client.HTTPException as e:
+            # the server dropped or garbled the connection: start from a clean opener, keep the cookies
+            self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
+            raise SourceError(host, "%s broke the connection: %s" % (host, e), "network or firewall",
+                              transient=True)
         except (urllib.error.URLError, OSError) as e:
             why = str(getattr(e, "reason", e))
+            proxy = "403" in why or "407" in why
             tip = ("a proxy or firewall on this network blocks %s; use Kite MCP or import-csv" % host
-                   if "403" in why or "407" in why else "no network, DNS or firewall")
-            raise SourceError(host, "could not reach %s: %s" % (host, why), tip)
+                   if proxy else "no network, DNS or firewall")
+            raise SourceError(host, "could not reach %s: %s" % (host, why), tip, transient=not proxy)
 
 
 def hint(source, code):
@@ -724,6 +898,7 @@ def nse_prime(sess, force=False):
     if code != 200:
         raise SourceError("nse-home", "www.nseindia.com home page answered HTTP %d" % code, hint("nse", code))
     sess.nse_primed = True
+    sess.save_cookies()
 
 
 def nse_api(sess, path, referer):
@@ -796,8 +971,14 @@ def parse_nse_chart(doc):
 # ---------------------------------------------------------------- NSE bhavcopy archives
 
 def bhav_urls(d):
-    return [ARCHIVES + "/products/content/sec_bhavdata_full_%s.csv" % d.strftime("%d%m%Y"),
-            ARCHIVES + "/content/cm/BhavCopy_NSE_CM_0_0_0_%s_F_0000.csv.zip" % d.strftime("%Y%m%d")]
+    """The delivery bhavcopy first, then the plain one: UDiFF from 2024-07-08, the legacy
+    cmDDMONYYYYbhav file before that."""
+    full = ARCHIVES + "/products/content/sec_bhavdata_full_%s.csv" % d.strftime("%d%m%Y")
+    if d >= UDIFF_FROM:
+        return [full, ARCHIVES + "/content/cm/BhavCopy_NSE_CM_0_0_0_%s_F_0000.csv.zip" % d.strftime("%Y%m%d")]
+    mon = MONTH_UP[d.month - 1]
+    return [full, ARCHIVES + "/content/historical/EQUITIES/%d/%s/cm%02d%s%dbhav.csv.zip" % (
+        d.year, mon, d.day, mon, d.year)]
 
 
 def _key(h):
@@ -839,15 +1020,31 @@ def parse_bhav(text, want=None):
 
 
 class Bhav(object):
-    """Fetches each trading day once per run and serves every symbol from it."""
+    """Fetches each trading day once per run and serves every symbol from it. The same file also
+    feeds the delivery analytics: `deliv` holds each day's delivery rows, `full` the days whose
+    rows came from sec_bhavdata_full (the only file with delivery), `sec_missing` the days that
+    have a bar table but no delivery file yet."""
 
     def __init__(self, sess):
         self.sess, self.days, self.errors = sess, {}, {}
+        self.deliv, self.full, self.sec_missing = {}, set(), set()
+        self.tried, self.deliv_errors = set(), {}
+
+    def take_delivery(self, d, text, full):
+        try:
+            rows = parse_delivery(text)
+        except DataError:
+            return
+        if full or d not in self.deliv:
+            self.deliv[d] = rows
+        if full:
+            self.full.add(d)
 
     def day(self, d):
         if d in self.days:
             return self.days[d]
         table, last = None, None
+        self.tried.add(d)
         for url in bhav_urls(d):
             try:
                 code, body = self.sess.get(url, {"Accept": "*/*", "Referer": NSE + "/"}, gap=BHAV_PAUSE)
@@ -863,7 +1060,9 @@ class Bhav(object):
                         last = "bad zip from %s" % url
                         continue
                 try:
-                    table = parse_bhav(body.decode("utf-8", "replace"))
+                    text = body.decode("utf-8", "replace")
+                    table = parse_bhav(text)
+                    self.take_delivery(d, text, "sec_bhavdata_full" in url)
                     break
                 except DataError as e:
                     last = str(e)
@@ -874,7 +1073,29 @@ class Bhav(object):
         self.days[d] = table
         if table is None:
             self.errors[d] = last
+        elif d not in self.full:
+            self.sec_missing.add(d)
         return table
+
+    def delivery_day(self, d):
+        """Fetch only the delivery file of one day (once per run). True when its rows are in `deliv`."""
+        if d in self.full:
+            return True
+        if d in self.tried:
+            return False
+        self.tried.add(d)
+        url = bhav_urls(d)[0]
+        try:
+            code, body = self.sess.get(url, {"Accept": "*/*", "Referer": NSE + "/"}, gap=BHAV_PAUSE)
+            if code != 200:
+                raise SourceError("nsearchives", "HTTP %d (%s)" % (code, hint("bhav", code)))
+            self.take_delivery(d, body.decode("utf-8", "replace"), True)
+        except SourceError as e:
+            self.deliv_errors[d] = str(e)
+        if d not in self.full:
+            self.sec_missing.add(d)
+            return False
+        return True
 
 
 def fetch_bhav_daily(bhav, sym, days, max_days):
@@ -946,7 +1167,7 @@ def window(rows, years, now_ist, fill_gaps):
         have = set(r["date"] for r in rows)
         if fill_gaps:
             first = datetime.date.fromisoformat(rows[0]["date"])
-            miss = [d for d in trading_days(first, end) if d.isoformat() not in have and d.year in CALENDAR_YEARS]
+            miss = [d for d in trading_days(first, end) if d.isoformat() not in have and calendar_known(d.year)]
         else:
             miss = trading_days(last + datetime.timedelta(days=1), end)
         return miss, end
@@ -993,7 +1214,7 @@ def get_daily(sess, bhav, sym, miss, end, source, years, max_days):
 
 def cmd_daily(a):
     now = parse_now(a.now)
-    sess, rc = Session(), 0
+    sess, rc = Session(a.data), 0
     bhav = Bhav(sess)
     for s in a.symbols:
         sym = norm_symbol(s)
@@ -1052,13 +1273,279 @@ def cmd_daily(a):
             print("  dropped bad bar " + b)
         for w in warns:
             print("  warning: " + w)
+    for line in fill_delivery(a.data, bhav, [norm_symbol(x) for x in a.symbols], now.date()):
+        print(line)
+    return rc
+
+
+# ---------------------------------------------------------------- delivery analytics
+
+def _int(x):
+    v = num(x)
+    return None if v is None else int(round(v))
+
+
+def parse_delivery(text, want=None):
+    """sec_bhavdata_full (or a plain bhavcopy) -> {SYMBOL: row} for the delivery file.
+
+    A row is {date, volume, trades, deliv_qty, deliv_pct, qty_per_trade, series}; a value NSE
+    leaves blank ("-") is None, never 0. In the trade-to-trade series (BE, BZ) every share is
+    delivered, so delivery is the full volume. Rights symbols (-RE) are skipped; EQ wins when a
+    symbol has several series. The UDiFF and legacy files carry no delivery, so those rows keep
+    volume and trades and leave the delivery fields empty."""
+    rd = csv.reader(io.StringIO(text))
+    try:
+        head = [_key(h) for h in next(rd)]
+    except StopIteration:
+        return {}
+    pick = lambda *names: next((head.index(n) for n in names if n in head), None)  # noqa: E731
+    ix = {"sym": pick("symbol", "tckrsymb"), "ser": pick("series", "sctysrs"),
+          "date": pick("date1", "traddt", "timestamp"), "v": pick("ttl_trd_qnty", "ttltradgvol", "tottrdqty"),
+          "n": pick("no_of_trades", "ttlnboftxsexctd", "totaltrades"), "dq": pick("deliv_qty"),
+          "dp": pick("deliv_per")}
+    if None in (ix["sym"], ix["date"], ix["v"]):
+        raise DataError("not a bhavcopy (columns: %s)" % ", ".join(head[:8]))
+    out = {}
+    for r in rd:
+        if len(r) < len(head):
+            continue
+        sym = r[ix["sym"]].strip().upper()
+        if (want and sym not in want) or sym.endswith("-RE"):
+            continue
+        ser = r[ix["ser"]].strip().upper() if ix["ser"] is not None else "EQ"
+        if ser not in DELIVERY_SERIES or (sym in out and ser != "EQ"):
+            continue
+        try:
+            day = parse_date(r[ix["date"]])
+        except DataError:
+            continue
+        vol = _int(r[ix["v"]])
+        trades = _int(r[ix["n"]]) if ix["n"] is not None else None
+        if ser in T2T_SERIES:
+            dq = vol
+        else:
+            dq = _int(r[ix["dq"]]) if ix["dq"] is not None else None
+        pct = round(dq * 100.0 / vol, 2) if dq is not None and vol else None
+        if pct is None and dq is None and ix["dp"] is not None:
+            given = num(r[ix["dp"]])
+            pct = None if given is None else round(given, 2)
+        out[sym] = {"date": day.isoformat(), "volume": vol, "trades": trades, "deliv_qty": dq, "deliv_pct": pct,
+                    "qty_per_trade": round(vol / float(trades), 2) if vol is not None and trades else None,
+                    "series": ser}
+    return out
+
+
+def delivery_dir(data_dir):
+    return os.path.join(data_dir, "delivery")
+
+
+def delivery_path(data_dir, sym):
+    return os.path.join(delivery_dir(data_dir), sym + ".csv")
+
+
+def read_delivery(path):
+    """delivery/<SYM>.csv -> rows ascending by date; a blank cell is None."""
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, newline="", encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            try:
+                datetime.date.fromisoformat(r["date"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            rows.append({"date": r["date"], "volume": _int(r.get("volume")), "trades": _int(r.get("trades")),
+                         "deliv_qty": _int(r.get("deliv_qty")), "deliv_pct": num(r.get("deliv_pct")),
+                         "qty_per_trade": num(r.get("qty_per_trade")), "series": (r.get("series") or "").strip()})
+    return sorted(rows, key=lambda r: r["date"])
+
+
+def merge_delivery(old, new):
+    """By date; a value in the new row replaces the old one, a blank never wipes a value."""
+    by = dict((r["date"], dict(r)) for r in old)
+    for r in new:
+        cur = by.setdefault(r["date"], dict(r))
+        for k, v in r.items():
+            if v not in (None, ""):
+                cur[k] = v
+    return [by[d] for d in sorted(by)]
+
+
+def write_delivery(data_dir, sym, new_rows):
+    """Merge rows into delivery/<SYM>.csv (header date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series;
+    a missing value is an empty cell). -> rows now in the file."""
+    path = delivery_path(data_dir, sym)
+    rows = merge_delivery(read_delivery(path), new_rows)
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(DELIVERY_HEADER)
+    cell = lambda v: "" if v is None else str(v)  # noqa: E731
+    for r in rows:
+        w.writerow([r["date"], cell(r["volume"]), cell(r["trades"]), cell(r["deliv_qty"]),
+                    "" if r["deliv_pct"] is None else "%.2f" % r["deliv_pct"],
+                    "" if r["qty_per_trade"] is None else "%.2f" % r["qty_per_trade"], r["series"] or ""])
+    _atomic_write(path, buf.getvalue())
+    return rows
+
+
+def pending_path(data_dir):
+    return os.path.join(delivery_dir(data_dir), "pending.json")
+
+
+def read_pending(data_dir):
+    doc = _read_json(pending_path(data_dir), {})
+    out = set()
+    for d in (doc.get("pending") if isinstance(doc, dict) else None) or []:
+        try:
+            out.add(datetime.date.fromisoformat(str(d)))
+        except ValueError:
+            continue
+    return out
+
+
+def tracked_symbols(data_dir):
+    dd = delivery_dir(data_dir)
+    return sorted(f[:-4] for f in (os.listdir(dd) if os.path.isdir(dd) else []) if f.endswith(".csv"))
+
+
+def store_delivery(data_dir, bhav, syms):
+    """Write the delivery rows the Bhav fetched for each symbol. -> {symbol: rows added or filled in}."""
+    done = {}
+    for sym in syms:
+        rows = [bhav.deliv[d][sym] for d in sorted(bhav.deliv) if sym in bhav.deliv[d]]
+        if not rows:
+            continue
+        before = read_delivery(delivery_path(data_dir, sym))
+        after = write_delivery(data_dir, sym, rows)
+        n = sum(1 for r in after if r not in before)
+        if n:
+            done[sym] = n
+    return done
+
+
+def fill_delivery(data_dir, bhav, syms, today):
+    """After a run that fetched bhavcopies: retry the pending delivery days, store the rows for the
+    symbols named plus every symbol already tracked, and keep pending.json (a day still missing after
+    PENDING_DAYS is dropped with a warning). -> printable lines."""
+    pend = read_pending(data_dir)
+    if not (bhav.deliv or pend or bhav.sec_missing):
+        return []
+    lines = []
+    for d in sorted(pend):
+        if (today - d).days <= PENDING_DAYS:
+            bhav.delivery_day(d)
+    names = sorted(set(syms) | set(tracked_symbols(data_dir)))
+    done = store_delivery(data_dir, bhav, names)
+    if done:
+        lines.append("delivery: %d row(s) written for %d symbol(s) in %s" % (
+            sum(done.values()), len(done), delivery_dir(data_dir)))
+    keep = set()
+    for d in sorted(pend):
+        if d in bhav.full:
+            continue
+        if (today - d).days > PENDING_DAYS:
+            lines.append("warning: the delivery file for %s did not appear within %d days; those days stay empty"
+                         % (d, PENDING_DAYS))
+        else:
+            keep.add(d)
+    keep |= set(d for d in bhav.sec_missing if d not in bhav.full and (today - d).days <= PENDING_DAYS)
+    if keep != pend or os.path.exists(pending_path(data_dir)):
+        _write_json(pending_path(data_dir), {"pending": sorted(d.isoformat() for d in keep)})
+    if keep:
+        lines.append("delivery pending (file not published yet, retried on the next run): %s" % compress(sorted(keep)))
+    return lines
+
+
+def delivery_metrics(rows, window=DELIVERY_WINDOW):
+    """The latest row against the mean of the last `window` rows (it included):
+    DQ = delivery quantity, TQ = quantity per trade, VOL = volume, each over its mean.
+    Institutional money: DQ > 1.2 and TQ > 1.2 on a series that is not trade-to-trade.
+    Band on DQ: >= 2 strong, >= 1.5 high, > 1 above normal, else normal.
+    Fewer than DELIVERY_MIN delivery values in the window -> status "not enough delivery data"."""
+    win = rows[-window:]
+    last = win[-1]
+    out = {"date": last["date"], "series": last["series"], "window": len(win), "status": "ok"}
+    for name, key in (("dq", "deliv_qty"), ("tq", "qty_per_trade"), ("vol", "volume")):
+        vals = [r[key] for r in win if r[key] is not None]
+        mean = sum(vals) / len(vals) if vals else 0
+        out[name] = last[key] / mean if last[key] is not None and mean else None
+        out["n_" + name] = len(vals)
+    out["t2t"] = last["series"] in T2T_SERIES
+    if out["n_dq"] < DELIVERY_MIN:
+        out["status"] = "not enough delivery data"
+    dq, tq = out["dq"], out["tq"]
+    out["band"] = (None if dq is None else "strong" if dq >= 2 else "high" if dq >= 1.5
+                   else "above normal" if dq > 1 else "normal")
+    out["institutional"] = bool(dq is not None and tq is not None and dq > IM_LEVEL and tq > IM_LEVEL
+                                and not out["t2t"] and out["status"] == "ok")
+    out["last"] = last
+    return out
+
+
+def cmd_delivery(a):
+    now = parse_now(a.now)
+    today = now.date()
+    syms = [norm_symbol(s) for s in a.symbols] or tracked_symbols(a.data)
+    if not syms:
+        raise DataError("no symbols: name some (delivery RELIANCE TCS), or fill the cache with daily first")
+    window = max(DELIVERY_MIN, a.window)
+    if not a.no_fetch:
+        end = last_complete_session(now)
+        sessions = trading_days(end - datetime.timedelta(days=int(window * 7 / 5) + 10), end)[-(window + 5):]
+        have = dict((s, set(r["date"] for r in read_delivery(delivery_path(a.data, s)))) for s in syms)
+        need = [d for d in sessions if any(d.isoformat() not in have[s] for s in syms)]
+        need += [d for d in read_pending(a.data) if d not in need and (today - d).days <= PENDING_DAYS]
+        bhav = Bhav(Session(a.data))
+        for d in sorted(need):
+            bhav.delivery_day(d)
+        for line in fill_delivery(a.data, bhav, syms, today):
+            print(line)
+        for d, why in sorted(bhav.deliv_errors.items())[:5]:
+            print("  %s: %s" % (d, why))
+    rc = 0
+    for sym in syms:
+        rows = read_delivery(delivery_path(a.data, sym))
+        if not rows:
+            rc = 1
+            print("%s: no delivery data cached%s" % (sym, "" if a.no_fetch else " (NSE has no delivery file for it yet)"))
+            continue
+        m = delivery_metrics(rows, window)
+        last = m["last"]
+        print("%s  %s  series %s  (%d session(s) in the window of %d)" % (sym, m["date"], m["series"] or "?",
+                                                                       m["window"], window))
+        if m["status"] != "ok":
+            rc = 1
+            print("  not enough delivery data: %d value(s) in the window, %d needed%s" % (
+                m["n_dq"], DELIVERY_MIN, "" if a.no_fetch else "; NSE publishes the file after the close"))
+            continue
+        ratio = lambda x: "n/a" if x is None else "%.2fx" % x  # noqa: E731
+        if last["deliv_qty"] is not None:
+            print("  delivered %s of %s shares (%s%%), %s shares per trade" % (
+                format(last["deliv_qty"], ","), format(last["volume"] or 0, ","),
+                "?" if last["deliv_pct"] is None else "%.1f" % last["deliv_pct"],
+                "?" if last["qty_per_trade"] is None else "%.1f" % last["qty_per_trade"]))
+        else:
+            print("  delivery for %s is not published yet (volume and trades only)" % m["date"])
+        print("  DQ %s   TQ %s   VOL %s   (each against the mean of the last %d sessions with data)" % (
+            ratio(m["dq"]), ratio(m["tq"]), ratio(m["vol"]), m["window"]))
+        if m["t2t"]:
+            print("  band: %s   institutional money: no (trade-to-trade series %s: delivery is all volume)" % (
+                m["band"] or "n/a", m["series"]))
+        elif m["institutional"]:
+            print("  band: %s   institutional money: YES (DQ and TQ both above %.1f: heavy delivery in big tickets)"
+                  % (m["band"], IM_LEVEL))
+        else:
+            why = ("delivery is not published yet" if m["dq"] is None else
+                   "needs DQ and TQ both above %.1f" % IM_LEVEL)
+            print("  band: %s   institutional money: no (%s)" % (m["band"] or "n/a", why))
+    print("A rule of thumb from delivery and ticket size, not a signal: confirm with price and your own plan.")
     return rc
 
 
 # ---------------------------------------------------------------- intraday command
 
 def cmd_intraday(a):
-    sess, rc = Session(), 0
+    sess, rc = Session(a.data), 0
     days = max(1, min(60, a.days))
     for s in a.symbols:
         sym = norm_symbol(s)
@@ -1135,7 +1622,7 @@ def cmd_bands(a):
                  if s not in syms]
     if not syms:
         raise DataError("no symbols: give some, or fill the daily cache first")
-    sess, entries, unknown, errors, used = Session(), {}, [], [], set()
+    sess, entries, unknown, errors, used = Session(a.data), {}, [], [], set()
     today = now.date().isoformat()
     nse_ok = a.source in ("auto", "nse")
     for sym in syms:
@@ -1403,6 +1890,229 @@ def cmd_import_csv(a):
     return 0
 
 
+# ---------------------------------------------------------------- calendar command
+
+def parse_holiday_master(doc):
+    """/api/holiday-master?type=trading -> (holidays, special_sessions, years, skipped) from its CM list.
+
+    Only weekday closures are holidays. A "Laxmi Pujan" entry is the Muhurat session: a special
+    session (bars exist), never a closure, weekday or not. NSE marks it with an asterisk."""
+    cm = doc.get("CM") if isinstance(doc, dict) else None
+    if not isinstance(cm, list) or not cm:
+        raise DataError("holiday-master has no CM list (NSE changed the feed, or this is a bot wall)")
+    holidays, special, years, skipped = {}, {}, set(), 0
+    for r in cm:
+        try:
+            d = parse_date((r or {}).get("tradingDate"))
+        except (DataError, AttributeError):
+            skipped += 1
+            continue
+        name = " ".join(str(r.get("description") or "holiday").replace("*", " ").split())
+        years.add(d.year)
+        if "laxmi pujan" in name.lower() or "muhurat" in name.lower():
+            special[d.isoformat()] = name if "muhurat" in name.lower() else name + " (Muhurat)"
+        elif d.weekday() < 5:
+            holidays[d.isoformat()] = name
+    if not years:
+        raise DataError("holiday-master CM list has no readable dates")
+    return holidays, special, years, skipped
+
+
+def dates_in_text(text):
+    """Every date written in a circular subject: "Saturday, March 6, 2027", "6th March 2027",
+    "06-Mar-2027", "06/03/2027"."""
+    out = []
+    pats = (r"([A-Za-z]{3,9})\.? (\d{1,2})(?:st|nd|rd|th)?,? (\d{4})",
+            r"(\d{1,2})(?:st|nd|rd|th)?[- ]([A-Za-z]{3,9})\.?[- ,]+(\d{4})",
+            r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})")
+    for i, pat in enumerate(pats):
+        for m in re.finditer(pat, text):
+            try:
+                out.append(parse_date({0: "%s %s, %s", 1: "%s %s %s", 2: "%s-%s-%s"}[i] % m.groups()))
+            except (DataError, ValueError):
+                continue
+    return out
+
+
+def parse_circulars(doc):
+    """/api/circulars?dept=CMTR -> (closures, special_sessions, warnings), the first two {iso: name}.
+
+    "trading holiday" plus "on account of" in the subject adds a closure, "live trading session"
+    (or "muhurat") a special session. A subject with no readable date is a warning, never a guess."""
+    rows = doc.get("data") if isinstance(doc, dict) else None
+    if not isinstance(rows, list):
+        raise DataError("circulars answer has no data list (NSE changed the feed, or this is a bot wall)")
+    closures, special, warns = {}, {}, []
+    for r in rows:
+        sub = " ".join(str((r or {}).get("sub") or (r or {}).get("subject") or "").split())
+        low = sub.lower()
+        closed = "trading holiday" in low and "on account of" in low
+        live = "live trading session" in low or "muhurat" in low
+        if not (closed or live):
+            continue
+        if closed and live:
+            warns.append("circular is both a holiday and a live session, not applied: %s" % sub[:100])
+            continue
+        found = dates_in_text(sub)
+        if not found:
+            warns.append("circular mentions a %s but no date could be read, not guessed: %s" % (
+                "trading holiday" if closed else "special session", sub[:100]))
+            continue
+        for d in sorted(set(found)):
+            if closed:
+                if d.weekday() < 5:     # a weekend closure changes nothing
+                    closures[d.isoformat()] = CIRCULAR_TAG + sub[:90]
+            else:
+                special[d.isoformat()] = CIRCULAR_TAG + sub[:90]
+    return closures, special, warns
+
+
+def merge_calendar(old, master, circ, now, checked_from):
+    """The new calendar.json document. master = (holidays, special, years, skipped) or None;
+    circ = (closures, special, warnings) or None. Entries from circulars survive a holiday-list refetch."""
+    holidays = dict(old["holidays"]) if old else {}
+    special = dict(old["special_sessions"]) if old else {}
+    years = set(old["years"]) if old else set()
+    warns = list(old["warnings"]) if old else []
+    fetched = old["fetched_at"] if old else None
+    if master:
+        mh, ms, myears, skipped = master
+        for iso in [k for k in holidays if int(k[:4]) in myears and not holidays[k].startswith(CIRCULAR_TAG)]:
+            del holidays[iso]
+        holidays.update(mh)
+        special.update(ms)
+        years |= myears
+        fetched = stamp(now)
+        if skipped:
+            warns.append("%d holiday-master row(s) had no readable date and were skipped" % skipped)
+    last = old["last_circular_check"] if old else None
+    if circ:
+        closures, specials, cw = circ
+        holidays.update(closures)
+        special.update(specials)
+        warns += cw
+        last = now.date().isoformat()
+    elif not last:
+        last = checked_from.isoformat()   # nothing read yet: the next run starts from here
+    out_w = []
+    for w in warns:
+        if w not in out_w:
+            out_w.append(w)
+    return {"fetched_at": fetched, "years": sorted(years), "holidays": dict(sorted(holidays.items())),
+            "special_sessions": dict(sorted(special.items())), "last_circular_check": last,
+            "warnings": out_w[-MAX_WARNINGS:]}
+
+
+def calendar_changes(old, new):
+    """Printable lines for what a refresh changed."""
+    out = []
+    for key, label in (("holidays", "holiday"), ("special_sessions", "special session")):
+        o, n = (old[key] if old else {}), new[key]
+        for iso in sorted(set(n) - set(o)):
+            out.append("  + %s %s: %s" % (iso, label, n[iso]))
+        for iso in sorted(set(o) - set(n)):
+            out.append("  - %s %s: %s" % (iso, label, o[iso]))
+    return out
+
+
+def builtin_disagreement(new, years):
+    """Where NSE's list and the built-in tables differ, for the years both cover."""
+    out = []
+    for y in sorted(set(years) & set(CALENDAR_YEARS)):
+        pre = "%04d-" % y
+        built = {k for k in HOLIDAYS if k.startswith(pre) and k not in SPECIAL_SESSIONS}
+        live = {k for k in new["holidays"] if k.startswith(pre)}
+        if built - live:
+            out.append("%d: closed in the built-in table only: %s" % (y, compress(sorted(built - live))))
+        if live - built:
+            out.append("%d: closed in NSE's list only: %s" % (y, compress(sorted(live - built))))
+    return out
+
+
+def calendar_needs(old, today, now, refresh):
+    """(fetch the holiday list, read the circulars) per the refresh rules."""
+    if refresh or old is None:
+        return True, True
+    master = today.year not in old["years"]
+    if not master and today.isoformat() in old["holidays"]:
+        # today is a listed closure: trust the list only if it is under a day old
+        try:
+            age = now - IST - datetime.datetime.strptime(old["fetched_at"], "%Y-%m-%dT%H:%M:%SZ")
+            master = age > datetime.timedelta(days=1)
+        except (TypeError, ValueError):
+            master = True
+    return master, old["last_circular_check"] != today.isoformat()
+
+
+def print_calendar_summary(cal, today):
+    ahead = [k for k in sorted(cal["holidays"]) if k > today.isoformat()][:3]
+    print("years %s, %d holiday(s), %d special session(s)%s." % (
+        ", ".join(str(y) for y in cal["years"]) or "none", len(cal["holidays"]), len(cal["special_sessions"]),
+        ("; next: " + ", ".join("%s %s" % (k, cal["holidays"][k]) for k in ahead)) if ahead else ""))
+
+
+def cmd_calendar(a):
+    now = parse_now(a.now)
+    today = now.date()
+    path = os.path.join(a.data, CALENDAR_FILE)
+    old = load_calendar(a.data)
+    if old is None and os.path.exists(path):
+        print("calendar.json is unreadable; building it again from NSE.")
+    need_master, need_circ = calendar_needs(old, today, now, a.refresh)
+    if not (need_master or need_circ):
+        print("calendar.json is current: holiday list fetched %s, circulars checked %s." % (
+            old["fetched_at"], old["last_circular_check"]))
+        print_calendar_summary(old, today)
+        return 0
+    sess, errors, master, circ = Session(a.data), [], None, None
+    if need_master:
+        try:
+            master = parse_holiday_master(nse_api(sess, "/api/holiday-master?type=trading", CAL_REFERER))
+        except (SourceError, DataError) as e:
+            errors.append("holiday list: %s" % e)
+    checked_from = today - datetime.timedelta(days=CIRCULAR_FIRST_DAYS)
+    if old and old["last_circular_check"]:
+        try:
+            checked_from = min(today, parse_date(old["last_circular_check"]))
+        except DataError:
+            pass
+    if need_circ:
+        url = "/api/circulars?from_date=%s&to_date=%s&dept=CMTR" % (
+            checked_from.strftime("%d-%m-%Y"), today.strftime("%d-%m-%Y"))
+        try:
+            circ = parse_circulars(nse_api(sess, url, CAL_REFERER))
+        except (SourceError, DataError) as e:
+            errors.append("circulars: %s" % e)
+    for e in errors:
+        print("  " + e)
+    if master is None and circ is None:
+        print("calendar not updated; %s." % (
+            "the built-in tables stay in force (2024 to 2026)" if old is None else "calendar.json is left as it was"))
+        return 1
+    new = merge_calendar(old, master, circ, now, checked_from)
+    _write_json(path, new)
+    bits = []
+    if master:
+        bits.append("holiday list %s" % ", ".join(str(y) for y in sorted(master[2])))
+    if circ:
+        bits.append("circulars %s to %s" % (checked_from, today))
+    print("Wrote %s (%s)." % (path, "; ".join(bits)))
+    changes = calendar_changes(old, new)
+    for line in changes[:40]:
+        print(line)
+    if len(changes) > 40:
+        print("  ... and %d more" % (len(changes) - 40))
+    if not changes:
+        print("  nothing changed.")
+    if master:
+        for line in builtin_disagreement(new, master[2]):
+            print("  differs from the built-in table, %s" % line)
+    for w in new["warnings"][len(old["warnings"]) if old else 0:]:
+        print("  warning: " + w)
+    print_calendar_summary(new, today)
+    return 1 if errors else 0
+
+
 # ---------------------------------------------------------------- doctor
 
 def probes(now_ist):
@@ -1412,6 +2122,10 @@ def probes(now_ist):
         ("yahoo-q2", "price", yahoo_url(YAHOO_HOSTS[1], "RELIANCE", "1d", rng="5d"), "yahoo"),
         ("nse-home", "gate", NSE + "/", "html"),
         ("nse-api", "price", NSE + "/api/quote-equity?symbol=RELIANCE", "nse"),
+        ("nse-holidays", "cal", NSE + "/api/holiday-master?type=trading", "holidays"),
+        ("nse-circulars", "cal", NSE + "/api/circulars?from_date=%s&to_date=%s&dept=CMTR" % (
+            (now_ist.date() - datetime.timedelta(days=7)).strftime("%d-%m-%Y"), now_ist.strftime("%d-%m-%Y")),
+         "circulars"),
         ("nsearchives", "price", bhav_urls(bd)[0], "bhav"),
         ("niftyindices", "list", NIFTY_LIST, "csv"),
         ("google-news", "news", GNEWS, "rss"),
@@ -1435,6 +2149,14 @@ def check_body(kind, code, body):
             return "priceInfo" in json.loads(body), ""
         except ValueError:
             return False, "not JSON (bot wall)"
+    if kind in ("holidays", "circulars"):
+        try:
+            doc = json.loads(body)
+            if kind == "holidays":
+                return bool(isinstance(doc, dict) and doc.get("CM")), "no CM holiday list in the answer"
+            return isinstance(doc.get("data"), list), "no data list in the answer"
+        except (ValueError, AttributeError):
+            return False, "not JSON (bot wall)"
     if kind == "bhav":
         return "SYMBOL" in text.upper(), "not a bhavcopy"
     if kind == "csv":
@@ -1446,7 +2168,7 @@ def check_body(kind, code, body):
 
 def cmd_doctor(a):
     now = parse_now(a.now)
-    sess = Session()
+    sess = Session(a.data)
     results = {}
     print("%-13s %-6s %-5s %8s  %s" % ("source", "kind", "ok", "latency", "error / hint"))
     for name, kind, url, check in probes(now):
@@ -1458,7 +2180,9 @@ def cmd_doctor(a):
                 hdr["Range"] = "bytes=0-2047"
             if name == "nse-api":
                 hdr.update({"Accept": "application/json", "Referer": NSE + "/get-quotes/equity?symbol=RELIANCE"})
-            code, body = sess.get(url, hdr, timeout=a.timeout, gap=0)
+            if check in ("holidays", "circulars"):
+                hdr.update({"Accept": "application/json", "Referer": CAL_REFERER, "X-Requested-With": "XMLHttpRequest"})
+            code, body = sess.get(url, hdr, timeout=a.timeout, gap=0, retries=0)   # a probe reports the first answer
             ok, why = check_body(check, code, body)
             if not ok:
                 err = hint(name, code) if code not in (200, 206) else why
@@ -1571,6 +2295,19 @@ def cmd_status(a):
             _, bars = read_intraday(os.path.join(idir, f))
             days = sorted(set(ts_to_ist(b[0]).date() for b in bars))
             print("%-22s %5d bars, %d session(s), last %s" % (f, len(bars), len(days), days[-1] if days else "-"))
+    tracked = tracked_symbols(a.data)
+    if tracked:
+        print("delivery/: %d symbol file(s); pending days: %s" % (
+            len(tracked), ", ".join(d.isoformat() for d in sorted(read_pending(a.data))) or "none"))
+    cal = _CAL
+    if cal:
+        print("calendar.json: years %s, %d holiday(s), fetched %s, circulars checked %s" % (
+            ", ".join(str(y) for y in cal["years"]) or "none", len(cal["holidays"]), cal["fetched_at"],
+            cal["last_circular_check"]))
+    else:
+        print("calendar.json: none (built-in tables cover %s)" % ", ".join(str(y) for y in CALENDAR_YEARS))
+    if not calendar_known(now.year):
+        print("  no holiday list for %d: run data.py calendar" % now.year)
     b = _read_json(os.path.join(a.data, "bands.json"), None)
     if b:
         print("bands.json as of %s: %d known, unknown: %s" % (b.get("as_of"), len(b.get("bands") or {}),
@@ -1634,6 +2371,14 @@ def main(argv=None):
     p.add_argument("--adjusted", action="store_true", help="the file is split/bonus adjusted: write .adj.csv")
     p.add_argument("--drop-bad", action="store_true", help="skip bars that fail OHLC checks")
     p.add_argument("--replace", action="store_true", help="replace the cache instead of merging")
+    p = sub.add_parser("delivery", help="delivery analytics: DQ, TQ, VOL and the institutional money flag")
+    common(p)
+    p.add_argument("symbols", nargs="*", help="default: every symbol with a delivery file")
+    p.add_argument("--window", type=int, default=DELIVERY_WINDOW, help="sessions for the means (default 30)")
+    p.add_argument("--no-fetch", action="store_true", help="use the cached delivery files only")
+    p = sub.add_parser("calendar", help="refresh the NSE holiday calendar (calendar.json)")
+    common(p)
+    p.add_argument("--refresh", action="store_true", help="refetch the holiday list and the circulars now")
     p = sub.add_parser("doctor", help="probe every source")
     common(p)
     p.add_argument("--timeout", type=float, default=10)
@@ -1650,16 +2395,20 @@ def main(argv=None):
     if not a.cmd:
         ap.print_help()
         return 1
+    global _CAL
+    saved, _CAL = _CAL, load_calendar(a.data)
     try:
         return {"daily": cmd_daily, "intraday": cmd_intraday, "bands": cmd_bands, "import-kite": cmd_import_kite,
-                "import-csv": cmd_import_csv, "doctor": cmd_doctor, "record": cmd_record,
-                "status": cmd_status}[a.cmd](a)
+                "import-csv": cmd_import_csv, "calendar": cmd_calendar, "delivery": cmd_delivery,
+                "doctor": cmd_doctor, "record": cmd_record, "status": cmd_status}[a.cmd](a)
     except DataError as e:
         print("data.py: %s" % e, file=sys.stderr)
         return 1
     except OSError as e:
         print("data.py: %s" % e, file=sys.stderr)
         return 1
+    finally:
+        _CAL = saved
 
 
 if __name__ == "__main__":

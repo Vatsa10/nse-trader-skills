@@ -1,0 +1,17 @@
+{
+ "CM": [
+  {"Sr_no": 1, "tradingDate": "26-Jan-2027", "weekDay": "Tuesday", "description": "Republic Day"},
+  {"Sr_no": 2, "tradingDate": "14-Feb-2027", "weekDay": "Sunday", "description": "Weekend sample entry"},
+  {"Sr_no": 3, "tradingDate": "22-Mar-2027", "weekDay": "Monday", "description": "Holi"},
+  {"Sr_no": 4, "tradingDate": "26-Mar-2027", "weekDay": "Friday", "description": "Good Friday"},
+  {"Sr_no": 5, "tradingDate": "15-Aug-2027", "weekDay": "Sunday", "description": "Independence Day"},
+  {"Sr_no": 6, "tradingDate": "29-Oct-2027", "weekDay": "Friday", "description": "Diwali Laxmi Pujan*"},
+  {"Sr_no": 7, "tradingDate": "25-Dec-2027", "weekDay": "Saturday", "description": "Christmas"},
+  {"Sr_no": 8, "tradingDate": "not a date", "weekDay": "", "description": "Unreadable row"}
+ ],
+ "FO": [
+  {"Sr_no": 1, "tradingDate": "26-Jan-2027", "weekDay": "Tuesday", "description": "Republic Day"},
+  {"Sr_no": 2, "tradingDate": "01-Apr-2027", "weekDay": "Thursday", "description": "F and O only sample"}
+ ],
+ "CD": []
+}
