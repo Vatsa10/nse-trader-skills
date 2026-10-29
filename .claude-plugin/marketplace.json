@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "nse-trader-skill",
+  "description": "NSE (India) port of the Day Trader skill pack",
+  "owner": {
+    "name": "Jake Schincariol",
+    "url": "https://opusjake.ai"
+  },
+  "plugins": [
+    {
+      "name": "nse-trader-skill",
+      "description": "Thirteen Claude skills for NSE: data layer with fallbacks, chart scanner, news, entry timer, exit planner, time machine, risk and budget managers, Zerodha Kite order executor (paper by default, never without your yes), alerts, long-term analyst, multi-year backtester and portfolio manager.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "name": "nse-trader-skill",
+  "description": "13 Claude skills for NSE trading and long-term investing: scan Nifty 500 charts, time entries and exits, analyse fundamentals, backtest years of data and manage your portfolio before you risk a rupee.",
+  "version": "4.0.0-nse",
+  "author": {
+    "name": "Jake Schincariol",
+    "url": "https://opusjake.ai"
+  },
+  "license": "MIT",
+  "keywords": [
+    "backtest",
+    "backtesting",
+    "claude-code",
+    "claude-skills",
+    "day-trading",
+    "fundamentals",
+    "india",
+    "long-term-investing",
+    "nse",
+    "opening-range-breakout",
+    "paper-trading",
+    "portfolio",
+    "stock-market",
+    "zerodha"
+  ],
+  "skills": "./"
+}
