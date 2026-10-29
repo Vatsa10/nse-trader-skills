@@ -6,11 +6,13 @@ description: >-
   (SYMBOL.NS), Google News India search results for the company, and how far
   each stock is from yesterday's close in ₹. Shows only what is new since the
   last check, newest first, in IST, tags each item (earnings, analyst, deal,
-  capital, circuit/halt, regulatory, macro...) and never repeats one. Use
-  when the user says "any news on RELIANCE", "why is HINDCOPPER moving",
+  capital, circuit/halt, regulatory, macro...) and never repeats one. Also
+  reads NSE bulk deals, block deals and short-selling disclosures on your
+  symbols (size against the 20-day average volume, net buying per client).
+  Use when the user says "any news on RELIANCE", "why is HINDCOPPER moving",
   "what's the news on my watchlist", "morning briefing", "pre-market news",
-  "monitor the news", "did anything break", or after /trader-scanner finds
-  setups.
+  "monitor the news", "did anything break", "any bulk deals", "block deals",
+  "who is buying", or after /trader-scanner finds setups.
 argument-hint: "[symbols]"
 ---
 
@@ -28,6 +30,7 @@ Tool in this folder (standard library Python, no keys):
 python3 "${CLAUDE_SKILL_DIR}/news.py"                         # watchlist + plan + portfolio
 python3 "${CLAUDE_SKILL_DIR}/news.py" --tickers RELIANCE HDFCBANK --hours 12
 python3 "${CLAUDE_SKILL_DIR}/news.py" --no-google --json
+python3 "${CLAUDE_SKILL_DIR}/news.py" --deal-days 90          # deals window (default 30; --no-deals skips)
 ```
 
 ## What it reads and writes
@@ -41,6 +44,8 @@ python3 "${CLAUDE_SKILL_DIR}/news.py" --no-google --json
 | Google News RSS (India) | `https://news.google.com/rss/search?q=<COMPANY or SYMBOL>+NSE&hl=en-IN&gl=IN&ceid=IN:en` (`--no-google` to skip) |
 | Yahoo Finance chart endpoint | the last price against yesterday's close (unofficial, can lag). query1 first, then query2 |
 | NSE corporate announcements | when both headline feeds fail for a symbol (or with `--nse`): a cookie-primed session, `https://www.nseindia.com/` first, then `https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=RELIANCE`. Results, board meetings, outcomes: the primary source |
+| NSE bulk, block and short-selling deals | `https://www.nseindia.com/api/historicalOR/bulk-block-short-deals?optionType=bulk_deals&from=DD-MM-YYYY&to=DD-MM-YYYY` (also `block_deals`, `short_selling`): three requests per run for the whole `--deal-days` window, not one per symbol, then filtered to your symbols. Same cookie-primed NSE session as the announcements |
+| `trader/data/daily/<SYMBOL>.adj.csv` (else `.csv`) | `date,open,high,low,close,volume`: the 20-day average volume a deal is measured against |
 | `trader/data/intraday/<SYMBOL>-5m.json`, `trader/data/daily/<SYMBOL>.csv` | the trader-data cache: the move when Yahoo's chart fails (or with `--cache`), with "using cached data from <time>" |
 | `trader/state/news.json` | what has been shown (kept 30 days) |
 
@@ -56,6 +61,26 @@ then means "could not look", not "nothing happened". For the price move with
 no live data, the error names the way out: `python3 trader-data/data.py
 doctor`, or the Kite MCP `get_historical_data` then `data.py import-kite`.
 
+## Bulk, block and short-selling deals
+
+Deals on your symbols arrive as ordinary items tagged `deal`: new since the
+last check, newest first, IST, never repeated. NSE gives a date, not a time,
+so a deal is stamped 15:30 IST of its day. The title says who did what:
+`Bulk deal: ALPHA GROWTH FUND bought 1,000,000 shares at ₹1,350.50 [2.50% of
+20-day avg volume, LARGE]`. The percent needs the trader-data cache; without
+it the deal prints with no percent. **LARGE** is 1 % or more of the 20-day
+average volume. Short-selling rows name no client.
+
+Under the items, `Net deals by client` lists bought minus sold per named
+client over the window, for the symbols with a deal shown (all with `--all`;
+`--json` always has `deal_flow`). A big net buyer is a lead, not a signal:
+say who, how much, and that the filing does not say why.
+
+An empty deal list is normal (most days have nothing on a given stock). If NSE
+blocks (HTTP 401/403 or a block page), the session is primed once more, and if
+it still refuses you get one note line; headlines and moves still print, and
+the deals are simply "not checked", which is not "none".
+
 ## The rules
 
 - **Headlines are leads, not facts.** Before telling the user something
@@ -64,7 +89,9 @@ doctor`, or the Kite MCP `get_historical_data` then `data.py import-kite`.
 - **Exchange filings beat headlines.** Results, board meetings, dividends,
   bonus and fundraising are announced on nseindia.com (Corporate
   announcements). If a headline matters, check the company's announcement
-  there before relying on it. This tool does not scrape NSE.
+  there before relying on it. This tool reads NSE's JSON endpoints politely
+  (cookie-primed session, spacing between calls, one re-prime) and never
+  scrapes pages.
 - **Say what it touches.** Every item lists the symbols it touches and its
   tags: earnings, analyst, legal, deal, capital (dividend, bonus, QIP, OFS,
   block deal), people, risk, halt (upper/lower circuit, ASM/GSM, suspension),
@@ -109,7 +136,8 @@ When a symbol has no news, say so rather than padding the brief.
 - Never invents or embellishes a story, a quote or a number.
 - Never trades on news, and never tells the user to buy or sell because of a
   headline.
-- Never hammers a server: one request per feed per symbol, half a second apart.
+- Never hammers a server: one request per feed per symbol, half a second
+  apart; the deals are three requests for the whole run.
 
 ## Safety
 

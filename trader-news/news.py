@@ -37,11 +37,30 @@ https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=<SYMB
 If NSE refuses too, it prints the pages to open by hand. Open an
 announcement before acting.
 
+Bulk, block and short-selling deals (NSE, one fetch per type for the whole
+date range, then filtered to your symbols): shown as items tagged "deal", new
+since the last check like any other, with the quantity as a percent of the
+20-day average volume from trader/data/daily/<SYMBOL>.adj.csv (or .csv) and a
+LARGE flag at 1 % or more, plus the net bought minus sold per named client over
+the window (--deal-days, default 30):
+https://www.nseindia.com/api/historicalOR/bulk-block-short-deals?optionType=bulk_deals&from=DD-MM-YYYY&to=DD-MM-YYYY
+(also block_deals, short_selling). An empty list is normal. --no-deals skips it.
+
+Results calendar: NSE's board meetings per symbol,
+https://www.nseindia.com/api/corporate-board-meetings?index=equities&symbol=<SYMBOL>
+A purpose with "financial results" is a results date, with "dividend" a dividend
+board date. A results date within 2 NSE sessions (weekends excluded, plus the
+holidays in trader/data/calendar.json when it exists) prints RESULTS SOON at the
+top: an overnight gap can jump past an intraday stop. --no-calendar skips it.
+
+Both ride the NSE session above (one re-prime on a 401/403 or a non-JSON block
+page, then a one-line note; the other sources still print).
+
 Times print in IST (UTC+05:30). State: trader/state/news.json remembers what
 you have seen (30 days), so an item shows once. Offline: --offline DIR reads
-yahoo-<SYMBOL>.xml, google-<SYMBOL>.xml, nse-<SYMBOL>.json and
-chart-<SYMBOL>.json from DIR.
-The tests use it.
+yahoo-<SYMBOL>.xml, google-<SYMBOL>.xml, nse-<SYMBOL>.json, chart-<SYMBOL>.json,
+meetings-<SYMBOL>.json and deals-<bulk_deals|block_deals|short_selling>.json
+from DIR. The tests use it.
 
 Headlines are leads, not facts: open the story before acting, and treat
 nothing here as advice.
@@ -72,6 +91,14 @@ BACKOFF = 5.0
 NSE_HOME = "https://www.nseindia.com/"
 NSE_API = "https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=%s"
 NSE_QUOTE = "https://www.nseindia.com/get-quotes/equity?symbol=%s"
+NSE_DEALS = "https://www.nseindia.com/api/historicalOR/bulk-block-short-deals?optionType=%s&from=%s&to=%s"
+NSE_MEETINGS = "https://www.nseindia.com/api/corporate-board-meetings?index=equities&symbol=%s"
+DEAL_KINDS = (("bulk_deals", "Bulk deal"), ("block_deals", "Block deal"), ("short_selling", "Short selling"))
+DEAL_DAYS = 30      # the window the deals are fetched and netted over (NSE allows up to 365)
+DEAL_PCT = 1.0      # a deal this big, as a percent of the 20-day average volume, is flagged LARGE
+DEAL_CLOSE = (15, 30)   # deals carry a date only; they are stamped at the close, IST
+RESULTS_SOON = 2    # results this many NSE sessions away (or fewer) are a gap risk
+CALENDAR_DAYS = 30  # board-meeting dates further out than this are left off the briefing
 DATA_DIR = os.path.join("trader", "data")
 DATA_HINT = ("run `python3 trader-data/data.py doctor`; or call Kite MCP get_historical_data and "
              "`python3 trader-data/data.py import-kite`")
@@ -96,6 +123,10 @@ KEYWORDS = [
 
 class NewsError(Exception):
     pass
+
+
+class NseWall(NewsError):
+    """NSE's bot wall: HTTP 401/403. One fresh session is worth a try."""
 
 
 # ---------------------------------------------------------------- time
@@ -172,10 +203,29 @@ class Fetcher(object):
             raise NewsError("could not reach %s: %s" % (url, exc))
 
     def get_nse(self, ticker):
-        """NSE corporate announcements for one symbol: a cookie-primed session (the
-        home page first, as a browser does), then the JSON API."""
+        """NSE corporate announcements for one symbol (see nse_json)."""
+        return self.nse_json(NSE_API % urllib.parse.quote(ticker), "nse-%s.json" % ticker, ticker)
+
+    def nse_json(self, url, name, ticker):
+        """One NSE API call on the cookie-primed session (the home page first, as a
+        browser does). A 401/403 or a body that is not JSON is NSE's bot wall: the
+        session is dropped and primed again, once; then it raises."""
         if self.offline:
-            return self.get(None, "nse-%s.json" % ticker)
+            return self.get(None, name)
+        for attempt in (0, 1):
+            try:
+                data = self._nse_get(url, ticker)
+                json.loads(data.decode("utf-8"))   # a block page is HTML
+                return data
+            except (ValueError, NseWall):
+                self._nse = None
+                if attempt:
+                    raise NewsError("NSE keeps refusing (a block page or HTTP 401/403 even after a fresh session)")
+
+    def _nse_get(self, url, ticker):
+        gap = time.time() - self._last   # polite: spaced from whatever call came before
+        if gap < self.pause:
+            time.sleep(self.pause - gap)
         headers = {"User-Agent": BROWSER_UA, "Accept": "application/json, text/plain, */*",
                    "Accept-Language": "en-IN,en;q=0.9", "Referer": NSE_QUOTE % urllib.parse.quote(ticker)}
         try:
@@ -183,8 +233,8 @@ class Fetcher(object):
                 self._nse = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
                 self._nse.open(urllib.request.Request(NSE_HOME, headers=dict(headers, Accept="text/html")),
                                timeout=30).read()
-            time.sleep(self.pause)
-            url = NSE_API % urllib.parse.quote(ticker)
+                time.sleep(self.pause)
+            self._last = time.time()
             with self._nse.open(urllib.request.Request(url, headers=headers), timeout=30) as resp:
                 data = resp.read()
                 if resp.headers.get("Content-Encoding") == "gzip":
@@ -192,6 +242,8 @@ class Fetcher(object):
                 return data
         except urllib.error.HTTPError as exc:
             self._nse = None
+            if exc.code in (401, 403):
+                raise NseWall("NSE answered HTTP %s" % exc.code)
             raise NewsError("NSE answered HTTP %s" % exc.code)
         except (urllib.error.URLError, OSError) as exc:
             self._nse = None
@@ -332,6 +384,154 @@ def parse_nse(data, ticker):
     return out
 
 
+def _rows(data, what):
+    """An NSE JSON body (a list, or {"data": [...]}) -> its rows; an empty list is fine."""
+    try:
+        doc = json.loads(data.decode("utf-8") if isinstance(data, bytes) else data)
+    except ValueError:
+        raise NewsError("NSE sent something that is not JSON for %s (maybe a block page)" % what)
+    rows = doc.get("data") if isinstance(doc, dict) else doc
+    if not isinstance(rows, list):
+        raise NewsError("NSE's %s are not the shape this tool knows" % what)
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def parse_date(value):
+    """NSE date text (07-Oct-2026, 07-10-2026, 2026-10-07, any with a time after) -> date or None."""
+    value = str(value or "").strip()
+    for text in (value, value.split(" ")[0], value.split("T")[0]):
+        for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d"):
+            try:
+                return _dt.datetime.strptime(text, fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
+def _qty(value):
+    try:
+        return int(float(str(value).replace(",", "").strip()))
+    except ValueError:
+        return None
+
+
+def parse_deals(data, kind):
+    """NSE bulk/block/short-selling JSON -> [{"kind", "symbol", "date", "client", "side", "qty", "price",
+    "remarks"}]. Bulk and block rows are BD_*; short selling rows are SS_* and name no client."""
+    out = []
+    for r in _rows(data, "%s deals" % kind):
+        sym = str(r.get("BD_SYMBOL") or r.get("SS_SYMBOL") or "").strip().upper()
+        qty = _qty(r.get("BD_QTY_TRD", r.get("SS_QTY")))
+        if not sym or not qty:
+            continue
+        side = str(r.get("BD_BUY_SELL") or "").strip().upper()[:1]
+        try:
+            price = float(str(r.get("BD_TP_WATP")).replace(",", ""))
+        except ValueError:
+            price = None
+        remarks = " ".join(str(r.get("BD_REMARKS") or "").split())
+        out.append({"kind": kind, "symbol": sym, "date": parse_date(r.get("BD_DT_DATE") or r.get("SS_DATE")),
+                    "client": " ".join(str(r.get("BD_CLIENT_NAME") or "").split()) or None,
+                    "side": {"B": "BUY", "S": "SELL"}.get(side), "qty": qty, "price": price,
+                    "remarks": "" if remarks == "-" else remarks})
+    return out
+
+
+def avg_volume(sym, before=None, days=20, cache=None):
+    """The 20-day average volume from the trader-data cache (.adj.csv first, then .csv), over
+    the sessions before the date given (else the latest ones); None when there is no cache."""
+    cache = {} if cache is None else cache
+    if sym not in cache:
+        cache[sym] = None
+        for name in ("%s.adj.csv", "%s.csv"):
+            path = os.path.join(DATA_DIR, "daily", name % sym)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    cache[sym] = [(r["date"], float(r["volume"])) for r in csv.DictReader(fh)
+                                  if (r.get("volume") or "").strip()]
+                break
+            except (OSError, ValueError, KeyError):
+                continue
+    rows = cache[sym]
+    if not rows:
+        return None
+    vols = [v for d, v in rows if before is None or d < before.isoformat()] or [v for d, v in rows]
+    vols = vols[-days:]
+    avg = sum(vols) / len(vols)
+    return avg if avg > 0 else None
+
+
+def deal_items(rows, watch):
+    """Deal rows on your symbols -> items tagged "deal" (the same shape the feeds give), each with
+    its quantity as a percent of the 20-day average volume when the cache has one."""
+    cache, out = {}, []
+    for d in rows:
+        if d["symbol"] not in watch:
+            continue
+        avg = avg_volume(d["symbol"], d["date"], cache=cache)
+        pct = round(d["qty"] / avg * 100, 2) if avg else None
+        large = pct is not None and pct >= DEAL_PCT
+        if d["side"]:
+            what = "%s %s shares" % ({"BUY": "bought", "SELL": "sold"}[d["side"]], format(d["qty"], ","))
+            if d["client"]:
+                what = "%s %s" % (d["client"], what)
+        else:
+            what = "%s shares disclosed short" % format(d["qty"], ",")
+        title = "%s: %s%s%s%s" % (d["kind"], what, (" at " + inr(d["price"])) if d["price"] else "",
+                                  (" (%s)" % d["remarks"]) if d["remarks"] else "",
+                                  (" [%.2f%% of 20-day avg volume%s]" % (pct, ", LARGE" if large else ""))
+                                  if pct is not None else "")
+        when = None
+        if d["date"]:
+            when = (_dt.datetime.combine(d["date"], _dt.time(*DEAL_CLOSE)) - IST).replace(tzinfo=_dt.timezone.utc)
+        key = "|".join(str(x) for x in (d["kind"], d["date"], d["symbol"], d["client"], d["side"], d["qty"], d["price"]))
+        out.append({"id": "deal:" + key, "source": "NSE", "kind": "deal", "ticker": d["symbol"], "title": title,
+                    "summary": "", "link": "", "time": when,
+                    "deal": {"kind": d["kind"], "client": d["client"], "side": d["side"], "qty": d["qty"],
+                             "price": d["price"], "date": d["date"].isoformat() if d["date"] else None,
+                             "pct_of_avg_volume": pct, "large": large}})
+    return out
+
+
+def deal_flow(rows, watch):
+    """Net bought minus sold per named client per symbol over the fetched window (bulk and block
+    deals; short selling names no one). Biggest absolute net first."""
+    net, cache, out = {}, {}, []
+    for d in rows:
+        if d["symbol"] in watch and d["client"] and d["side"]:
+            n = net.setdefault((d["symbol"], d["client"]), {"bought": 0, "sold": 0})
+            n["bought" if d["side"] == "BUY" else "sold"] += d["qty"]
+    for (sym, client), n in net.items():
+        avg = avg_volume(sym, cache=cache)
+        total = n["bought"] - n["sold"]
+        out.append({"symbol": sym, "client": client, "bought": n["bought"], "sold": n["sold"], "net": total,
+                    "pct_of_avg_volume": round(abs(total) / avg * 100, 2) if avg else None})
+    out.sort(key=lambda f: (-abs(f["net"]), f["symbol"], f["client"]))
+    return out
+
+
+def fetch_deals(fetcher, watch, now, days=DEAL_DAYS, errors=None):
+    """One fetch per deal type for the whole date range (not per symbol), kept to your symbols.
+    An empty list is normal. If NSE blocks, one note and the rest are skipped."""
+    errors = [] if errors is None else errors
+    today = to_ist(now).date()
+    start = today - _dt.timedelta(days=max(1, min(int(days), 365)))
+    rows = []
+    for option, kind in DEAL_KINDS:
+        url = NSE_DEALS % (option, start.strftime("%d-%m-%Y"), today.strftime("%d-%m-%Y"))
+        try:
+            rows += [d for d in parse_deals(fetcher.nse_json(url, "deals-%s.json" % option, next(iter(sorted(watch)))),
+                                            kind) if d["symbol"] in watch]
+        except NewsError as exc:
+            if fetcher.offline and "no file" in str(exc):
+                continue
+            errors.append("NSE bulk/block/short-selling deals: %s; deals not checked, the rest is unaffected" % exc)
+            break
+    return rows
+
+
 def manual_links(ticker):
     q = urllib.parse.quote(ticker)
     return ("open by hand: %s (NSE announcements), https://finance.yahoo.com/quote/%s.NS/news, "
@@ -445,6 +645,8 @@ def tag(items, watch):
                 touches.add(t)
         it["touches"] = sorted(touches)
         it["tags"] = [label for label, rx in KEYWORDS if re.search(rx, hay, re.I)]
+        if it["kind"] == "deal" and "deal" not in it["tags"]:   # a short-selling row never says "deal"
+            it["tags"].insert(0, "deal")
     return items
 
 
@@ -559,7 +761,17 @@ def render_moves(moves, move_pct=MOVE_PCT):
     return out
 
 
-def render(items, errors, now, moves=None, move_pct=MOVE_PCT):
+def render_flow(flow):
+    """Net bought minus sold per client: one line each."""
+    out = []
+    for f in flow:
+        pct = ("; %.2f%% of 20-day avg volume" % f["pct_of_avg_volume"]) if f["pct_of_avg_volume"] is not None else ""
+        out.append("  %-11s %-30s net %s shares (bought %s, sold %s%s)" % (
+            f["symbol"], f["client"][:30], format(f["net"], "+,"), format(f["bought"], ","), format(f["sold"], ","), pct))
+    return out
+
+
+def render(items, errors, now, moves=None, move_pct=MOVE_PCT, flow=None):
     out = render_moves(moves or [], move_pct)
     if out:
         out.append("")
@@ -572,8 +784,12 @@ def render(items, errors, now, moves=None, move_pct=MOVE_PCT):
         extra = []
         if it["tags"]:
             extra.append("tags: " + ", ".join(it["tags"]))
-        extra.append(it["link"])
+        if it["link"]:
+            extra.append(it["link"])
         out.append("      " + "  ".join(extra))
+    if flow:
+        out.append("Net deals by client (bought minus sold, bulk and block, over the window):")
+        out += render_flow(flow)
     for e in errors:
         out.append("note: %s" % e)
     out.append("Checked %s. Headlines are leads, not facts; open the story before acting. "
@@ -604,6 +820,9 @@ def main(argv=None):
     ap.add_argument("--move-pct", type=float, default=MOVE_PCT, help="flag a move this big (percent)")
     ap.add_argument("--offline", metavar="DIR")
     ap.add_argument("--nse", action="store_true", help="also read NSE corporate announcements for every symbol")
+    ap.add_argument("--no-deals", action="store_true", help="skip NSE bulk, block and short-selling deals")
+    ap.add_argument("--deal-days", type=int, default=DEAL_DAYS,
+                    help="deals window in days, also the net buy/sell window (max 365)")
     ap.add_argument("--cache", action="store_true",
                     help="moves from the trader-data cache (trader/data/intraday, then daily), not Yahoo")
     ap.add_argument("--now", help="ISO time, for reproducible runs (no offset = IST)")
@@ -633,16 +852,21 @@ def main(argv=None):
     errors = []
     fetcher = Fetcher(offline=args.offline)
     items = collect(fetcher, watch, state, google=not args.no_google, errors=errors, nse=args.nse)
-    items = dedupe(tag(items, watch))
+    deals = [] if args.no_deals else fetch_deals(fetcher, watch, now, args.deal_days, errors)
+    items = dedupe(tag(items + deal_items(deals, watch), watch))
     shown = select(items, state, now, hours=args.hours, show_all=args.all)
+    flow = deal_flow(deals, watch)
+    # the net view goes with the deals you are being shown (all of it with --all)
+    flow_shown = [f for f in flow if args.all or any(
+        i["kind"] == "deal" and i["ticker"] == f["symbol"] for i in shown)]
     moves = [] if args.no_moves else collect_moves(fetcher, watch, errors, cache=args.cache)
     if args.json:
         mv = [dict(m, time=m["time"].isoformat() if m.get("time") else None,
                    moving=abs(m["pct"]) >= args.move_pct) for m in moves]
         print(json.dumps({"checked": now.isoformat(), "moves": mv, "items": _json_ready(shown),
-                          "notes": errors}, indent=2, ensure_ascii=False))
+                          "deal_flow": flow, "notes": errors}, indent=2, ensure_ascii=False))
     else:
-        sys.stdout.write(render(shown, errors, now, moves, args.move_pct))
+        sys.stdout.write(render(shown, errors, now, moves, args.move_pct, flow_shown))
     if not args.dry_run:
         remember(items, state, now)
         folder = os.path.dirname(args.state)
