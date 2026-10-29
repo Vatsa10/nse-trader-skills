@@ -12,6 +12,7 @@ from _load import load, ROOT, FIX
 
 ticket = load("trader-broker", "ticket")
 check = load("trader-risk", "check")
+size = load("trader-budget", "size")
 for _m in (ticket, check):
     _m.CHARGES_FILE = ""         # the embedded defaults, whatever is in the repo's trader/
     _m.BANDS_FILE = ""
@@ -494,7 +495,7 @@ class Reconcile(unittest.TestCase):
     def test_a_rewrite_in_the_same_timestamp_tick_is_still_read(self):
         # reconcile writes the calibration and --show reads it straight after: on a coarse file clock
         # (about 15 ms on Windows) both writes carry one mtime, and an mtime-keyed cache served the old one
-        for mod in (ticket, check):
+        for mod in (ticket, check, size):
             old = {"calibration": {"factor": 1.039, "samples": 2, "updated": "2026-10-29"}}
             with open(self.charges, "w") as fh:
                 json.dump(old, fh)
