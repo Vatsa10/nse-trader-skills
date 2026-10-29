@@ -1,0 +1,16 @@
+{"records": {"timestamp": "23-Oct-2026 15:30:00", "underlyingValue": 25060.4,
+  "expiryDates": ["29-Oct-2026", "05-Nov-2026"],
+  "data": [
+    {"strikePrice": 25000, "expiryDate": "29-Oct-2026",
+     "CE": {"strikePrice": 25000, "openInterest": 1000, "changeinOpenInterest": 100, "impliedVolatility": 11.2, "lastPrice": 120.5, "totalTradedVolume": 5000},
+     "PE": {"strikePrice": 25000, "openInterest": 3000, "changeinOpenInterest": 500, "impliedVolatility": 11.9, "lastPrice": 55.0, "totalTradedVolume": 9000}},
+    {"strikePrice": 25100, "expiryDate": "29-Oct-2026",
+     "CE": {"strikePrice": 25100, "openInterest": 2000, "changeinOpenInterest": -50, "impliedVolatility": 11.0, "lastPrice": 70.0, "totalTradedVolume": 7000},
+     "PE": {"strikePrice": 25100, "openInterest": 1500, "changeinOpenInterest": 200, "impliedVolatility": 11.5, "lastPrice": 100.0, "totalTradedVolume": 4000}},
+    {"strikePrice": 25200, "expiryDate": "29-Oct-2026",
+     "CE": {"strikePrice": 25200, "openInterest": 4000, "changeinOpenInterest": 300, "impliedVolatility": 10.8, "lastPrice": 30.0, "totalTradedVolume": 8000}},
+    {"strikePrice": 25300, "expiryDate": "05-Nov-2026",
+     "CE": {"strikePrice": 25300, "openInterest": 9999999, "changeinOpenInterest": 99999, "impliedVolatility": 12.0, "lastPrice": 90.0, "totalTradedVolume": 100},
+     "PE": {"strikePrice": 25300, "openInterest": 9999999, "changeinOpenInterest": 99999, "impliedVolatility": 12.0, "lastPrice": 190.0, "totalTradedVolume": 100}}
+  ]},
+ "filtered": {"data": []}}

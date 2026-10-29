@@ -15,12 +15,20 @@ description: >-
   keeps a self-updating NSE holiday calendar (`calendar`, so 2027 and later
   work without a code change), turns the delivery file into delivery
   analytics (`delivery`: delivery quantity, trade size, the institutional
-  money flag), and records real data as test fixtures. Use when the user says "get me
+  money flag), reads NSE corporate actions (`actions`: splits, consolidations,
+  bonus issues, dividends in rupees per share) and rebuilds the split and
+  bonus adjusted `.adj.csv` exactly from them (`adjust`), keeps index levels
+  with the Nifty 50 P/E, P/B, dividend yield and India VIX (`index`), summarises
+  an index option chain (`chain`: put-call ratio, open interest walls, max
+  pain, at-the-money strike), and
+  records real data as test fixtures. Use when the user says "get me
   RELIANCE history", "update my data", "download prices", "Yahoo is not
   working", "NSE blocked me", "what is the price band / circuit limit",
-  "import this CSV", "is my data fresh", or before a backtest, an
-  investment check or a scan that needs daily bars.
-argument-hint: "[daily|intraday|bands|calendar|delivery|doctor|status] [symbol]"
+  "import this CSV", "is my data fresh", "corporate actions", "split",
+  "bonus", "adjust for the split", "ex-date", "nifty pe", "is the market
+  expensive", "vix", "option chain", "pcr", "max pain", or before a backtest,
+  an investment check or a scan that needs daily bars.
+argument-hint: "[daily|intraday|bands|calendar|delivery|actions|adjust|index|chain|doctor|status] [symbol]"
 ---
 
 # trader-data
@@ -47,6 +55,14 @@ python3 "${CLAUDE_SKILL_DIR}/data.py" delivery RELIANCE TCS               # DQ, 
 python3 "${CLAUDE_SKILL_DIR}/data.py" delivery RELIANCE --no-fetch         # from the cached delivery files only
 python3 "${CLAUDE_SKILL_DIR}/data.py" calendar                            # keep the NSE holiday calendar current
 python3 "${CLAUDE_SKILL_DIR}/data.py" calendar --refresh                   # refetch holidays and circulars now
+python3 "${CLAUDE_SKILL_DIR}/data.py" actions RELIANCE TCS                 # splits, bonus, dividends -> actions.json
+python3 "${CLAUDE_SKILL_DIR}/data.py" adjust RELIANCE TCS                  # rebuild RELIANCE.adj.csv from the raw file
+python3 "${CLAUDE_SKILL_DIR}/data.py" adjust RELIANCE --force              # also replace a Yahoo-supplied adj file
+python3 "${CLAUDE_SKILL_DIR}/data.py" index                                # NIFTY 50, NIFTY BANK, NIFTY 500, India VIX + Nifty 50 P/E
+python3 "${CLAUDE_SKILL_DIR}/data.py" index "NIFTY IT" --days 260         # another index; 260 snapshot files for the P/E percentile
+python3 "${CLAUDE_SKILL_DIR}/data.py" index --years 2                      # also backfill index levels (no P/E) from NSE history
+python3 "${CLAUDE_SKILL_DIR}/data.py" chain NIFTY                          # option chain: PCR, OI walls, max pain -> chain-NIFTY.json
+python3 "${CLAUDE_SKILL_DIR}/data.py" chain BANKNIFTY --expiry 29-Oct-2026
 python3 "${CLAUDE_SKILL_DIR}/data.py" status                              # cached, fresh, gaps
 python3 "${CLAUDE_SKILL_DIR}/data.py" record RELIANCE --date 2026-10-23   # real data -> test fixtures
 ```
@@ -66,6 +82,9 @@ Every command takes `--data DIR` (default `trader/data`) and `--now
 | `trader/data/cache_meta.json` | which source filled each file and when | status, record |
 | `trader/data/delivery/<SYM>.csv` | `date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series`, ascending; a value NSE did not publish is an empty cell, never 0 | scanner, invest, `delivery` |
 | `trader/data/delivery/pending.json` | `{"pending": ["2026-10-22"]}`: days whose delivery file was not published yet | data.py only |
+| `trader/data/actions.json` | corporate actions per symbol: splits, bonus, dividends (contract below) | invest, portfolio, entry, backtest, `adjust` |
+| `trader/data/index/<slug>.csv` | `date,open,high,low,close,volume,pe,pb,div_yield` per index (contract below) | invest, scanner, risk, entry |
+| `trader/data/chain-<SYMBOL>.json` | option chain summary for one expiry (contract below), intraday | entry, risk |
 | `trader/data/nse_cookies.txt` | the NSE cookie jar (Mozilla format), reused between runs | data.py only |
 | `trader/data/calendar.json` | NSE holidays and special sessions (contract below) | data, alerts, and the skills that load alerts |
 
@@ -110,6 +129,16 @@ it reports the first answer. Cookies are saved to `trader/data/nse_cookies.txt`
 (Mozilla format); expired ones are dropped on load, session cookies are kept,
 a file under 30 minutes old skips the home page prime, and a 401 primes once
 more. A cookie file that cannot be read is a cold start, never an error.
+
+Report readiness: when a bhavcopy run is about to fetch today's file (after
+18:00 IST on a trading day), it first asks `GET /api/daily-reports?key=CM` once
+per run. If `currentDate` is not today, or `CurrentDay` lists neither
+`CM-UDIFF-BHAVCOPY-CSV` nor `CM-BHAVDATA-FULL`, it says "today's bhavcopy is
+not published yet", requests nothing for today (no 404s to hammer) and exits 0;
+earlier missing sessions are still filled. Only the files that are listed are
+requested (UDiFF alone: no delivery file, so the day goes into `pending.json`).
+If the call fails or has no file list, it says so and falls back to the 18:00
+rule above. The `delivery` command skips an unlisted file the same way.
 
 Only dates after the last cached session are fetched. The last complete
 session is today after 18:00 IST on a trading day (bhavcopy is published in
@@ -199,6 +228,159 @@ Heavy delivery in big tickets is a proxy for institutional buying, a hint to
 look closer and not a signal to trade. `--no-fetch` works from the cache and
 asks NSE for nothing. Exit 1 if any symbol had no usable data.
 
+## Corporate actions and exact adjustment (`actions`, `adjust`)
+
+Only Yahoo supplies an adjusted series; bhavcopy and the NSE API are raw, so a
+split or bonus leaves a fake crash in the cache. `actions` reads NSE's
+corporate-actions feed and `adjust` rebuilds `<SYM>.adj.csv` from it, exactly.
+
+`actions SYM...` (no names: every symbol in the daily cache; `--years N` how
+far back for a symbol with no cache, default 3; `--refresh` refetches the
+whole span) asks `GET /api/corporates-corporateActions?index=equities&symbol=SYM&from_date=DD-MM-YYYY&to_date=DD-MM-YYYY`
+for explicit date ranges in chunks of 365 days, from the first cached bar to
+30 days past today (so an announced ex-date shows up as UPCOMING). The next
+run asks only for what is new: anything before the span already covered, and
+from 7 days before `fetched_through` onward; actions inside a refetched range
+are replaced, not merged, so a withdrawn one disappears. Fetched today already
+means no request. If a symbol's fetch fails its entry stays as it was.
+
+```json
+{"fetched_at": "2026-10-23T13:30:00Z",
+ "symbols": {"RELIANCE": {"from": "2023-10-23", "fetched_through": "2026-10-23", "actions": [
+   {"ex_date": "2024-10-28", "kind": "bonus", "factor": 2.0, "dividend": null,
+    "subject": "Bonus 1:1", "series": "EQ", "isin": "INE002A01018", "face_val": 10.0},
+   {"ex_date": "2026-08-14", "kind": "dividend", "factor": null, "dividend": 5.5,
+    "subject": "Final Dividend - Rs 5.50 Per Share", "series": "EQ", "isin": "INE002A01018", "face_val": 10.0}]}}}
+```
+
+- `kind` is `split`, `bonus`, `split+bonus` (the factors multiply), `dividend`
+  or `unparsed`. `factor` is what older prices are divided by (2.0 for a 1:1
+  bonus or a 2-for-1 split, 0.1 for a 1-for-10 consolidation). `dividend` is
+  rupees per share (keep them: invest and portfolio use them for yield and
+  income). An `unparsed` entry also has `"about": "split" | "bonus" | "dividend"`.
+- Only series EQ, BE, BZ; rights symbols (`-RE`), buy backs, rights issues and
+  rows with no ex-date are left out. Subjects are read after lowercasing:
+  - split, "splt" or "consolidation": from that word on, the first two numbers
+    (decimals allowed) with only letters, spaces, `/`, `-`, `.` between them;
+    factor = first / second (old face value over new);
+  - bonus with a ratio `a:b` (spaces allowed): factor = 1 + a/b. Bonus text
+    that mentions deb, pref, ncrps or dvr is not a share bonus and is skipped;
+  - dividend: the first number after `Rs` or `Re` is rupees per share.
+  A split, bonus or dividend named without a readable number is stored as
+  `unparsed` and printed as "unparsed corporate action"; no factor is guessed.
+
+`adjust SYM...` (no names: every cached symbol that has actions) rebuilds
+`<SYM>.adj.csv` from `<SYM>.csv`; the raw file is never changed.
+
+- For each action with an ex-date inside the cached span, rows dated before it
+  have open, high, low and close divided by the cumulative factor of every
+  later action, rounded to 2 decimals (no snapping to 0.05, which distorts
+  cheap stocks), and volume multiplied by it. An action whose ex-date is after
+  the last bar waits until its bars arrive.
+- Verification, per ex-date: the adjusted close on the ex-date over the adjusted
+  close before it should be 0.67 to 1.5, else "possible adjustment failure"
+  (the file is still written, the warning says check the factor). No bar on the
+  ex-date: "unverified". Duplicate dates in the raw file: refused.
+- All or nothing per symbol: any error (duplicate dates, a price that rounds
+  to 0.00) leaves the existing adj file untouched and writes nothing.
+- It also warns when the actions were fetched more than 7 days before the last
+  bar, or start later than the cache does.
+- Provenance: the adj file's source is kept in `cache_meta.json` under
+  `adjusted` (`yahoo`, `actions`, `import-csv:FILE`, `kite-mcp`; `unknown` for a
+  file from before this was tracked). A file from anything but `actions` is
+  never overwritten unless `--force`, and every run says which source the file
+  came from.
+- `daily` runs `adjust` for you after a non-Yahoo source when actions are known
+  for the symbol (and stays quiet when the adj file is Yahoo's). It never
+  fetches actions itself: run `actions` now and then, or when `daily` warns of
+  a 1/2, 1/5 or 1/10 overnight gap.
+
+## Index levels, valuation and India VIX (`index`, `trader/data/index/`)
+
+`index [NAME...]` keeps one CSV per index. The file name is the slug: the
+lowercase name with every run of characters outside a-z and 0-9 replaced by
+one `-` (`NIFTY 50` is `nifty-50.csv`, `Nifty Bank` is `nifty-bank.csv`,
+`India VIX` is `india-vix.csv`, `Nifty Financial Services 25/50` is
+`nifty-financial-services-25-50.csv`). Other skills read these files by header
+name, so the header is fixed:
+
+```
+date,open,high,low,close,volume,pe,pb,div_yield
+2026-10-23,25060,25250,25000,25200.15,360000000,25,3.5,1.27
+2026-10-23,13.4,13.6,12.7,12.95,,,,
+```
+
+Ascending dates; a value NSE shows as `-` or leaves out is an empty cell,
+never 0 (the second row is India VIX: no volume, no P/E, P/B or yield; some
+indices, such as Nifty Bank, have no valuation on some days). A new row fills
+cells in and never wipes a value that is already there.
+
+- Default indices: NIFTY 50, NIFTY BANK, NIFTY 500, and India VIX always;
+  name others in quotes (`index "NIFTY IT"`), matched by slug.
+- Daily snapshots: `https://nsearchives.nseindia.com/content/indices/ind_close_all_DDMMYYYY.csv`
+  (Index Name, the four index values, Volume, P/E, P/B, Div Yield). One file
+  holds every index, so it is fetched once for all of them. With nothing
+  cached it takes the last 30 sessions; afterwards only the sessions after the
+  last cached row. `--days N` fetches the last N sessions again (values merge),
+  `--max-days` caps a run at 300 files. A 404 for today is "not published
+  yet" and not an error (it appears in the evening); a past day with no file
+  is skipped and counted; a 403 stops the run.
+- History backfill, `--years Y`: `/api/historicalOR/indicesHistory?indexType=NIFTY 50&from=DD-MM-YYYY&to=DD-MM-YYYY`
+  in yearly chunks and `/api/historicalOR/vixhistory?from=..&to=..` (India VIX
+  goes to `india-vix.csv` with the same header). Both answer newest first and are
+  reversed to ascending. They carry only the four index values, so `pe`, `pb`
+  and `div_yield` stay empty for those days; the snapshot files are the only
+  source of P/E. The backfill asks only for the span before the first cached row.
+- Valuation line for NIFTY 50 (eod2's rule of thumb, not a signal): P/E at or
+  above 25 is expensive, at or below 20 cheap, otherwise neutral
+  (`--pe-expensive`, `--pe-cheap` change the marks; the defaults are the
+  constants `PE_EXPENSIVE` and `PE_CHEAP`). Once 250 rows with a P/E exist it
+  also prints the percentile of today's P/E among them; before that it says how
+  many it has and that `index --days 260` builds the history (about a second a
+  file). The last India VIX close is printed too.
+- Say it plainly when presenting this: valuation tells how rich the market is,
+  not when to buy or sell, and can stay high or low for years.
+
+## Option chain (`chain`, `chain-<SYMBOL>.json`)
+
+Intraday context for an index (or an F&O stock): `chain NIFTY [--expiry
+DD-Mon-YYYY]` asks `GET /api/option-chain-contract-info?symbol=NIFTY` for the
+expiry dates (nearest first; an empty or missing list is an error), then
+`GET /api/option-chain-v3?type=Indices&symbol=NIFTY&expiry=29-Oct-2026`
+(`type=Equity` for stocks; NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY and
+NIFTYNXT50 are indices). The nearest expiry is remembered in the output file
+and reused (no contract-info call) until it has passed; an expiry you name with
+`--expiry` is used as given and not remembered.
+
+```json
+{"symbol": "NIFTY", "type": "Indices", "underlying": 25060.4, "timestamp": "23-Oct-2026 15:30:00",
+ "expiry": "2026-10-29", "expiry_pick": "nearest", "fetched_at": "2026-10-23T10:30:00Z",
+ "source": "nse-option-chain", "pcr_oi": 0.6429, "pcr_change_oi": 2.0,
+ "total_call_oi": 7000, "total_put_oi": 4500, "total_call_oi_change": 350, "total_put_oi_change": 700,
+ "max_call_oi_strike": 25200.0, "max_call_oi": 4000, "max_put_oi_strike": 25000.0, "max_put_oi": 3000,
+ "atm": 25100, "strike_gap": 100.0, "max_pain": 25100.0, "strikes": 3,
+ "vix": "India VIX 12.95 on 2026-10-23 (-3.4% on the day), 1.0x its 20-session average (about normal)"}
+```
+
+- `pcr_oi` = total put OI / total call OI; `pcr_change_oi` = the same on the
+  day's change in OI (the more telling one intraday). Either is `null` when
+  the call side is 0.
+- `max_call_oi_strike` and `max_put_oi_strike` are the strikes with the most
+  call and put open interest (the usual resistance and support talk). `atm` is
+  the underlying rounded to the strike gap. `max_pain` is the strike where the
+  summed payout to option buyers is smallest, over every strike (the lowest on
+  a tie).
+- A strike with only a CE or only a PE counts the missing side as 0. Rows are
+  matched to the chosen expiry under either key NSE has used (`expiryDate` or
+  `expiryDates`); rows of another expiry are left out.
+- An empty object back (stale cookies, a bot wall) primes a fresh session and
+  asks once more; still empty gives a clear message and no file is written.
+- `vix` appears only when `index` has already written `index/india-vix.csv`.
+- Present PCR as a sentiment hint, never a signal: above about 1.2 leans
+  supportive, below about 0.7 leans weak, in between balanced. OI walls and
+  max pain are levels where positions sit, not guarantees that price stops
+  there.
+
 ## The NSE calendar (`calendar`, `calendar.json`)
 
 The built-in holiday tables stop at 2026. `data.py calendar` keeps a cache,
@@ -248,8 +430,9 @@ trader-alerts the skills that load it by path.
 ## doctor
 
 Probes Yahoo query1 and query2, the NSE home page and quote API, the NSE
-holiday-master and circulars endpoints (the calendar feeds: a changed shape
-is reported, not silently empty), the nsearchives bhavcopy, the niftyindices
+holiday-master, circulars, corporate-actions, daily-reports and option-chain contract-info endpoints (a changed shape
+is reported, not silently empty), the index snapshot archive
+(`ind_close_all_DDMMYYYY.csv`), the nsearchives bhavcopy, the niftyindices
 Nifty 500 list, Google News RSS and the Kite MCP endpoint, each with a timeout, prints a table (ok / FAIL,
 latency, error and a hint such as "403: NSE blocks this IP (cloud, VPN and
 datacenter IPs usually are); use Kite MCP or import-csv") and writes

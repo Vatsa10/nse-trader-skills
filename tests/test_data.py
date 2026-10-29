@@ -1354,6 +1354,1098 @@ class RecordStatus(Net):
         self.assertIn("4 session(s) behind", out)
 
 
+# ---------------------------------------------------------------- corporate actions and adjustment
+
+class ActionParse(unittest.TestCase):
+    def test_split_factors(self):
+        f = data.split_factor
+        self.assertEqual(f("Face Value Split (Sub-Division) - From Rs 10/- Per Share To Re 1/- Per Share"), 10.0)
+        self.assertEqual(f("Stock Split From Rs.10/- To Rs.2/-"), 5.0)
+        self.assertEqual(f("Sub-Division/ Splt From Rs 5/- Per Share To Rs 2.5/- Per Share"), 2.0)
+        self.assertAlmostEqual(f("Face Value Consolidation From Re 1/- To Rs 10/-"), 0.1)     # reverse split
+        self.assertIsNone(f("Face Value Split"))                                               # no numbers
+        self.assertIsNone(f("Face Value Split (Phase 2, from Rs 10/- to Rs 1/-)"))             # a comma between them
+        self.assertIsNone(f("Face Value Split From Rs 10/- To Rs 10/-"))                       # nothing changes
+        self.assertIsNone(f("Interim Dividend - Rs 5 Per Share"))
+
+    def test_bonus_factors(self):
+        f = data.bonus_factor
+        self.assertEqual(f("Bonus 2:1"), 3.0)
+        self.assertEqual(f("Bonus issue 3 : 2"), 2.5)
+        self.assertEqual(f("Bonus 1:1"), 2.0)
+        for text in ("Bonus 1:1 NCRPS", "Bonus Debentures 1:10", "Bonus on Preference Shares 1:2", "DVR Bonus 1:20"):
+            self.assertIsNone(f(text), text)
+        self.assertIsNone(f("Bonus Issue"))                  # no ratio: never guessed
+        self.assertIsNone(f("Buy Back"))
+
+    def test_dividends_in_rupees_per_share(self):
+        f = data.dividend_amount
+        self.assertEqual(f("Interim Dividend - Rs 30 Per Share"), 30.0)
+        self.assertEqual(f("Interim Dividend - Re 0.50 Per Share"), 0.5)
+        self.assertEqual(f("Special Dividend Rs. 2.5/- per share"), 2.5)
+        self.assertIsNone(f("Dividend - 250%"))
+        self.assertIsNone(f("Buy Back"))
+
+    def test_parse_action(self):
+        got = data.parse_action("Face Value Split From Rs 10/- To Rs 5/- and Bonus 1:1")
+        self.assertEqual((got["kind"], got["factor"]), ("split+bonus", 4.0))        # the factors multiply
+        self.assertEqual(data.parse_action("Bonus 3:2")["factor"], 2.5)
+        self.assertEqual(data.parse_action("Final Dividend - Rs 8 Per Share")["dividend"], 8.0)
+        for text in ("Buy Back", "Rights 1:5 at premium", "Bonus 1:1 NCRPS", "Annual General Meeting"):
+            self.assertIsNone(data.parse_action(text), text)
+        got = data.parse_action("Bonus Issue")
+        self.assertEqual((got["kind"], got["about"], got["factor"]), ("unparsed", "bonus", None))
+        self.assertEqual(data.parse_action("Dividend - 250%")["about"], "dividend")
+        self.assertEqual(data.parse_action("Split of shares")["kind"], "unparsed")
+        self.assertEqual(data.parse_action("Split From Rs 10 To Rs 5 and Bonus Issue")["about"], "split+bonus")
+
+    def test_feed_rows(self):
+        got = data.parse_actions_doc(json.loads(fx("nse-actions-SPLITCO.json")), "SPLITCO")
+        self.assertEqual([(x["ex_date"], x["kind"], x["factor"], x["dividend"]) for x in got],
+                         [("2026-10-06", "dividend", None, 5.0), ("2026-10-08", "split", 10.0, None),
+                          ("2026-10-13", "bonus", 2.5, None)])      # NCRPS, no ex-date, buy back and SM series left out
+        self.assertEqual((got[1]["series"], got[1]["isin"], got[1]["face_val"]), ("EQ", "INE000A01010", 1.0))
+        self.assertEqual(data.parse_actions_doc({"data": []}, "SPLITCO"), [])      # an empty list is valid
+        self.assertEqual(data.parse_actions_doc(json.loads(fx("nse-actions-SPLITCO.json")), "SPLITCO-RE"), [])
+        with self.assertRaises(data.SourceError):
+            data.parse_actions_doc({}, "SPLITCO")                                  # not a list: stale cookies
+
+    def test_ranges(self):
+        D = datetime.date
+        self.assertEqual(data.chunk_range(D(2024, 1, 1), D(2024, 12, 31)), [(D(2024, 1, 1), D(2024, 12, 30)),
+                                                                          (D(2024, 12, 31), D(2024, 12, 31))])
+        self.assertEqual(data.chunk_range(D(2024, 1, 1), D(2024, 1, 10), 4),
+                         [(D(2024, 1, 1), D(2024, 1, 4)), (D(2024, 1, 5), D(2024, 1, 8)), (D(2024, 1, 9), D(2024, 1, 10))])
+        entry = {"from": "2026-10-05", "fetched_through": "2026-10-23", "actions": []}
+        self.assertEqual(data.action_ranges(None, D(2026, 10, 5), D(2026, 10, 23)), [(D(2026, 10, 5), D(2026, 11, 22))])
+        self.assertEqual(data.action_ranges(entry, D(2026, 10, 5), D(2026, 10, 23)), [])
+        self.assertEqual(data.action_ranges(entry, D(2026, 10, 5), D(2026, 10, 30)), [(D(2026, 10, 16), D(2026, 11, 29))])
+        self.assertEqual(data.action_ranges(entry, D(2026, 9, 1), D(2026, 10, 30)),
+                         [(D(2026, 9, 1), D(2026, 10, 4)), (D(2026, 10, 16), D(2026, 11, 29))])
+        self.assertEqual(data.action_ranges(entry, D(2026, 10, 5), D(2026, 10, 30), refresh=True),
+                         [(D(2026, 10, 5), D(2026, 11, 29))])
+
+
+class AdjustRows(unittest.TestCase):
+    def rows(self, closes, start=5):
+        return [data.bar("2026-10-%02d" % (start + i), c, c + 1, c - 1, c, 1000) for i, c in enumerate(closes)]
+
+    def act(self, ex, factor, subject="Split"):
+        return {"ex_date": ex, "kind": "split", "factor": factor, "dividend": None, "subject": subject}
+
+    def test_two_decimals_and_no_snapping_to_0_05(self):
+        rows = [data.bar("2026-10-05", 12.34, 12.4, 12.3, 12.34, 100), data.bar("2026-10-06", 6.2, 6.3, 6.1, 6.2, 200)]
+        out, applied, warns = data.adjust_rows(rows, [self.act("2026-10-06", 2.0)])
+        self.assertEqual(out[0]["close"], 6.17)                 # 12.34 / 2, not snapped to 6.15
+        self.assertEqual((out[0]["open"], out[0]["volume"]), (6.17, 200))
+        self.assertEqual(out[1]["close"], 6.2)
+        self.assertEqual(warns, [])
+        self.assertEqual(applied[0][:2], ("2026-10-06", 2.0))
+
+    def test_consolidation_scales_the_old_prices_up(self):
+        out, _, warns = data.adjust_rows(self.rows([10, 10, 100, 101]), [self.act("2026-10-07", 0.1)])
+        self.assertEqual([r["close"] for r in out], [100.0, 100.0, 100.0, 101.0])
+        self.assertEqual([r["volume"] for r in out], [100, 100, 1000, 1000])
+        self.assertEqual(warns, [])
+
+    def test_a_drop_that_the_factor_does_not_explain_is_flagged(self):
+        out, applied, warns = data.adjust_rows(self.rows([100, 100, 100]), [self.act("2026-10-06", 2.0)])
+        self.assertEqual(out[0]["close"], 50.0)                 # still written: it is a warning
+        self.assertEqual(len(warns), 1)
+        self.assertIn("possible adjustment failure", warns[0])
+        self.assertIn("2.00x", warns[0])
+        self.assertAlmostEqual(applied[0][2], 2.0)
+
+    def test_no_bar_on_the_ex_date_is_unverified(self):
+        rows = self.rows([100, 100, 50, 50], start=8)          # 8, 9, 10, 11 Oct; the 10th is a Saturday
+        rows = [r for r in rows if r["date"] != "2026-10-10"]
+        out, applied, warns = data.adjust_rows(rows, [self.act("2026-10-10", 2.0)])
+        self.assertEqual(len(warns), 1)
+        self.assertIn("unverified", warns[0])
+        self.assertIsNone(applied[0][2])
+        self.assertEqual(out[0]["close"], 50.0)                 # still applied to the rows before it
+
+    def test_outside_the_span_is_not_applied(self):
+        acts = [self.act("2026-10-05", 2.0), self.act("2026-11-05", 2.0)]     # on the first bar; after the last bar
+        out, applied, warns = data.adjust_rows(self.rows([100, 100, 100]), acts)
+        self.assertEqual([r["close"] for r in out], [100.0, 100.0, 100.0])
+        self.assertEqual((applied, warns), ([], []))
+
+    def test_duplicate_dates_are_refused(self):
+        rows = self.rows([100, 100, 100])
+        rows[2]["date"] = rows[1]["date"]
+        with self.assertRaises(data.DataError) as cm:
+            data.adjust_rows(rows, [])
+        self.assertIn("duplicate dates", str(cm.exception))
+
+    def test_unparsed_split_is_a_warning_not_a_guess(self):
+        acts = [{"ex_date": "2026-10-06", "kind": "unparsed", "about": "split", "factor": None, "dividend": None,
+                 "subject": "Split of shares"},
+                {"ex_date": "2026-10-06", "kind": "unparsed", "about": "dividend", "factor": None, "dividend": None,
+                 "subject": "Dividend - 250%"}]
+        out, applied, warns = data.adjust_rows(self.rows([100, 100, 100]), acts)
+        self.assertEqual([r["close"] for r in out], [100.0] * 3)
+        self.assertEqual(applied, [])
+        self.assertEqual(len(warns), 1)                        # the dividend one does not matter here
+        self.assertIn("no number could be read", warns[0])
+
+
+class Adjust(Net):
+    NOW = "2026-10-23 19:00"
+
+    def setUp(self):
+        Net.setUp(self)
+        self.raw_p, self.adj_p, _ = data.data_paths(self.dd, "SPLITCO")
+        os.makedirs(os.path.dirname(self.raw_p))
+        shutil.copyfile(os.path.join(DFIX, "adj-raw-SPLITCO.csv"), self.raw_p)
+
+    def feed(self, body=None, code=200):
+        return self.net([("corporates-corporateActions", code, body if body is not None else fx("nse-actions-SPLITCO.json")),
+                         ("www.nseindia.com/", 200, b"<html>home</html>")])
+
+    def fetch(self, *extra):
+        self.feed()
+        code, out, err = self.run_d("actions", "SPLITCO", "--now", self.NOW, *extra)
+        self.assertEqual(code, 0, out + err)
+        return out
+
+    def meta(self):
+        return json.loads(rd(os.path.join(self.dd, "cache_meta.json")))
+
+    def test_the_eight_row_case(self):
+        self.fetch()
+        before = rd(self.raw_p)
+        code, out, err = self.run_d("adjust", "SPLITCO")
+        self.assertEqual(code, 0, out + err)
+        adj = self.daily("SPLITCO", adj=True)
+        self.assertEqual([r["close"] for r in adj], [40.0, 40.4, 40.8, 40.0, 40.4, 40.8, 40.8, 41.0])
+        # rows 1-3 are original / 10 / 2.5, rows 4-6 original / 2.5, rows 7-8 untouched
+        raw = self.daily("SPLITCO")
+        self.assertEqual([r["close"] for r in adj[:3]], [r["close"] / 10 / 2.5 for r in raw[:3]])
+        self.assertEqual([r["close"] for r in adj[3:6]], [r["close"] / 2.5 for r in raw[3:6]])
+        self.assertEqual((adj[0]["open"], adj[0]["high"], adj[0]["low"]), (39.8, 40.4, 39.6))
+        self.assertEqual((adj[5]["open"], adj[5]["high"], adj[5]["low"]), (40.4, 41.6, 40.0))
+        self.assertEqual([r["volume"] for r in adj], [25000] * 8)             # volume scaled up the same way
+        self.assertEqual(rd(self.raw_p), before)                               # the raw file is never touched
+        self.assertIn("2026-10-08 x10  verified, ratio 0.98", out)
+        self.assertIn("2026-10-13 x2.5  verified, ratio 1.00", out)
+        self.assertIn("2 action(s) applied (source: corporate actions)", out)
+        self.assertNotIn("warning", out)                                       # NCRPS bonus and dividend were ignored
+        self.assertEqual(self.meta()["adjusted"]["SPLITCO"]["source"], "actions")
+        self.assertEqual(self.meta()["adjusted"]["SPLITCO"]["applied"], ["2026-10-08", "2026-10-13"])
+
+    def test_running_it_again_is_the_same_file(self):
+        self.fetch()
+        self.run_d("adjust", "SPLITCO")
+        first = rd(self.adj_p)
+        code, out, _ = self.run_d("adjust", "SPLITCO")                        # our own file needs no --force
+        self.assertEqual(code, 0)
+        self.assertEqual(rd(self.adj_p), first)
+
+    def test_adjust_with_no_name_does_every_cached_symbol_with_actions(self):
+        self.fetch()
+        code, out, _ = self.run_d("adjust")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(os.path.exists(self.adj_p))
+        code, out, _ = self.run_d("adjust", "TCS")
+        self.assertEqual(code, 1)
+        self.assertIn("TCS: no daily cache to adjust", out)
+        self.seed("TCS", "2026-09-30")
+        code, out, _ = self.run_d("adjust", "TCS")
+        self.assertEqual(code, 1)
+        self.assertIn("run data.py actions TCS first", out)
+
+    def test_a_yahoo_adj_file_is_kept_unless_forced(self):
+        self.fetch()
+        yahoo = "date,open,high,low,close,volume\n2026-10-13,1,2,0.5,1.5,7\n"
+        wr(self.adj_p, yahoo)
+        data.note_meta(self.dd, "adjusted", "SPLITCO", {"source": "yahoo", "fetched_at": "x"})
+        code, out, _ = self.run_d("adjust", "SPLITCO")
+        self.assertEqual(code, 0)
+        self.assertIn("SPLITCO.adj.csv came from yahoo, kept as it is", out)
+        self.assertIn("--force", out)
+        self.assertEqual(rd(self.adj_p), yahoo)
+        code, out, _ = self.run_d("adjust", "SPLITCO", "--force")
+        self.assertEqual(code, 0)
+        self.assertIn("replaced the yahoo file", out)
+        self.assertEqual(self.daily("SPLITCO", adj=True)[0]["close"], 40.0)
+        self.assertEqual(self.meta()["adjusted"]["SPLITCO"]["source"], "actions")
+
+    def test_an_adj_file_of_unknown_origin_is_also_kept(self):
+        self.fetch()
+        wr(self.adj_p, "date,open,high,low,close,volume\n2026-10-13,1,2,0.5,1.5,7\n")
+        _, out, _ = self.run_d("adjust", "SPLITCO")
+        self.assertIn("came from unknown", out)
+        self.assertEqual(rd(self.adj_p).count("\n"), 2)
+
+    def test_yahoo_daily_records_where_the_adj_file_came_from(self):
+        self.net([("query1.finance.yahoo.com", 200, fx("yahoo-daily-RELIANCE.json"))])
+        self.run_d("daily", "RELIANCE", "--years", "3", "--now", self.NOW)
+        self.assertEqual(self.meta()["adjusted"]["RELIANCE"]["source"], "yahoo")
+        self.assertEqual(data.adj_source(self.dd, "RELIANCE"), "yahoo")
+
+    def test_imports_record_the_adj_source(self):
+        self.run_d("import-csv", os.path.join(DFIX, "nse-website-RELIANCE.csv"), "--symbol", "RELIANCE", "--adjusted")
+        self.assertEqual(self.meta()["adjusted"]["RELIANCE"]["source"], "import-csv:nse-website-RELIANCE.csv")
+        self.run_d("import-kite", os.path.join(DFIX, "kite-historical-RELIANCE-day.json"), "--kind", "historical",
+                   "--symbol", "RELIANCE", "--adjusted")
+        self.assertEqual(self.meta()["adjusted"]["RELIANCE"]["source"], "kite-mcp")
+
+    def test_a_problem_writes_nothing(self):
+        self.fetch()
+        self.run_d("adjust", "SPLITCO")
+        good = rd(self.adj_p)
+        # a price that rounds to 0.00 after dividing: write_daily refuses, so the old file stays
+        wr(self.raw_p, "date,open,high,low,close,volume\n2026-10-05,0.04,0.04,0.04,0.04,10\n"
+                       "2026-10-06,0.05,0.05,0.05,0.05,10\n2026-10-08,0.5,0.5,0.5,0.5,10\n"
+                       "2026-10-13,0.5,0.5,0.5,0.5,10\n")
+        code, out, _ = self.run_d("adjust", "SPLITCO")
+        self.assertEqual(code, 1)
+        self.assertIn("not adjusted", out)
+        self.assertEqual(rd(self.adj_p), good)
+        # duplicate dates in the raw file: refused as well
+        wr(self.raw_p, rd(os.path.join(DFIX, "adj-raw-SPLITCO.csv")) + "2026-10-14,40.8,42,40.6,41,25000\n")
+        code, out, _ = self.run_d("adjust", "SPLITCO")
+        self.assertEqual(code, 1)
+        self.assertIn("duplicate dates", out)
+        self.assertEqual(rd(self.adj_p), good)
+
+    def test_the_first_run_with_a_bad_file_makes_no_adj_file(self):
+        self.fetch()
+        wr(self.raw_p, rd(self.raw_p) + "2026-10-14,1,1,1,1,1\n")
+        code, _, _ = self.run_d("adjust", "SPLITCO")
+        self.assertEqual(code, 1)
+        self.assertFalse(os.path.exists(self.adj_p))
+
+    def test_a_future_ex_date_waits_for_its_bars(self):
+        body = json.loads(fx("nse-actions-SPLITCO.json"))
+        body.append({"symbol": "SPLITCO", "series": "EQ", "subject": "Bonus 1:1", "exDate": "05-Nov-2026"})
+        self.feed(json.dumps(body).encode())
+        _, out, _ = self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        self.assertIn("2026-11-05 bonus x2  UPCOMING", out)
+        _, out, _ = self.run_d("adjust", "SPLITCO")
+        self.assertIn("not applied yet: ex-date 2026-11-05 is after the last bar 2026-10-14", out)
+        self.assertEqual(self.daily("SPLITCO", adj=True)[-1]["close"], 41.0)
+
+    def test_an_unparsed_split_is_reported_and_not_applied(self):
+        self.feed(b'[{"symbol": "SPLITCO", "series": "EQ", "subject": "Bonus Issue", "exDate": "13-Oct-2026"},'
+                  b' {"symbol": "SPLITCO", "series": "EQ", "subject": "Dividend - 250%", "exDate": "06-Oct-2026"}]')
+        code, out, _ = self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        self.assertIn("warning: unparsed corporate action on 2026-10-13, never guessed: Bonus Issue", out)
+        self.assertIn("0 split/bonus, 0 dividend(s), 2 unparsed", out)
+        saved = json.loads(rd(os.path.join(self.dd, "actions.json")))["symbols"]["SPLITCO"]["actions"]
+        self.assertEqual([(x["kind"], x["about"], x["factor"]) for x in saved],
+                         [("unparsed", "dividend", None), ("unparsed", "bonus", None)])
+        _, out, _ = self.run_d("adjust", "SPLITCO")
+        self.assertIn("no number could be read in \"Bonus Issue\"", out)
+        self.assertEqual([r["close"] for r in self.daily("SPLITCO", adj=True)], [r["close"] for r in self.daily("SPLITCO")])
+
+    def test_stale_actions_are_called_out(self):
+        self.fetch()
+        far = json.loads(rd(os.path.join(self.dd, "actions.json")))
+        far["symbols"]["SPLITCO"]["fetched_through"] = "2026-10-01"
+        far["symbols"]["SPLITCO"]["from"] = "2026-10-07"
+        data._write_json(os.path.join(self.dd, "actions.json"), far)
+        _, out, _ = self.run_d("adjust", "SPLITCO")
+        self.assertIn("warning: actions were fetched through 2026-10-01", out)
+        self.assertIn("warning: actions are known only from 2026-10-07", out)
+
+    def test_daily_on_a_non_yahoo_source_rebuilds_the_adj_file(self):
+        self.seed("RELIANCE", "2026-10-21")
+        data._write_json(os.path.join(self.dd, "actions.json"), {"fetched_at": "x", "symbols": {"RELIANCE": {
+            "from": "2026-09-01", "fetched_through": "2026-10-23", "actions": [
+                {"ex_date": "2026-10-22", "kind": "split", "factor": 2.0, "dividend": None, "subject": "Split",
+                 "series": "EQ", "isin": None, "face_val": None},
+                {"ex_date": "2026-09-10", "kind": "dividend", "factor": None, "dividend": 5.0, "subject": "Dividend",
+                 "series": "EQ", "isin": None, "face_val": None}]}}})
+
+        def bhav(url):
+            name = url.rsplit("/", 1)[-1]
+            return (200, fx(name)) if os.path.exists(os.path.join(DFIX, name)) else (404, b"")
+        self.net([("sec_bhavdata_full", None, bhav), ("yahoo.com", 403, b""), ("nseindia.com", 404, b"")])
+        code, out, _ = self.run_d("daily", "RELIANCE", "--source", "bhavcopy", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertIn("RELIANCE: RELIANCE.adj.csv rebuilt from RELIANCE.csv", out)
+        self.assertIn("1 action(s) applied (source: corporate actions)", out)
+        self.assertIn("2026-10-22 x2  CHECK", out)           # the made-up bars do not halve: the check says so
+        adj = self.daily("RELIANCE", adj=True)
+        self.assertEqual((adj[0]["date"], adj[0]["close"], adj[-1]["date"]), ("2026-09-01", 592.5, "2026-10-23"))
+        self.assertEqual(self.daily("RELIANCE")[0]["close"], 1185.0)
+
+    def test_daily_without_known_actions_makes_no_adj_file(self):
+        self.seed("RELIANCE", "2026-10-21")
+        self.net([("sec_bhavdata_full_22102026", 200, fx("sec_bhavdata_full_22102026.csv")),
+                  ("sec_bhavdata_full_23102026", 200, fx("sec_bhavdata_full_23102026.csv")),
+                  ("yahoo.com", 403, b""), ("nseindia.com", 404, b"")])
+        _, out, _ = self.run_d("daily", "RELIANCE", "--source", "bhavcopy", "--now", self.NOW)
+        self.assertNotIn("rebuilt", out)
+        self.assertFalse(os.path.exists(data.data_paths(self.dd, "RELIANCE")[1]))
+
+    def test_daily_from_yahoo_never_runs_adjust(self):
+        data._write_json(os.path.join(self.dd, "actions.json"), {"fetched_at": "x", "symbols": {"RELIANCE": {
+            "from": "2023-01-01", "fetched_through": "2026-10-23", "actions": [
+                {"ex_date": "2026-01-05", "kind": "split", "factor": 9.0, "dividend": None, "subject": "Split",
+                 "series": "EQ", "isin": None, "face_val": None}]}}})
+        self.net([("query1.finance.yahoo.com", 200, fx("yahoo-daily-RELIANCE.json"))])
+        _, out, _ = self.run_d("daily", "RELIANCE", "--years", "3", "--now", self.NOW)
+        self.assertNotIn("rebuilt", out)
+        self.assertEqual(self.daily("RELIANCE", adj=True)[-1]["date"], "2024-11-08")     # Yahoo's own file
+        self.assertEqual(data.adj_source(self.dd, "RELIANCE"), "yahoo")
+
+
+class ActionsCommand(Net):
+    NOW = "2026-10-23 19:00"
+
+    def feed(self, body=None, code=200):
+        return self.net([("corporates-corporateActions", code, body if body is not None else fx("nse-actions-SPLITCO.json")),
+                         ("www.nseindia.com/", 200, b"<html>home</html>")])
+
+    def cache(self, first="2026-10-05"):
+        rows = [data.bar(first, 100, 101, 99, 100, 10), data.bar("2026-10-14", 100, 101, 99, 100, 10)]
+        data.write_daily(data.data_paths(self.dd, "SPLITCO")[0], rows)
+
+    def saved(self):
+        return json.loads(rd(os.path.join(self.dd, "actions.json")))
+
+    @staticmethod
+    def window(url):
+        return tuple(url.split(k + "=")[1].split("&")[0] for k in ("from_date", "to_date"))
+
+    def test_writes_the_contract(self):
+        self.cache()
+        f = self.feed()
+        code, out, err = self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        self.assertEqual(code, 0, out + err)
+        doc = self.saved()
+        self.assertEqual(sorted(doc), ["fetched_at", "symbols"])
+        self.assertEqual(doc["fetched_at"], "2026-10-23T13:30:00Z")
+        e = doc["symbols"]["SPLITCO"]
+        self.assertEqual((e["from"], e["fetched_through"]), ("2026-10-05", "2026-10-23"))
+        self.assertEqual(sorted(e["actions"][0]), ["dividend", "ex_date", "face_val", "factor", "isin", "kind", "series",
+                                                    "subject"])
+        self.assertEqual([(x["ex_date"], x["kind"], x["factor"], x["dividend"]) for x in e["actions"]],
+                         [("2026-10-06", "dividend", None, 5.0), ("2026-10-08", "split", 10.0, None),
+                          ("2026-10-13", "bonus", 2.5, None)])
+        self.assertEqual(len(f.urls("corporates-corporateActions")), 1)
+        url = f.urls("corporates-corporateActions")[0]
+        self.assertIn("index=equities&symbol=SPLITCO&from_date=05-10-2026&to_date=22-11-2026", url)   # explicit dates
+        hdr = [h for u, h in f.calls if "corporateActions" in u][0]
+        self.assertEqual(hdr["Accept"], "application/json, text/plain, */*")
+        self.assertIn("corporate-filings-actions", hdr["Referer"])
+        self.assertIn("2 split/bonus, 1 dividend(s), 0 unparsed", out)
+        self.assertIn("2026-10-08 split x10", out)
+        self.assertIn("2026-10-13 bonus x2.5", out)
+        self.assertIn("next: data.py adjust SPLITCO", out)
+        self.assertNotIn("NCRPS", out)
+
+    def test_long_spans_go_in_explicit_chunks(self):
+        f = self.feed(b"[]")
+        code, out, _ = self.run_d("actions", "SPLITCO", "--years", "3", "--now", self.NOW)     # no daily cache
+        self.assertEqual(code, 0, out)
+        wins = [self.window(u) for u in f.urls("corporateActions")]
+        self.assertEqual(len(wins), 4)
+        fmt = lambda s: datetime.datetime.strptime(s, "%d-%m-%Y").date()    # noqa: E731
+        self.assertEqual((fmt(wins[0][1]) - fmt(wins[0][0])).days, 364)
+        for a, b in zip(wins, wins[1:]):
+            self.assertEqual(fmt(b[0]) - fmt(a[1]), datetime.timedelta(days=1))   # contiguous, no holes
+        self.assertEqual(wins[-1][1], "22-11-2026")
+        self.assertEqual(self.saved()["symbols"]["SPLITCO"]["actions"], [])        # empty is a valid answer
+
+    def test_a_later_run_asks_only_for_the_newer_range(self):
+        self.cache()
+        self.feed()
+        self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        # same day: nothing to ask
+        f = self.net([])
+        code, out, _ = self.run_d("actions", "SPLITCO", "--now", "2026-10-23 21:00")
+        self.assertEqual((code, f.calls), (0, []))
+        self.assertIn("already fetched through 2026-10-23", out)
+        # next week: the last 7 days again, plus the lookahead, and a new action is added
+        new = [{"symbol": "SPLITCO", "series": "EQ", "subject": "Bonus 1:1", "exDate": "28-Oct-2026"}]
+        f = self.feed(json.dumps(new).encode())
+        code, out, _ = self.run_d("actions", "SPLITCO", "--now", "2026-10-30 19:00")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([self.window(u) for u in f.urls("corporateActions")], [("16-10-2026", "29-11-2026")])
+        acts = self.saved()["symbols"]["SPLITCO"]["actions"]
+        self.assertEqual([x["ex_date"] for x in acts], ["2026-10-06", "2026-10-08", "2026-10-13", "2026-10-28"])
+        self.assertEqual(self.saved()["symbols"]["SPLITCO"]["fetched_through"], "2026-10-30")
+        # the refetched range is replaced, not merged: NSE no longer lists the 28 Oct bonus
+        self.feed(b"[]")
+        self.run_d("actions", "SPLITCO", "--now", "2026-11-06 19:00")
+        acts = self.saved()["symbols"]["SPLITCO"]["actions"]
+        self.assertEqual([x["ex_date"] for x in acts], ["2026-10-06", "2026-10-08", "2026-10-13"])
+
+    def test_an_older_cache_start_fetches_the_older_range(self):
+        self.cache()
+        self.feed()
+        self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        self.cache(first="2026-10-01")
+        f = self.feed(b"[]")
+        code, _, _ = self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        self.assertEqual(code, 0)
+        self.assertEqual([self.window(u) for u in f.urls("corporateActions")], [("01-10-2026", "04-10-2026")])
+        self.assertEqual(self.saved()["symbols"]["SPLITCO"]["from"], "2026-10-01")
+        self.assertEqual(len(self.saved()["symbols"]["SPLITCO"]["actions"]), 3)     # the rest kept
+
+    def test_a_failed_fetch_leaves_the_symbol_as_it_was(self):
+        self.cache()
+        self.feed()
+        self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        before = rd(os.path.join(self.dd, "actions.json"))
+        self.feed(b"Access Denied", code=403)
+        code, out, _ = self.run_d("actions", "SPLITCO", "--now", "2026-10-30 19:00")
+        self.assertEqual(code, 1)
+        self.assertIn("corporate actions not updated", out)
+        self.assertIn("403", out)
+        self.assertEqual(rd(os.path.join(self.dd, "actions.json")), before)
+        # an object where a list belongs (stale cookies) and a bot wall page are failures too
+        for body in (b"{}", b"<html>wall</html>"):
+            self.feed(body)
+            code, out, _ = self.run_d("actions", "SPLITCO", "--now", "2026-10-30 19:00")
+            self.assertEqual(code, 1, body)
+            self.assertEqual(rd(os.path.join(self.dd, "actions.json")), before)
+
+    def test_one_bad_symbol_does_not_stop_the_others(self):
+        self.cache()
+        data.write_daily(data.data_paths(self.dd, "OKCO")[0], [data.bar("2026-10-05", 5, 6, 4, 5, 1)])
+
+        def by_symbol(url):
+            return (500, b"boom") if "symbol=SPLITCO" in url else (200, b"[]")
+        self.net([("corporateActions", None, by_symbol), ("www.nseindia.com/", 200, b"home")])
+        code, out, _ = self.run_d("actions", "--now", self.NOW)             # no names: the whole daily cache
+        self.assertEqual(code, 1)
+        self.assertIn("SPLITCO: corporate actions not updated", out)
+        self.assertEqual(list(self.saved()["symbols"]), ["OKCO"])
+
+    def test_rights_symbols_and_empty_cache(self):
+        f = self.net([])
+        code, out, _ = self.run_d("actions", "ABC-RE", "--now", self.NOW)
+        self.assertIn("rights symbol, skipped", out)
+        self.assertEqual(f.calls, [])
+        code, _, err = self.run_d("actions")
+        self.assertEqual(code, 1)
+        self.assertIn("no symbols", err)
+
+    def test_status_and_doctor_know_about_actions(self):
+        self.cache()
+        self.feed()
+        self.run_d("actions", "SPLITCO", "--now", self.NOW)
+        _, out, _ = self.run_d("status", "--now", self.NOW)
+        self.assertIn("actions.json: 1 symbol(s), 2 split/bonus", out)
+        f = self.net([("corporateActions", 200, fx("nse-actions-SPLITCO.json")), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertTrue(s["nse-actions"]["ok"])
+        self.assertIn("from_date=23-10-2025&to_date=23-10-2026", f.urls("corporateActions")[0])
+        self.net([("corporateActions", 200, b'{"not": "a list"}'), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertFalse(s["nse-actions"]["ok"])
+        self.assertIn("no list of actions", s["nse-actions"]["error"])
+
+
+# ---------------------------------------------------------------- index snapshot, valuation and India VIX
+
+INDEX_HEAD = "date,open,high,low,close,volume,pe,pb,div_yield"
+
+
+class IndexParse(unittest.TestCase):
+    def test_slug(self):
+        for name, want in (("NIFTY 50", "nifty-50"), ("Nifty Bank", "nifty-bank"), ("India VIX", "india-vix"),
+                           ("Nifty Bank / X", "nifty-bank-x"), ("Nifty Financial Services 25/50",
+                                                               "nifty-financial-services-25-50"),
+                           ("NIFTY   MIDCAP150  MOMENTUM 50", "nifty-midcap150-momentum-50"), ("S&P", "s-p")):
+            self.assertEqual(data.index_slug(name), want, name)
+
+    def test_snapshot_file(self):
+        t = data.parse_index_csv(fx("ind_close_all_22102026.csv").decode(), datetime.date(2026, 10, 22))
+        self.assertEqual(sorted(t), ["india-vix", "nifty-50", "nifty-500", "nifty-bank",
+                                     "nifty-financial-services-25-50"])
+        name, row = t["nifty-50"]
+        self.assertEqual(name, "Nifty 50")
+        self.assertEqual(row, {"date": "2026-10-22", "open": 25000.1, "high": 25100.35, "low": 24900.2,
+                               "close": 25050.4, "volume": 345000000, "pe": 24.8, "pb": 3.45, "div_yield": 1.28})
+        bank = t["nifty-bank"][1]
+        self.assertEqual((bank["pe"], bank["pb"], bank["div_yield"]), (None, None, None))     # "-" is empty, not 0
+        self.assertEqual(bank["close"], 56100.75)
+        vix = t["india-vix"][1]
+        self.assertEqual((vix["close"], vix["volume"], vix["pe"]), (13.4, None, None))
+
+    def test_not_a_snapshot(self):
+        with self.assertRaises(data.DataError):
+            data.parse_index_csv("<html>Access Denied</html>\n", datetime.date(2026, 10, 22))
+        self.assertEqual(data.parse_index_csv("", datetime.date(2026, 10, 22)), {})
+        # a row with no close is skipped, and the requested day fills a missing Index Date
+        t = data.parse_index_csv("Index Name,Closing Index Value,P/E\nNifty 50,25000,23.5\nNifty Bank,-,-\n",
+                                 datetime.date(2026, 10, 22))
+        self.assertEqual(list(t), ["nifty-50"])
+        self.assertEqual(t["nifty-50"][1]["date"], "2026-10-22")
+
+    def test_history_shapes(self):
+        rows = data.parse_index_history(json.loads(fx("nse-index-history-NIFTY50.json")))
+        self.assertEqual([(r["date"], r["close"]) for r in rows], [("2026-10-19", 24900.0), ("2026-10-21", 24990.25)])
+        self.assertEqual((rows[0]["open"], rows[0]["high"], rows[0]["low"]), (24800.0, 24950.0, 24750.0))
+        self.assertEqual((rows[0]["volume"], rows[0]["pe"]), (None, None))                    # ascending; no P/E here
+        vix = data.parse_index_history(json.loads(fx("nse-vix-history.json")))
+        self.assertEqual([(r["date"], r["close"]) for r in vix], [("2026-10-19", 13.1), ("2026-10-21", 13.2)])
+        self.assertEqual(data.parse_index_history({"data": []}), [])
+        self.assertEqual(data.parse_index_history({}), [])
+
+    def test_valuation_rule_of_thumb(self):
+        v = data.pe_verdict
+        self.assertEqual((data.PE_EXPENSIVE, data.PE_CHEAP, data.PE_MIN_ROWS), (25.0, 20.0, 250))
+        self.assertEqual(v(25.0), "expensive")
+        self.assertEqual(v(24.99), "neutral")
+        self.assertEqual(v(20.0), "cheap")
+        self.assertEqual(v(20.01), "neutral")
+        self.assertIsNone(v(None))
+        self.assertEqual(v(25.0, expensive=26), "neutral")
+
+    def rows(self, n, pe=lambda i: i):
+        days = data.index_days(datetime.date(2026, 10, 23), n)
+        return [data.index_row(d, 1, 2, 0.5, 1.5, None, pe(i), None, None) for i, d in enumerate(days)]
+
+    def test_percentile_needs_250_rows(self):
+        series = lambda i: float((i * 37) % 300 + 1)    # a permutation of 1..300; the last one is 264  # noqa: E731
+        rows = self.rows(300, series)
+        self.assertEqual(len(rows), 300)
+        self.assertEqual(rows[-1]["pe"], 264.0)
+        self.assertEqual(data.pe_percentile(rows), 88.0)
+        self.assertIsNone(data.pe_percentile(rows[-249:]))
+        self.assertIsNotNone(data.pe_percentile(rows[-250:]))
+        # rows without a P/E do not count towards the 250
+        sparse = self.rows(300, lambda i: None if i < 60 else float(i))
+        self.assertIsNone(data.pe_percentile(sparse))
+        self.assertEqual(data.pe_percentile(self.rows(300, lambda i: float(i))), 100.0)
+
+    def test_merge_never_wipes_a_value(self):
+        old = [data.index_row("2026-10-22", 1, 2, 0.5, 1.5, 7, 24.8, 3.4, 1.2)]
+        new = [data.index_row("2026-10-22", 1.1, 2, 0.5, 1.6, None, None, None, None),
+               data.index_row("2026-10-21", 1, 2, 0.5, 1.4, None, None, None, None)]
+        got = data.merge_index(old, new)
+        self.assertEqual([r["date"] for r in got], ["2026-10-21", "2026-10-22"])
+        self.assertEqual((got[1]["open"], got[1]["close"], got[1]["volume"], got[1]["pe"]), (1.1, 1.6, 7, 24.8))
+
+
+class IndexCommand(Net):
+    NOW = "2026-10-23 19:00"
+
+    def archive(self, **extra):
+        """The two snapshot fixtures; any other day is a 404. extra: {"DDMMYYYY": (code, body)}."""
+        def snap(url):
+            key = url.rsplit("_", 1)[-1].split(".")[0]
+            if key in extra:
+                return extra[key]
+            name = "ind_close_all_%s.csv" % key
+            return (200, fx(name)) if os.path.exists(os.path.join(DFIX, name)) else (404, b"")
+        return self.net([("ind_close_all", None, snap), ("www.nseindia.com/", 200, b"home")])
+
+    def csv_text(self, name):
+        return rd(data.index_path(self.dd, name))
+
+    def test_writes_the_contract(self):
+        f = self.archive()
+        code, out, err = self.run_d("index", "--days", "2", "--now", self.NOW)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.dd, "index"))),
+                         ["india-vix.csv", "nifty-50.csv", "nifty-500.csv", "nifty-bank.csv"])    # the financial 25/50 is not asked for
+        self.assertEqual(self.csv_text("NIFTY 50").splitlines(), [
+            INDEX_HEAD,
+            "2026-10-22,25000.1,25100.35,24900.2,25050.4,345000000,24.8,3.45,1.28",
+            "2026-10-23,25060,25250,25000,25200.15,360000000,25,3.5,1.27"])
+        self.assertEqual(self.csv_text("Nifty Bank").splitlines()[1:], [
+            "2026-10-22,56000,56300.5,55800.25,56100.75,150000000,,,",                  # "-" is an empty cell
+            "2026-10-23,56150,56500,56000,56400,155000000,14.5,2.4,1.05"])
+        self.assertEqual(self.csv_text("India VIX").splitlines(), [
+            INDEX_HEAD, "2026-10-22,13.1,13.8,12.9,13.4,,,,", "2026-10-23,13.4,13.6,12.7,12.95,,,,"])
+        self.assertEqual(sorted(u.rsplit("_", 1)[-1] for u in f.urls("ind_close_all")), ["22102026.csv", "23102026.csv"])
+        self.assertIn("https://nsearchives.nseindia.com/content/indices/ind_close_all_22102026.csv", f.urls("ind_close_all"))
+        self.assertIn("NIFTY 50 on 2026-10-23: P/E 25, P/B 3.5, dividend yield 1.27%", out)
+        self.assertIn("rule of thumb: P/E >= 25 expensive, <= 20 cheap, between neutral -> expensive", out)
+        self.assertIn("P/E percentile: 2 of 250 rows with a P/E", out)
+        self.assertIn("India VIX 12.95 on 2026-10-23", out)
+        self.assertIn("not a timing signal", out)
+
+    def test_default_run_with_nothing_cached_reads_the_last_sessions(self):
+        f = self.archive()
+        code, out, _ = self.run_d("index", "--now", self.NOW)
+        self.assertEqual(len(f.urls("ind_close_all")), data.INDEX_DAYS)
+        self.assertEqual(code, 0, out)                       # the 404 days in between are skipped, not fatal
+        self.assertIn("no snapshot file for 28 day(s), skipped", out)
+        self.assertEqual(len(self.csv_text("NIFTY 50").splitlines()), 3)
+
+    def test_a_later_run_fetches_only_the_new_days(self):
+        self.archive()
+        self.run_d("index", "--days", "2", "--now", self.NOW)
+        new = fx("ind_close_all_23102026.csv").replace(b"23-10-2026", b"26-10-2026")
+        f = self.archive(**{"26102026": (200, new)})
+        code, out, _ = self.run_d("index", "--now", "2026-10-26 19:00")                # Monday
+        self.assertEqual(code, 0, out)
+        self.assertEqual([u.rsplit("_", 1)[-1] for u in f.urls("ind_close_all")], ["26102026.csv"])
+        self.assertEqual([r["date"] for r in data.read_index(data.index_path(self.dd, "NIFTY 50"))],
+                         ["2026-10-22", "2026-10-23", "2026-10-26"])
+        f = self.net([])
+        code, out, _ = self.run_d("index", "--now", "2026-10-26 20:00")
+        self.assertEqual(f.calls, [])                                                  # nothing to ask
+        self.assertIn("up to date", out)
+
+    def test_named_indices(self):
+        self.archive()
+        code, out, _ = self.run_d("index", "Nifty Financial Services 25/50", "--days", "1", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.dd, "index"))),
+                         ["india-vix.csv", "nifty-financial-services-25-50.csv"])
+        self.assertEqual(self.csv_text("Nifty Financial Services 25/50").splitlines()[1],
+                         "2026-10-23,27060,27200,27000,27150,,,,")
+        _, out, _ = self.run_d("index", "NIFTY NOPE", "--days", "1", "--now", self.NOW)
+        self.assertIn("NIFTY NOPE: not in the snapshot files", out)
+        self.assertFalse(os.path.exists(data.index_path(self.dd, "NIFTY NOPE")))
+
+    def test_thresholds_are_configurable(self):
+        self.archive()
+        _, out, _ = self.run_d("index", "--days", "2", "--pe-expensive", "26", "--pe-cheap", "21", "--now", self.NOW)
+        self.assertIn("P/E >= 26 expensive, <= 21 cheap, between neutral -> neutral", out)
+
+    def test_today_before_the_evening_is_not_an_error(self):
+        self.archive(**{"23102026": (404, b"")})
+        code, out, _ = self.run_d("index", "--days", "2", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertIn("not published yet", out)
+        self.assertEqual(len(self.csv_text("NIFTY 50").splitlines()), 2)        # the 22nd is kept
+
+    def test_a_block_stops_the_run(self):
+        f = self.net([("", 403, b"Access Denied")])
+        code, out, _ = self.run_d("index", "--days", "5", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertIn("NSE blocks this IP", out)
+        self.assertEqual(len(f.urls("ind_close_all")), 1)                         # not hammered
+        self.assertFalse(os.path.exists(os.path.join(self.dd, "index")))
+
+    def test_a_bot_wall_page_is_reported(self):
+        self.net([("ind_close_all", 200, b"<html>Access Denied</html>")])
+        code, out, _ = self.run_d("index", "--days", "1", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertIn("not the index snapshot", out)
+
+    def test_history_backfill_in_yearly_chunks(self):
+        f = self.archive()
+        f = self.net([("historicalOR/indicesHistory", 200, fx("nse-index-history-NIFTY50.json")),
+                      ("historicalOR/vixhistory", 200, fx("nse-vix-history.json"))] + f.rules)
+        code, out, _ = self.run_d("index", "NIFTY 50", "--days", "2", "--years", "1", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        hist = f.urls("indicesHistory")
+        self.assertEqual(len(hist), 1)
+        self.assertIn("indexType=NIFTY%2050&from=23-10-2025&to=21-10-2026", hist[0])          # up to the first cached day
+        self.assertIn("from=23-10-2025&to=21-10-2026", f.urls("vixhistory")[0])
+        rows = data.read_index(data.index_path(self.dd, "NIFTY 50"))
+        self.assertEqual([r["date"] for r in rows], ["2026-10-19", "2026-10-21", "2026-10-22", "2026-10-23"])
+        self.assertEqual([r["pe"] for r in rows], [None, None, 24.8, 25.0])        # history has no P/E, the archive does
+        self.assertEqual(rows[0]["close"], 24900.0)
+        vix = data.read_index(data.index_path(self.dd, "India VIX"))
+        self.assertEqual([(r["date"], r["close"]) for r in vix],
+                         [("2026-10-19", 13.1), ("2026-10-21", 13.2), ("2026-10-22", 13.4), ("2026-10-23", 12.95)])
+        self.assertEqual(self.csv_text("India VIX").splitlines()[1], "2026-10-19,13.2,13.4,12.9,13.1,,,,")
+
+    def test_a_long_backfill_is_chunked_by_year(self):
+        f = self.net([("indicesHistory", 200, b'{"data": {"indexCloseOnlineRecords": []}}'),
+                      ("vixhistory", 200, b'{"data": []}'), ("ind_close_all", 404, b""),
+                      ("www.nseindia.com/", 200, b"home")])
+        code, out, _ = self.run_d("index", "NIFTY 50", "--years", "3", "--now", self.NOW)
+        hist = f.urls("indicesHistory")
+        self.assertEqual(len(hist), 4)                                              # 3 years and a day: 4 yearly chunks
+        self.assertIn("&to=23-10-2026", hist[-1])
+
+    def test_history_failure_is_reported_and_keeps_the_archive_rows(self):
+        self.archive()
+        f = self.net([("historicalOR", 200, b"<html>wall</html>")] + self.archive().rules)
+        code, out, _ = self.run_d("index", "NIFTY 50", "--days", "2", "--years", "1", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertIn("NIFTY 50 history:", out)
+        self.assertEqual(len(data.read_index(data.index_path(self.dd, "NIFTY 50"))), 2)
+
+    def test_percentile_is_printed_once_250_rows_exist(self):
+        days = data.index_days(datetime.date(2026, 10, 23), 300)
+        rows = [data.index_row(d, 1, 2, 0.5, 1.5, None, float((i * 37) % 300 + 1), 3.0, 1.0) for i, d in enumerate(days)]
+        data.write_index(self.dd, "NIFTY 50", rows)
+        data.write_index(self.dd, "India VIX", [data.index_row("2026-10-23", 13, 14, 12, 13.5, None, None, None, None)])
+        f = self.net([])
+        code, out, _ = self.run_d("index", "NIFTY 50", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(f.calls, [])
+        self.assertIn("P/E percentile: 88% of the 300 cached sessions", out)
+        self.assertIn("India VIX 13.5 on 2026-10-23", out)
+
+    def test_doctor_probes_the_archive_and_status_lists_the_files(self):
+        f = self.net([("ind_close_all", 200, fx("ind_close_all_23102026.csv")), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertTrue(s["nse-index"]["ok"])
+        self.assertIn("ind_close_all_23102026.csv", s["nse-index"]["url"])
+        self.assertEqual(f.urls("ind_close_all")[0].count("ind_close_all"), 1)
+        self.net([("ind_close_all", 200, b"<html>wall</html>"), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertFalse(s["nse-index"]["ok"])
+        self.assertIn("not the index snapshot", s["nse-index"]["error"])
+        self.archive()
+        self.run_d("index", "--days", "2", "--now", self.NOW)
+        _, out, _ = self.run_d("status", "--now", self.NOW)
+        self.assertIn("index/nifty-50.csv", out)
+        self.assertIn("2 rows 2026-10-22..2026-10-23", out)
+
+
+# ---------------------------------------------------------------- report readiness
+
+class Readiness(Net):
+    NOW = "2026-10-23 19:00"
+
+    def reports(self, current="23-Oct-2026", keys=("CM-UDIFF-BHAVCOPY-CSV", "CM-BHAVDATA-FULL", "CM-MII-SECURITY")):
+        return json.dumps({"currentDate": current, "CurrentDay": [{"fileKey": k, "displayName": k} for k in keys],
+                           "PreviousDay": [{"fileKey": "CM-BHAVDATA-FULL"}]}).encode()
+
+    def feed(self, reports):
+        """reports: bytes, or (code, bytes). Bhavcopy files are served for the two fixture days."""
+        def bhav(url):
+            name = url.rsplit("/", 1)[-1]
+            if "sec_bhavdata_full" in name and os.path.exists(os.path.join(DFIX, name)):
+                return 200, fx(name)
+            return 404, b""
+        code, body = reports if isinstance(reports, tuple) else (200, reports)
+        return self.net([("api/daily-reports", code, body), ("sec_bhavdata_full", None, bhav),
+                         ("BhavCopy_NSE_CM", None, bhav), ("yahoo.com", 403, b""),
+                         ("www.nseindia.com/", 200 if code == 200 else 403, b"home")])
+
+    def bhavcopy(self, *extra):
+        return self.run_d("daily", "RELIANCE", "--source", "bhavcopy", "--now", self.NOW, *extra)
+
+    def test_a_stale_report_list_stops_cleanly_without_asking_for_the_files(self):
+        self.seed("RELIANCE", "2026-10-22")
+        f = self.feed(self.reports(current="22-Oct-2026"))
+        code, out, _ = self.bhavcopy()
+        self.assertEqual(code, 0, out)
+        self.assertIn("RELIANCE: today's bhavcopy is not published yet", out)
+        self.assertIn("NSE's report list still shows 2026-10-22", out)
+        self.assertNotIn("every source failed", out)
+        self.assertEqual(f.urls("sec_bhavdata_full") + f.urls("BhavCopy_NSE_CM"), [])      # no 404s to hammer
+        self.assertEqual(len(f.urls("api/daily-reports")), 1)
+        self.assertIn("key=CM", f.urls("api/daily-reports")[0])
+        self.assertEqual(self.daily("RELIANCE")[-1]["date"], "2026-10-22")
+
+    def test_an_empty_current_day_is_not_published_either(self):
+        self.seed("RELIANCE", "2026-10-22")
+        f = self.feed(self.reports(keys=("CM-MII-SECURITY",)))
+        code, out, _ = self.bhavcopy()
+        self.assertEqual(code, 0, out)
+        self.assertIn("NSE lists no CM-UDIFF-BHAVCOPY-CSV or CM-BHAVDATA-FULL for 2026-10-23 yet", out)
+        self.assertEqual(f.urls("sec_bhavdata_full"), [])
+
+    def test_listed_files_are_downloaded_and_the_list_is_asked_once(self):
+        self.seed("RELIANCE", "2026-10-21")
+        self.seed("TCS", "2026-10-21")
+        f = self.feed(self.reports())
+        code, out, _ = self.run_d("daily", "RELIANCE", "TCS", "--source", "bhavcopy", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(f.urls("api/daily-reports")), 1)
+        self.assertEqual(self.daily("RELIANCE")[-1]["date"], "2026-10-23")
+        self.assertEqual(self.daily("TCS")[-1]["date"], "2026-10-23")
+        self.assertNotIn("not published", out)
+
+    def test_only_the_listed_file_is_requested(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("BhavCopy_NSE_CM_0_0_0_20261023_F_0000.csv",
+                       "TradDt,TckrSymb,SctySrs,OpnPric,HghPric,LwPric,ClsPric,TtlTradgVol,TtlNbOfTxsExctd\n"
+                       "2026-10-23,RELIANCE,EQ,1184.00,1201.90,1163.10,1190.00,14905641,241397\n")
+        self.seed("RELIANCE", "2026-10-22")
+        f = self.net([("api/daily-reports", 200, self.reports(keys=("CM-UDIFF-BHAVCOPY-CSV",))),
+                      ("BhavCopy_NSE_CM", 200, buf.getvalue()), ("www.nseindia.com/", 200, b"home")])
+        code, out, _ = self.bhavcopy()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(f.urls("sec_bhavdata_full"), [])                    # the delivery file is not out: not asked for
+        self.assertEqual(len(f.urls("BhavCopy_NSE_CM")), 1)
+        self.assertEqual(self.daily("RELIANCE")[-1]["close"], 1190.0)
+        self.assertEqual(self.pending_days(), ["2026-10-23"])                # its delivery waits in pending.json
+
+    def pending_days(self):
+        return json.loads(rd(os.path.join(self.dd, "delivery", "pending.json")))["pending"]
+
+    def test_a_failed_call_falls_back_to_the_time_rule(self):
+        self.seed("RELIANCE", "2026-10-22")
+        f = self.feed((403, b"Access Denied"))
+        code, out, _ = self.bhavcopy()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.daily("RELIANCE")[-1]["date"], "2026-10-23")      # fetched as before
+        self.assertIn("going by the 18:00 rule", out)
+        self.assertEqual(len(f.urls("sec_bhavdata_full")), 1)
+        # an answer with no file list is a failed call as well
+        shutil.rmtree(self.dd)
+        self.seed("RELIANCE", "2026-10-22")
+        self.feed(self.reports().replace(b"CurrentDay", b"Other"))
+        code, out, _ = self.bhavcopy()
+        self.assertEqual(self.daily("RELIANCE")[-1]["date"], "2026-10-23")
+        self.assertIn("daily-reports has no CurrentDay list", out)
+
+    def test_earlier_sessions_are_filled_while_today_waits(self):
+        self.seed("RELIANCE", "2026-10-21")
+        f = self.feed(self.reports(current="22-Oct-2026", keys=("CM-BHAVDATA-FULL",)))
+        # the list is still on the 22nd, so only the 22nd is real; today's file is not requested
+        code, out, _ = self.bhavcopy()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.daily("RELIANCE")[-1]["date"], "2026-10-22")
+        self.assertIn("the earlier sessions were filled, run again later for today", out)
+        self.assertEqual([u.rsplit("_", 1)[-1] for u in f.urls("sec_bhavdata_full")], ["22102026.csv"])
+
+    def test_no_check_when_today_is_not_being_fetched(self):
+        self.seed("RELIANCE", "2026-10-21")
+        f = self.feed(self.reports())
+        self.run_d("daily", "RELIANCE", "--source", "bhavcopy", "--now", "2026-10-23 12:00")     # last session is the 22nd
+        self.assertEqual(f.urls("api/daily-reports"), [])
+        f = self.feed(self.reports())
+        self.run_d("daily", "RELIANCE", "--source", "nse", "--now", self.NOW)
+        self.assertEqual(f.urls("api/daily-reports"), [])                                   # not the bhavcopy source
+
+    def test_delivery_command_does_not_ask_for_a_file_that_is_not_listed(self):
+        self.seed("RELIANCE", "2026-10-23")
+        f = self.feed(self.reports(current="22-Oct-2026"))
+        code, out, _ = self.run_d("delivery", "RELIANCE", "--window", "5", "--now", self.NOW)
+        self.assertEqual([u for u in f.urls("sec_bhavdata_full") if "23102026" in u], [])
+        self.assertIn("2026-10-23", self.pending_days())             # it waits in pending.json instead
+
+    def test_doctor_probes_the_report_list(self):
+        f = self.net([("api/daily-reports", 200, self.reports()), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertTrue(s["nse-reports"]["ok"])
+        hdr = [h for u, h in f.calls if "daily-reports" in u][0]
+        self.assertIn("all-reports", hdr["Referer"])
+        self.net([("api/daily-reports", 200, b'{"CurrentDay": "x"}'), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertFalse(s["nse-reports"]["ok"])
+        self.assertIn("no CurrentDay", s["nse-reports"]["error"])
+
+
+# ---------------------------------------------------------------- index option chain
+
+class ChainMaths(unittest.TestCase):
+    def rec(self):
+        return json.loads(fx("nse-option-chain-NIFTY.json"))["records"]
+
+    def test_stats_for_one_expiry(self):
+        D = datetime.date
+        strikes = data.chain_strikes(self.rec(), D(2026, 10, 29))
+        self.assertEqual(sorted(strikes), [25000.0, 25100.0, 25200.0])           # the 5 Nov row is another expiry
+        self.assertEqual(strikes[25200.0], {"ce_oi": 4000.0, "ce_chg": 300.0, "pe_oi": 0.0, "pe_chg": 0.0})   # CE only
+        s = data.chain_stats(strikes, 25060.4)
+        self.assertEqual((s["total_call_oi"], s["total_put_oi"]), (7000, 4500))
+        self.assertEqual(s["pcr_oi"], 0.6429)                                    # 4500 / 7000
+        self.assertEqual((s["total_call_oi_change"], s["total_put_oi_change"]), (350, 700))
+        self.assertEqual(s["pcr_change_oi"], 2.0)
+        self.assertEqual((s["max_call_oi_strike"], s["max_call_oi"]), (25200.0, 4000))
+        self.assertEqual((s["max_put_oi_strike"], s["max_put_oi"]), (25000.0, 3000))
+        self.assertEqual((s["atm"], s["strike_gap"]), (25100, 100.0))
+        self.assertEqual(s["max_pain"], 25100.0)             # payouts 150000 / 100000 / 400000 at 25000 / 25100 / 25200
+        self.assertEqual(s["strikes"], 3)
+
+    def test_the_other_expiry(self):
+        s = data.chain_stats(data.chain_strikes(self.rec(), datetime.date(2026, 11, 5)), 25060.4)
+        self.assertEqual((s["pcr_oi"], s["max_pain"], s["atm"], s["strike_gap"]), (1.0, 25300.0, None, None))
+        self.assertEqual(s["max_call_oi_strike"], 25300.0)
+
+    def test_either_expiry_key_is_read(self):
+        text = fx("nse-option-chain-NIFTY.json").decode()
+        for variant in (text.replace('"expiryDate"', '"expiryDates"'),
+                        text.replace('"expiryDate": "29-Oct-2026"', '"expiryDates": ["29-Oct-2026"]')
+                            .replace('"expiryDate": "05-Nov-2026"', '"expiryDates": ["05-Nov-2026"]'),
+                        text.replace('"expiryDate"', '"expiry"')):
+            strikes = data.chain_strikes(json.loads(variant)["records"], datetime.date(2026, 10, 29))
+            self.assertEqual(sorted(strikes), [25000.0, 25100.0, 25200.0])
+        with self.assertRaises(data.DataError) as cm:
+            data.chain_strikes(self.rec(), datetime.date(2026, 12, 31))
+        self.assertIn("no strikes for the 31-Dec-2026 expiry (the chain holds 29-Oct-2026, 05-Nov-2026)", str(cm.exception))
+
+    def test_a_missing_side_is_zero_and_odd_inputs(self):
+        strikes = data.chain_strikes({"data": [{"strikePrice": "100", "PE": {"openInterest": "50"}},
+                                               {"strikePrice": 200, "CE": {"openInterest": 10, "changeinOpenInterest": None}},
+                                               {"strikePrice": None, "CE": {"openInterest": 1}}, "junk"]},
+                                     datetime.date(2026, 10, 29))
+        self.assertEqual(strikes, {100.0: {"ce_oi": 0.0, "ce_chg": 0.0, "pe_oi": 50.0, "pe_chg": 0.0},
+                                   200.0: {"ce_oi": 10.0, "ce_chg": 0.0, "pe_oi": 0.0, "pe_chg": 0.0}})
+        s = data.chain_stats(strikes, None)
+        self.assertEqual((s["pcr_oi"], s["atm"], s["pcr_change_oi"]), (5.0, None, None))   # no underlying, no change in OI
+        calls_only = data.chain_stats({100.0: strikes[200.0]}, 100)
+        self.assertEqual((calls_only["pcr_oi"], calls_only["strike_gap"], calls_only["max_pain"]), (0.0, None, 100.0))
+        no_calls = {1.0: {"ce_oi": 0.0, "ce_chg": 0.0, "pe_oi": 5.0, "pe_chg": 0.0}}
+        self.assertIsNone(data.chain_stats(no_calls, 1)["pcr_oi"])                          # no call OI: no ratio
+
+    def test_max_pain_tie_takes_the_lowest_strike(self):
+        flat = dict((k, {"ce_oi": 0.0, "ce_chg": 0.0, "pe_oi": 0.0, "pe_chg": 0.0}) for k in (100.0, 200.0, 300.0))
+        self.assertEqual(data.max_pain(flat), 100.0)
+
+    def test_expiry_dates_and_text(self):
+        D = datetime.date
+        self.assertEqual(data.expiry_text(D(2026, 10, 29)), "29-Oct-2026")
+        self.assertEqual(data.expiry_text(D(2026, 11, 5)), "05-Nov-2026")
+        self.assertEqual(data.expiry_dates({"expiryDates": ["05-Nov-2026", "29-Oct-2026", "junk"]}),
+                         [D(2026, 10, 29), D(2026, 11, 5)])
+        for bad in ({}, {"expiryDates": []}, {"expiryDates": None}, [], None):
+            with self.assertRaises(data.DataError):
+                data.expiry_dates(bad)
+
+    def test_pcr_is_a_hint(self):
+        self.assertEqual(data.pcr_hint(1.3), "more puts than calls, leans supportive")
+        self.assertEqual(data.pcr_hint(0.69), "more calls than puts, leans weak")
+        self.assertEqual(data.pcr_hint(1.2), "balanced")
+        self.assertEqual(data.pcr_hint(0.7), "balanced")
+        self.assertEqual(data.pcr_hint(None), "no call open interest")
+
+
+class ChainCommand(Net):
+    NOW = "2026-10-23 16:00"
+    INFO = json.dumps({"expiryDates": ["22-Oct-2026", "29-Oct-2026", "05-Nov-2026"], "strikePrice": [25000]}).encode()
+
+    def feed(self, chain=None, info=None):
+        return self.net([("option-chain-contract-info", 200, info if info is not None else self.INFO),
+                         ("option-chain-v3", 200, chain if chain is not None else fx("nse-option-chain-NIFTY.json")),
+                         ("www.nseindia.com/", 200, b"home")])
+
+    def saved(self, sym="NIFTY"):
+        return json.loads(rd(os.path.join(self.dd, "chain-%s.json" % sym)))
+
+    def test_writes_the_contract(self):
+        f = self.feed()
+        code, out, err = self.run_d("chain", "NIFTY", "--now", self.NOW)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(f.urls("contract-info")[0].split("nseindia.com")[1], "/api/option-chain-contract-info?symbol=NIFTY")
+        self.assertEqual(f.urls("option-chain-v3")[0].split("nseindia.com")[1],
+                         "/api/option-chain-v3?type=Indices&symbol=NIFTY&expiry=29-Oct-2026")    # the nearest one not passed
+        hdr = [h for u, h in f.calls if "option-chain-v3" in u][0]
+        self.assertEqual(hdr["Referer"], "https://www.nseindia.com/option-chain")
+        doc = self.saved()
+        self.assertEqual(doc, {
+            "symbol": "NIFTY", "type": "Indices", "underlying": 25060.4, "timestamp": "23-Oct-2026 15:30:00",
+            "expiry": "2026-10-29", "expiry_pick": "nearest", "fetched_at": "2026-10-23T10:30:00Z",
+            "source": "nse-option-chain", "pcr_oi": 0.6429, "pcr_change_oi": 2.0, "total_call_oi": 7000,
+            "total_put_oi": 4500, "total_call_oi_change": 350, "total_put_oi_change": 700,
+            "max_call_oi_strike": 25200.0, "max_call_oi": 4000, "max_put_oi_strike": 25000.0, "max_put_oi": 3000,
+            "atm": 25100, "strike_gap": 100.0, "max_pain": 25100.0, "strikes": 3})
+        self.assertIn("NIFTY option chain, expiry 29-Oct-2026 (3 strikes), underlying 25060.4 at 23-Oct-2026 15:30:00", out)
+        self.assertIn("PCR on open interest 0.6429 (more calls than puts, leans weak)", out)
+        self.assertIn("PCR on today's change in OI 2 (puts +700, calls +350)", out)
+        self.assertIn("largest call OI at 25200 (4,000 contracts), a possible resistance; largest put OI at 25000", out)
+        self.assertIn("ATM 25100, max pain 25100", out)
+        self.assertIn("sentiment hint, never a signal", out)
+        self.assertNotIn("India VIX", out)                    # no india-vix.csv yet
+        self.assertNotIn("vix", doc)
+
+    def test_the_nearest_expiry_is_kept_until_it_passes(self):
+        self.feed()
+        self.run_d("chain", "NIFTY", "--now", self.NOW)
+        f = self.feed()
+        code, out, _ = self.run_d("chain", "NIFTY", "--now", "2026-10-29 11:00")           # expiry day itself
+        self.assertEqual(code, 0, out)
+        self.assertEqual(f.urls("contract-info"), [])
+        self.assertIn("expiry=29-Oct-2026", f.urls("option-chain-v3")[0])
+        f = self.feed()
+        self.run_d("chain", "NIFTY", "--now", "2026-10-30 11:00")                          # it has passed: ask again
+        self.assertEqual(len(f.urls("contract-info")), 1)
+        self.assertIn("expiry=05-Nov-2026", f.urls("option-chain-v3")[0])
+        self.assertEqual(self.saved()["expiry"], "2026-11-05")
+
+    def test_an_expiry_you_choose(self):
+        f = self.feed()
+        code, out, _ = self.run_d("chain", "NIFTY", "--expiry", "05-Nov-2026", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(f.urls("contract-info"), [])
+        self.assertIn("expiry=05-Nov-2026", f.urls("option-chain-v3")[0])
+        doc = self.saved()
+        self.assertEqual((doc["expiry"], doc["expiry_pick"], doc["pcr_oi"], doc["max_pain"]),
+                         ("2026-11-05", "user", 1.0, 25300.0))
+        f = self.feed()
+        self.run_d("chain", "NIFTY", "--now", self.NOW)                                    # a chosen expiry is not "the nearest"
+        self.assertEqual(len(f.urls("contract-info")), 1)
+        self.assertEqual(self.saved()["expiry"], "2026-10-29")
+
+    def test_an_empty_object_primes_again_once_then_says_so(self):
+        f = self.net([("option-chain-contract-info", 200, self.INFO), ("option-chain-v3", 200, b"{}"),
+                      ("www.nseindia.com/", 200, b"home")])
+        code, _, err = self.run_d("chain", "NIFTY", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertIn("empty option chain for NIFTY 29-Oct-2026", err)
+        self.assertIn("a fresh session was tried once", err)
+        self.assertEqual(len(f.urls("option-chain-v3")), 2)                                # once more, not forever
+        self.assertEqual(len([u for u, _ in f.calls if u == "https://www.nseindia.com/"]), 2)   # prime, then re-prime
+        self.assertFalse(os.path.exists(os.path.join(self.dd, "chain-NIFTY.json")))
+        # {"records": {}} and a records object with no data are empty too
+        for body in (b'{"records": {}}', b'{"records": {"data": []}}', b"[]"):
+            self.net([("option-chain-contract-info", 200, self.INFO), ("option-chain-v3", 200, body),
+                      ("www.nseindia.com/", 200, b"home")])
+            self.assertEqual(self.run_d("chain", "NIFTY", "--now", self.NOW)[0], 1, body)
+
+    def test_the_second_try_after_a_fresh_prime_can_succeed(self):
+        f = self.net([("option-chain-contract-info", 200, self.INFO),
+                      ("option-chain-v3", None, script((200, b"{}"), (200, fx("nse-option-chain-NIFTY.json")))),
+                      ("www.nseindia.com/", 200, b"home")])
+        code, out, _ = self.run_d("chain", "NIFTY", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.saved()["pcr_oi"], 0.6429)
+
+    def test_no_expiry_dates_is_an_error(self):
+        for info in (b"{}", b'{"expiryDates": []}', b"<html>wall</html>"):
+            self.feed(info=info)
+            code, _, err = self.run_d("chain", "NIFTY", "--now", self.NOW)
+            self.assertEqual(code, 1, info)
+            self.assertTrue("no expiry dates" in err or "did not return JSON" in err, err)
+
+    def test_a_block_is_explained(self):
+        self.net([("", 403, b"Access Denied")])
+        code, _, err = self.run_d("chain", "NIFTY", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertIn("403", err)
+
+    def test_a_stock_uses_the_equity_type(self):
+        f = self.feed()
+        self.run_d("chain", "reliance", "--expiry", "29-Oct-2026", "--now", self.NOW)
+        self.assertIn("/api/option-chain-v3?type=Equity&symbol=RELIANCE&expiry=29-Oct-2026", f.urls("option-chain-v3")[0])
+        self.assertEqual(self.saved("RELIANCE")["type"], "Equity")
+
+    def test_a_vix_line_when_the_index_file_exists(self):
+        closes = [13.0, 13.0, 13.0, 13.0, 13.0, 16.0]
+        days = data.index_days(datetime.date(2026, 10, 23), 6)
+        data.write_index(self.dd, "India VIX", [data.index_row(d, c, c, c, c, None, None, None, None)
+                                                for d, c in zip(days, closes)])
+        self.feed()
+        code, out, _ = self.run_d("chain", "NIFTY", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        line = "India VIX 16 on 2026-10-23 (+23.1% on the day), 1.2x its 6-session average (elevated)"
+        self.assertIn("  " + line, out)
+        self.assertEqual(self.saved()["vix"], line)
+        self.assertEqual(data.vix_context(self.tmp), None)                                 # no file there, no line
+
+    def test_vix_wording(self):
+        def line(closes):
+            days = data.index_days(datetime.date(2026, 10, 23), len(closes))
+            data.write_index(self.dd, "India VIX", [data.index_row(d, c, c, c, c, None, None, None, None)
+                                                    for d, c in zip(days, closes)])
+            return data.vix_context(self.dd)
+        self.assertIn("(calm)", line([20, 20, 20, 20, 20, 16]))
+        shutil.rmtree(os.path.join(self.dd, "index"))
+        self.assertIn("(about normal)", line([13, 13, 13, 13, 13, 13.5]))
+        shutil.rmtree(os.path.join(self.dd, "index"))
+        self.assertEqual(line([13, 14]), "India VIX 14 on 2026-10-23 (+7.7% on the day)")   # too few rows for an average
+
+    def test_doctor_probes_the_chain_endpoint(self):
+        self.net([("option-chain-contract-info", 200, self.INFO), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertTrue(s["nse-chain"]["ok"])
+        self.net([("option-chain-contract-info", 200, b"{}"), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertFalse(s["nse-chain"]["ok"])
+        self.assertIn("no expiryDates", s["nse-chain"]["error"])
+
+
 class Style(unittest.TestCase):
     def test_no_em_dash_and_skill_frontmatter(self):
         for f in ("data.py", "SKILL.md"):

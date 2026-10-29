@@ -1,0 +1,16 @@
+[
+  {"symbol": "SPLITCO", "series": "EQ", "subject": "Face Value Split (Sub-Division) - From Rs 10/- Per Share To Re 1/- Per Share",
+   "exDate": "08-Oct-2026", "recDate": "09-Oct-2026", "faceVal": "1", "isin": "INE000A01010", "comp": "Split Co Ltd"},
+  {"symbol": "SPLITCO", "series": "EQ", "subject": "Bonus 3:2", "exDate": "13-Oct-2026", "recDate": "14-Oct-2026",
+   "faceVal": "1", "isin": "INE000A01010", "comp": "Split Co Ltd"},
+  {"symbol": "SPLITCO", "series": "EQ", "subject": "Bonus 1:1 NCRPS", "exDate": "12-Oct-2026", "recDate": "-",
+   "faceVal": "1", "isin": "INE000A01010", "comp": "Split Co Ltd"},
+  {"symbol": "SPLITCO", "series": "EQ", "subject": "Interim Dividend - Rs 5 Per Share", "exDate": "06-Oct-2026",
+   "recDate": "07-Oct-2026", "faceVal": "10", "isin": "INE000A01010", "comp": "Split Co Ltd"},
+  {"symbol": "SPLITCO", "series": "EQ", "subject": "Interim Dividend - Re 0.50 Per Share", "exDate": "-",
+   "recDate": "-", "faceVal": "1", "isin": "INE000A01010", "comp": "Split Co Ltd"},
+  {"symbol": "SPLITCO", "series": "EQ", "subject": "Buy Back", "exDate": "01-Oct-2026", "recDate": "-",
+   "faceVal": "1", "isin": "INE000A01010", "comp": "Split Co Ltd"},
+  {"symbol": "SPLITCO", "series": "SM", "subject": "Face Value Split From Rs 10/- To Rs 5/-", "exDate": "02-Oct-2026",
+   "recDate": "-", "faceVal": "5", "isin": "INE000A01010", "comp": "Split Co Ltd"}
+]
