@@ -15,6 +15,9 @@ ABOUT = ("13 Claude skills for NSE trading and long-term investing: scan Nifty 5
 ORDER_PATH = ["trader-scanner", "trader-entry", "trader-exit", "trader-timemachine", "trader-budget",
               "trader-risk", "trader-broker", "trader-alerts",
               "trader-invest", "trader-portfolio", "trader-backtest"]
+SWING_COPIES = [("trader-scanner", "scan.py"), ("trader-backtest", "backtest.py"),
+                ("trader-invest", "invest.py"), ("trader-exit", "exit.py"),
+                ("trader-timemachine", "timemachine.py")]
 V1_ONLY = ["trader-copycat", "trader-screener", "trader-tax", "trader-rebalance"]
 
 
@@ -27,7 +30,7 @@ def frontmatter(path):
 
 def every_text_file():
     for base, dirs, files in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__")]
+        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", ".claude")]
         for f in files:
             if f.endswith((".md", ".py", ".json", ".csv", ".txt", ".xml")) or f == "LICENSE":
                 yield os.path.join(base, f)
@@ -40,7 +43,8 @@ class Repo(unittest.TestCase):
         self.assertEqual(found, sorted(SKILLS))
 
     def test_root_matches_the_reel(self):
-        root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git"))
+        # .claude/ is a user's local Claude Code folder (gitignored), not part of the pack
+        root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git") and d != ".claude")
         self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "tests"] + SKILLS))
 
     def test_frontmatter_name_and_description(self):
@@ -132,6 +136,18 @@ class Repo(unittest.TestCase):
             cfg = json.load(fh)
         self.assertIs(cfg["paper"], True)
         self.assertIs(cfg.get("allow_options", False), False)
+
+    def test_swing_engine_is_the_same_everywhere(self):
+        # each skill is one standalone script, so the engine is copied; the copies must not drift
+        marks = ("# --- swing engine:", "# --- end swing engine ---")
+        blocks = {}
+        for s, f in SWING_COPIES:
+            with open(os.path.join(ROOT, s, f), encoding="utf-8") as fh:
+                text = fh.read()
+            a, b = text.find(marks[0]), text.find(marks[1])
+            self.assertTrue(0 <= a < b, "%s/%s has no swing engine block" % (s, f))
+            blocks[f] = text[a:b]
+        self.assertEqual(len(set(blocks.values())), 1, sorted(blocks))
 
 
 if __name__ == "__main__":
