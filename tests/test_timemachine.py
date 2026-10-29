@@ -1,4 +1,5 @@
 import copy
+import datetime
 import gzip
 import hashlib
 import io
@@ -578,6 +579,84 @@ class V4CacheAndCharges(unittest.TestCase):
         code, text, err = run(["run", "--cache", "--now", NOW, "--replays", "200"])
         self.assertEqual(code, 0, err)
         self.assertIn("After intraday charges, estimate (calibrated from 4 contract notes)", text)
+
+
+CAL_2027 = {"fetched_at": "2026-10-29T10:00:00Z", "years": [2027],
+            "holidays": {"2027-01-26": "Republic Day", "2027-03-22": "Holi"},
+            "special_sessions": {"2027-02-06": "Special Saturday session",
+                                 "2027-10-29": "Diwali Laxmi Pujan (Muhurat)"},
+            "last_circular_check": "2026-10-29", "warnings": []}
+
+
+def shifted(text, days):
+    """The fixture moved `days` later (a multiple of 7 keeps every weekday where it was)."""
+    doc = json.loads(text)
+    res = doc["chart"]["result"][0]
+    res["timestamp"] = [t + days * 86400 for t in res["timestamp"]]
+    res["meta"]["regularMarketTime"] += days * 86400
+    return json.dumps(doc)
+
+
+class CalendarFile(unittest.TestCase):
+    """trader/data/calendar.json (trader-data: data.py calendar) extends the holiday list past 2026."""
+
+    def setUp(self):
+        self.cwd = os.getcwd()
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, self.cwd)
+        os.makedirs(os.path.join("trader", "data"))
+
+    def fresh(self, content):
+        """A newly loaded timemachine.py that reads trader/data/calendar.json from the current folder."""
+        with open(os.path.join("trader", "data", "calendar.json"), "w", encoding="utf-8") as fh:
+            fh.write(content if isinstance(content, str) else json.dumps(content))
+        return load("trader-timemachine", "timemachine")
+
+    def warnings(self, mod, src, days):
+        """Warnings for a replay of the fixture's `src` session moved `days` later."""
+        day = (datetime.date.fromisoformat(src) + datetime.timedelta(days=days)).isoformat()
+        raw = dict(PLAN, date=day, entry_time=None)
+        now = mod.parse_now(NOW) + datetime.timedelta(days=days)
+        return mod.time_machine(shifted(TEXT, days), mod.normalize_plan(raw), now, replays=50)["warnings"]
+
+    def test_2027_holiday_flagged_and_weekday_not(self):
+        t = self.fresh(CAL_2027)
+        self.assertIn("NSE holiday: Republic Day", self.warnings(t, "2026-10-13", 105))      # 2027-01-26
+        w = self.warnings(t, "2026-10-14", 105)                                              # 2027-01-27
+        self.assertFalse(any("holiday" in x or "covers" in x for x in w), w)
+        self.assertIn(2027, t.HOLIDAY_YEARS)
+        self.assertNotIn("2027-01-26", tm.NSE_HOLIDAYS)                  # the module loaded at import is untouched
+
+    def test_muhurat_is_not_a_regular_session(self):
+        t = self.fresh(CAL_2027)
+        w = " ".join(self.warnings(t, "2026-10-16", 378))                                    # 2027-10-29, a Friday
+        self.assertIn("Muhurat", w)
+        self.assertIn("no normal 09:15-15:30 market", w)
+        self.assertNotIn("NSE holiday", w)
+
+    def test_a_special_session_is_not_a_holiday(self):
+        t = self.fresh(dict(CAL_2027, holidays={"2027-01-26": "Republic Day"},
+                            special_sessions={"2027-01-26": "Budget session"}))
+        self.assertEqual(t.SPECIAL_SESSIONS, {"2026-02-01": "Union Budget (Sunday)", "2027-01-26": "Budget session"})
+        w = self.warnings(t, "2026-10-13", 105)                                              # 2027-01-26
+        self.assertFalse(any("holiday" in x for x in w), w)
+
+    def test_builtin_2026_still_holds_and_other_years_still_warn(self):
+        t = self.fresh(CAL_2027)
+        self.assertIn("NSE holiday: Dussehra", self.warnings(t, "2026-10-13", 7))            # 2026-10-20
+        self.assertIn("holiday list covers 2026, 2027 only: check nseindia.com",
+                      self.warnings(t, "2026-10-16", 448))                                   # 2028-01-07
+
+    def test_missing_or_corrupt_file_falls_back_to_the_builtin_table(self):
+        self.assertEqual(load("trader-timemachine", "timemachine").HOLIDAY_YEARS, (2026,))  # no file at all
+        for bad in ("{not json", "[1, 2]", "", '{"years": "x", "holidays": []}'):
+            t = self.fresh(bad)
+            self.assertEqual(t.HOLIDAY_YEARS, (2026,), bad)
+            w = self.warnings(t, "2026-10-13", 105)                                          # 2027-01-26
+            self.assertIn("holiday list covers 2026 only: check nseindia.com", w, bad)
+            self.assertFalse(any("Republic Day" in x for x in w), bad)
 
 
 class Cli(unittest.TestCase):

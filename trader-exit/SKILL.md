@@ -112,7 +112,9 @@ A level setup has no opening range to lean on, so it needs a stop you name.
   `get_historical_data`, save the JSON and run `python3 trader-data/data.py
   import-kite FILE --kind historical --symbol SYMBOL`.
 - **Holidays.** A plan for an NSE holiday says so ("NSE holiday: Dussehra").
-  The list covers 2026 only: outside it, check nseindia.com.
+  The list is the built-in 2026 table plus `trader/data/calendar.json` (`python3
+  trader-data/data.py calendar` writes it). For a year in neither, check
+  nseindia.com.
 
 ## Steps
 

@@ -2,6 +2,7 @@
 (SYNTHETIC NSE bars: real US five-minute bars moved onto the 09:15-15:30 IST grid and renamed
 RELIANCE.NS; the prices are not RELIANCE's)."""
 
+import datetime
 import io
 import json
 import os
@@ -294,6 +295,70 @@ class Cli(unittest.TestCase):
         code, text, _ = run(exitp, ["show"])
         self.assertEqual(code, 1)
         self.assertIn("No plan", text)
+
+
+CAL_2027 = {"fetched_at": "2026-10-29T10:00:00Z", "years": [2027],
+            "holidays": {"2027-01-26": "Republic Day", "2027-03-22": "Holi"},
+            "special_sessions": {"2027-02-06": "Special Saturday session",
+                                 "2027-10-29": "Diwali Laxmi Pujan (Muhurat)"},
+            "last_circular_check": "2026-10-29", "warnings": []}
+
+
+class CalendarFile(unittest.TestCase):
+    """trader/data/calendar.json (trader-data: data.py calendar) extends the holiday list past 2026."""
+
+    def setUp(self):
+        self.cwd = os.getcwd()
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, self.cwd)
+        os.makedirs(os.path.join("trader", "data"))
+
+    def fresh(self, content):
+        """A newly loaded exit.py that reads trader/data/calendar.json from the current folder."""
+        with open(os.path.join("trader", "data", "calendar.json"), "w", encoding="utf-8") as fh:
+            fh.write(content if isinstance(content, str) else json.dumps(content))
+        return load("trader-exit", "exit")
+
+    def warnings(self, mod, day):
+        with open(os.path.join("trader", "entry.json"), "w") as fh:
+            json.dump(dict(REEL_ENTRY, date=day), fh)
+        code, text, err = run(mod, ["plan", "--now", "%s 10:01" % day, "--json"])
+        self.assertEqual(code, 0, err)
+        return json.loads(text)["warnings"]
+
+    def test_2027_holiday_closed_and_weekday_open(self):
+        x = self.fresh(CAL_2027)
+        self.assertIn("NSE holiday: Republic Day.", self.warnings(x, "2027-01-26"))
+        self.assertIsNone(x.session(datetime.date(2027, 1, 26)))
+        w = self.warnings(x, "2027-01-27")
+        self.assertFalse(any("holiday" in t or "covers" in t for t in w), w)
+        self.assertEqual(x.session(datetime.date(2027, 1, 27)), (x.OPEN, x.CLOSE))
+        self.assertIn(2027, x.HOLIDAY_YEARS)
+        self.assertNotIn("2027-01-26", exitp.NSE_HOLIDAYS)               # the module loaded at import is untouched
+
+    def test_special_saturday_opens_and_muhurat_closes_the_regular_market(self):
+        x = self.fresh(CAL_2027)
+        self.assertEqual(x.session(datetime.date(2027, 2, 6)), (x.OPEN, x.CLOSE))
+        self.assertEqual(x.holiday_note(datetime.date(2027, 2, 6)), "")
+        self.assertIsNone(x.session(datetime.date(2027, 10, 29)))        # a Friday
+        w = " ".join(self.warnings(x, "2027-10-29"))
+        self.assertIn("Muhurat", w)
+        self.assertIn("no normal 09:15-15:30 market", w)
+
+    def test_builtin_2026_still_holds_and_other_years_still_warn(self):
+        x = self.fresh(CAL_2027)
+        self.assertIn("NSE holiday: Dussehra.", self.warnings(x, "2026-10-20"))
+        self.assertTrue(any("covers 2026, 2027 only" in t for t in self.warnings(x, "2028-01-03")))
+
+    def test_missing_or_corrupt_file_falls_back_to_the_builtin_table(self):
+        self.assertEqual(load("trader-exit", "exit").HOLIDAY_YEARS, (2026,))    # no file at all
+        for bad in ("{not json", "[1, 2]", "", '{"years": "x", "holidays": []}'):
+            x = self.fresh(bad)
+            self.assertEqual(x.HOLIDAY_YEARS, (2026,), bad)
+            self.assertTrue(any("covers 2026 only" in t for t in self.warnings(x, "2027-01-26")), bad)
+            self.assertIn("NSE holiday: Dussehra.", self.warnings(x, "2026-10-20"), bad)
 
 
 class V4DataChargesBands(unittest.TestCase):

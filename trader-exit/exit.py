@@ -113,7 +113,16 @@ NSE_HOLIDAYS = {  # NSE equity trading holidays (weekdays), 2026
     "2026-11-24": "Guru Nanak Jayanti",
     "2026-12-25": "Christmas",
 }
-HOLIDAY_YEARS = (2026,)
+BUILTIN_HOLIDAYS = dict(NSE_HOLIDAYS)   # the offline fallback; NSE_HOLIDAYS also holds calendar.json
+BUILTIN_YEARS = (2026,)
+# Normal-hours sessions on a weekend or holiday: the market is open 09:15-15:30.
+BUILTIN_SPECIAL = {"2026-02-01": "Union Budget (Sunday)"}
+# Muhurat: one evening hour, times set by circular and not tracked here; the regular market is closed.
+BUILTIN_MUHURAT = {"2026-11-08": "Diwali Laxmi Pujan (Muhurat), Sunday"}
+SPECIAL_SESSIONS = dict(BUILTIN_SPECIAL)
+MUHURAT_SESSIONS = dict(BUILTIN_MUHURAT)
+HOLIDAY_YEARS = BUILTIN_YEARS
+CALENDAR_PATH = os.path.join(DATA_DIR, "calendar.json")
 IST_OFFSET = datetime.timedelta(hours=5, minutes=30)   # India: fixed UTC+05:30, no DST
 OPEN = datetime.time(9, 15)
 CLOSE = datetime.time(15, 30)
@@ -194,19 +203,94 @@ def ampm(t):
     return "%d:%02d %s" % (h, t.minute, "AM" if t.hour < 12 else "PM")
 
 
+def _iso_map(m):
+    """{"2027-01-26": "Republic Day"} -> the same with bad keys dropped; anything else is corrupt."""
+    if m is None:
+        return {}
+    if not isinstance(m, dict):
+        raise ValueError("not an object")
+    out = {}
+    for k, v in m.items():
+        try:
+            datetime.date.fromisoformat(k)
+        except (TypeError, ValueError):
+            continue
+        out[k] = str(v)
+    return out
+
+
+def load_calendar(path=None):
+    """trader/data/calendar.json (trader-data: data.py calendar) -> dict, or None when it is
+    missing or unreadable. Never raises: the built-in table is the fallback."""
+    try:
+        with open(path or CALENDAR_PATH, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        if not isinstance(doc, dict):
+            return None
+        return {"years": sorted(set(int(y) for y in (doc.get("years") or []))),
+                "holidays": _iso_map(doc.get("holidays")),
+                "special_sessions": _iso_map(doc.get("special_sessions"))}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def is_muhurat(name):
+    low = str(name).lower()
+    return "muhurat" in low or "laxmi pujan" in low
+
+
+def apply_calendar(path=None):
+    """Rebuild NSE_HOLIDAYS, SPECIAL_SESSIONS, MUHURAT_SESSIONS and HOLIDAY_YEARS from the built-in
+    tables plus calendar.json. For a year the file lists, the file replaces the built-in holidays.
+    Same rules as trader-alerts/alerts.py."""
+    global HOLIDAY_YEARS
+    cal = load_calendar(path)
+    for table, base in ((NSE_HOLIDAYS, BUILTIN_HOLIDAYS), (SPECIAL_SESSIONS, BUILTIN_SPECIAL),
+                        (MUHURAT_SESSIONS, BUILTIN_MUHURAT)):
+        table.clear()
+        table.update(base)
+    HOLIDAY_YEARS = BUILTIN_YEARS
+    if not cal:
+        return None
+    for y in cal["years"]:
+        for iso in [k for k in NSE_HOLIDAYS if k.startswith("%04d-" % y)]:
+            del NSE_HOLIDAYS[iso]
+    NSE_HOLIDAYS.update(cal["holidays"])
+    for iso, name in cal["special_sessions"].items():
+        SPECIAL_SESSIONS.pop(iso, None)
+        MUHURAT_SESSIONS.pop(iso, None)
+        (MUHURAT_SESSIONS if is_muhurat(name) else SPECIAL_SESSIONS)[iso] = name
+    HOLIDAY_YEARS = tuple(sorted(set(BUILTIN_YEARS) | set(cal["years"])))
+    return cal
+
+
+apply_calendar()   # at import, from trader/data/calendar.json when it exists
+
+
+def years_text():
+    return ", ".join(str(y) for y in HOLIDAY_YEARS)
+
+
 def session(d):
-    """(open_time, close_time) in IST, or None if closed all day. No early closes on NSE;
-    the Muhurat session is treated as closed."""
-    if d.weekday() >= 5 or d.isoformat() in NSE_HOLIDAYS:
+    """(open_time, close_time) in IST, or None if closed all day. No early closes on NSE. A
+    normal-hours special session opens a weekend or holiday; the Muhurat session is closed
+    for the regular market."""
+    iso = d.isoformat()
+    if iso in MUHURAT_SESSIONS:
+        return None
+    if iso not in SPECIAL_SESSIONS and (d.weekday() >= 5 or iso in NSE_HOLIDAYS):
         return None
     return OPEN, CLOSE
 
 
 def holiday_note(d):
-    if d.isoformat() in NSE_HOLIDAYS:
-        return "NSE holiday: %s" % NSE_HOLIDAYS[d.isoformat()]
+    iso = d.isoformat()
+    if iso in MUHURAT_SESSIONS:
+        return "special session: %s, evening only; no normal 09:15-15:30 market" % MUHURAT_SESSIONS[iso]
+    if iso in NSE_HOLIDAYS and iso not in SPECIAL_SESSIONS:
+        return "NSE holiday: %s" % NSE_HOLIDAYS[iso]
     if d.year not in HOLIDAY_YEARS:
-        return "holiday list covers 2026 only: check nseindia.com"
+        return "holiday list covers %s only: check nseindia.com" % years_text()
     return ""
 
 
