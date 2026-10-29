@@ -491,6 +491,21 @@ class Reconcile(unittest.TestCase):
         self.assertIn("DP ₹15.34 a scrip a sell day", text)
         self.assertIn("exchange txn NSE 0.00307%", text)
 
+    def test_a_rewrite_in_the_same_timestamp_tick_is_still_read(self):
+        # reconcile writes the calibration and --show reads it straight after: on a coarse file clock
+        # (about 15 ms on Windows) both writes carry one mtime, and an mtime-keyed cache served the old one
+        for mod in (ticket, check):
+            old = {"calibration": {"factor": 1.039, "samples": 2, "updated": "2026-10-29"}}
+            with open(self.charges, "w") as fh:
+                json.dump(old, fh)
+            self.assertEqual(mod.load_charges(self.charges)["calibration"]["updated"], "2026-10-29")
+            stamp = os.stat(self.charges)
+            with open(self.charges, "w") as fh:
+                json.dump({"calibration": dict(old["calibration"], updated="2026-10-30")}, fh)
+            os.utime(self.charges, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            self.assertEqual(os.stat(self.charges).st_mtime_ns, stamp.st_mtime_ns)
+            self.assertEqual(mod.load_charges(self.charges)["calibration"]["updated"], "2026-10-30", mod.__name__)
+
     def test_overrides_in_the_charges_file_are_kept(self):
         with open(self.charges, "w") as fh:
             json.dump({"intraday": {"brokerage_cap": 10}}, fh)
