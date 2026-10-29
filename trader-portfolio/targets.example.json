@@ -1,0 +1,15 @@
+{
+  "source": "example long-term targets: your own list, edit the symbols and weights",
+  "note": "Weights are renormalised to 100. cash_pct stays in cash. Holdings not listed here are left alone unless others is \"sell\". min_trade_inr skips small trades. Add \"price\" to a row only if no other price source has it.",
+  "cash_pct": 0,
+  "min_trade_inr": 500,
+  "others": "hold",
+  "weights": [
+    {"symbol": "NIFTYBEES", "name": "Nifty 50 ETF (core)", "weight": 40},
+    {"symbol": "JUNIORBEES", "name": "Nifty Next 50 ETF", "weight": 10},
+    {"symbol": "TATAGOLD", "name": "Tata Gold ETF", "weight": 15},
+    {"symbol": "TATSILV", "name": "Tata Silver ETF", "weight": 10},
+    {"symbol": "HINDCOPPER", "name": "Hindustan Copper", "weight": 10},
+    {"symbol": "HAL", "name": "Hindustan Aeronautics", "weight": 15}
+  ]
+}
