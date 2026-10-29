@@ -1,0 +1,1666 @@
+#!/usr/bin/env python3
+"""Market data layer for the NSE trader pack (trader-data). Standard library only.
+
+Free sources are unofficial and get blocked, so every command tries a chain of
+sources, says exactly which one failed and why, and also accepts data you
+saved yourself (Kite MCP JSON, Kite Console / NSE website CSV).
+
+    python3 data.py daily RELIANCE TCS [--years 3|max] [--source auto|yahoo|nse|bhavcopy]
+    python3 data.py intraday RELIANCE [--days 60]
+    python3 data.py bands [RELIANCE ...]
+    python3 data.py import-kite kite-hist.json --kind historical --symbol RELIANCE
+    python3 data.py import-kite kite-quotes.json --kind quotes
+    python3 data.py import-csv RELIANCE.csv --symbol RELIANCE [--adjusted]
+    python3 data.py doctor
+    python3 data.py record RELIANCE [--date 2026-10-23]
+    python3 data.py status
+
+Writes (shared contracts, see PORT_V4_SPEC.md):
+  trader/data/daily/<SYM>.csv        date,open,high,low,close,volume (unadjusted)
+  trader/data/daily/<SYM>.adj.csv    same header, split and bonus adjusted
+  trader/data/intraday/<SYM>-5m.json Yahoo v8 chart JSON shape, 5 minute bars
+  trader/data/bands.json             {"as_of","source","bands":{SYM:{band_pct,lower,upper}},"unknown":[...]}
+  trader/data/sources.json           doctor's per-source health
+  trader/data/cache_meta.json        where each cached file came from and when
+
+Daily chain (auto): Yahoo query1 -> Yahoo query2 -> NSE JSON API (cookie
+primed) -> NSE bhavcopy archives (one file per trading day). Only dates after
+the last cached session are fetched (--fill-gaps also refetches holes).
+Every write is validated: OHLC sanity, no duplicate dates, ascending dates,
+gaps checked against the NSE trading calendar (2024, 2025, 2026).
+"""
+
+import argparse
+import csv
+import datetime
+import gzip
+import http.cookiejar
+import importlib.util
+import io
+import json
+import os
+import re
+import shutil
+import socket
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/124.0 Safari/537.36")
+BROWSER = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9", "Accept-Encoding": "gzip",
+           "Connection": "keep-alive"}
+YAHOO_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
+NSE = "https://www.nseindia.com"
+ARCHIVES = "https://nsearchives.nseindia.com"
+NIFTY_LIST = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
+GNEWS = "https://news.google.com/rss/search?q=RELIANCE%20NSE&hl=en-IN&gl=IN&ceid=IN:en"
+KITE_MCP = "https://mcp.kite.trade/mcp"
+SEC_LIST = ARCHIVES + "/content/equities/sec_list.csv"
+PAUSE = 0.6          # seconds between requests to the same site
+BHAV_PAUSE = 1.0     # bhavcopy archive: one file a second
+RETRIES = 2          # extra tries per Yahoo host on a 429 / 5xx
+BACKOFF = 2.0        # first back-off in seconds, doubles each try
+NSE_CHUNK_DAYS = 100
+TIMEOUT = 20
+IST = datetime.timedelta(hours=5, minutes=30)
+OPEN_T = datetime.time(9, 15)
+CLOSE_T = datetime.time(15, 30)
+BARS_PER_SESSION = 75
+SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9&\-]{0,19}$")
+HEADER = ["date", "open", "high", "low", "close", "volume"]
+STD_BANDS = (2, 5, 10, 20)
+
+# ---------------------------------------------------------------- NSE trading calendar
+# 2026 comes from trader-alerts/alerts.py (loaded below, with this copy as the fallback).
+NSE_HOLIDAYS_2026_COPY = {
+    "2026-01-15": "Maharashtra municipal elections (special holiday)",
+    "2026-01-26": "Republic Day", "2026-03-03": "Holi", "2026-03-26": "Shri Ram Navami",
+    "2026-03-31": "Shri Mahavir Jayanti", "2026-04-03": "Good Friday",
+    "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti", "2026-05-01": "Maharashtra Day",
+    "2026-05-28": "Bakri Id", "2026-06-26": "Muharram", "2026-09-14": "Ganesh Chaturthi",
+    "2026-10-02": "Mahatma Gandhi Jayanti", "2026-10-20": "Dussehra",
+    "2026-11-10": "Diwali Balipratipada", "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
+    "2026-12-25": "Christmas",
+}
+# Special closure announced later: NSE circular CMTR72260 (Jan 2026), Maharashtra municipal elections.
+NSE_EXTRA_2026 = {"2026-01-15": "Maharashtra municipal elections (special holiday)"}
+# 2025: NSE circular 170/2024, NSE/CMTR/65587, 13 Dec 2024
+# (https://nsearchives.nseindia.com/content/circulars/CMTR65587.pdf). Oct 21 is a holiday
+# with a Muhurat session, listed in SPECIAL_SESSIONS so its bar is accepted.
+NSE_HOLIDAYS_2025 = {
+    "2025-02-26": "Mahashivratri", "2025-03-14": "Holi", "2025-03-31": "Id-Ul-Fitr (Ramadan Eid)",
+    "2025-04-10": "Shri Mahavir Jayanti", "2025-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2025-04-18": "Good Friday", "2025-05-01": "Maharashtra Day", "2025-08-15": "Independence Day",
+    "2025-08-27": "Ganesh Chaturthi", "2025-10-02": "Mahatma Gandhi Jayanti/Dussehra",
+    "2025-10-21": "Diwali Laxmi Pujan (Muhurat session)", "2025-10-22": "Diwali-Balipratipada",
+    "2025-11-05": "Prakash Gurpurb Sri Guru Nanak Dev", "2025-12-25": "Christmas",
+}
+# 2024: NSE circular 154/2023, NSE/CMTR/59722, 12 Dec 2023, plus three special closures
+# announced during the year (Jan 22, May 20, Nov 20). Cross-checked against bhavcopy history.
+NSE_HOLIDAYS_2024 = {
+    "2024-01-22": "Special holiday (Ram Mandir)", "2024-01-26": "Republic Day",
+    "2024-03-08": "Mahashivratri", "2024-03-25": "Holi", "2024-03-29": "Good Friday",
+    "2024-04-11": "Id-Ul-Fitr (Ramadan Eid)", "2024-04-17": "Shri Ram Navmi",
+    "2024-05-01": "Maharashtra Day", "2024-05-20": "Lok Sabha election (Mumbai)",
+    "2024-06-17": "Bakri Id", "2024-07-17": "Moharram", "2024-08-15": "Independence Day",
+    "2024-10-02": "Mahatma Gandhi Jayanti", "2024-11-01": "Diwali Laxmi Pujan (Muhurat session)",
+    "2024-11-15": "Gurunanak Jayanti", "2024-11-20": "Maharashtra assembly election",
+    "2024-12-25": "Christmas",
+}
+# Sessions on a weekend or a holiday: a bar on these dates is real, not an error.
+SPECIAL_SESSIONS = {
+    "2023-11-12": "Muhurat (Sunday)", "2024-01-20": "Saturday special session",
+    "2024-03-02": "Saturday DR session", "2024-05-18": "Saturday DR session",
+    "2024-11-01": "Muhurat", "2025-02-01": "Budget day (Saturday)", "2025-10-21": "Muhurat",
+    "2026-02-01": "Budget day (Sunday)", "2026-11-08": "Muhurat (Sunday)",
+}
+
+
+def _alerts_holidays():
+    path = os.path.join(os.path.dirname(HERE), "trader-alerts", "alerts.py")
+    try:
+        spec = importlib.util.spec_from_file_location("trader_alerts_for_data", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        got = {k: v for k, v in mod.NSE_HOLIDAYS.items() if k.startswith("2026-")}
+        return got or dict(NSE_HOLIDAYS_2026_COPY)
+    except Exception:
+        return dict(NSE_HOLIDAYS_2026_COPY)
+
+
+NSE_HOLIDAYS_2026 = _alerts_holidays()
+HOLIDAYS = {}
+for _h in (NSE_HOLIDAYS_2024, NSE_HOLIDAYS_2025, NSE_HOLIDAYS_2026, NSE_EXTRA_2026):
+    HOLIDAYS.update(_h)
+CALENDAR_YEARS = (2024, 2025, 2026)
+
+
+class DataError(Exception):
+    pass
+
+
+class SourceError(DataError):
+    def __init__(self, source, message, hint=""):
+        DataError.__init__(self, message)
+        self.source, self.hint = source, hint
+
+    def __str__(self):
+        msg = DataError.__str__(self)
+        return msg + (" (%s)" % self.hint if self.hint else "")
+
+
+def trading_day(d):
+    iso = d.isoformat()
+    if iso in SPECIAL_SESSIONS:
+        return True
+    if d.weekday() >= 5:
+        return False
+    return iso not in HOLIDAYS
+
+
+def trading_days(start, end):
+    out, d = [], start
+    while d <= end:
+        if trading_day(d):
+            out.append(d)
+        d += datetime.timedelta(days=1)
+    return out
+
+
+def prev_trading_day(d):
+    d -= datetime.timedelta(days=1)
+    while not trading_day(d):
+        d -= datetime.timedelta(days=1)
+    return d
+
+
+# ---------------------------------------------------------------- time (IST, fixed +05:30)
+
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None, microsecond=0)
+
+
+def parse_now(text):
+    """--now "2026-10-23 16:30" (IST, or with an offset) -> naive IST datetime."""
+    if not text:
+        return utc_now() + IST
+    t = text.strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.datetime.fromisoformat(t)
+    except ValueError:
+        raise DataError("--now wants a time like \"2026-10-23 16:30\" (IST)")
+    if dt.tzinfo is not None:
+        dt = (dt - dt.utcoffset()).replace(tzinfo=None) + IST
+    return dt
+
+
+def ts_to_ist(ts):
+    return datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc).replace(tzinfo=None) + IST
+
+
+def ist_to_ts(dt):
+    return int((dt - IST).replace(tzinfo=datetime.timezone.utc).timestamp())
+
+
+def last_complete_session(now_ist):
+    """The latest session whose EOD data should exist (bhavcopy appears in the evening)."""
+    d = now_ist.date()
+    if trading_day(d) and d.weekday() < 5 and now_ist.time() >= datetime.time(18, 0):
+        return d
+    return prev_trading_day(d)
+
+
+def stamp(now_ist=None):
+    n = (now_ist - IST) if now_ist else utc_now()
+    return n.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------- parsing helpers
+
+MONTHS = {m: i + 1 for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug",
+                                           "sep", "oct", "nov", "dec"])}
+
+
+def parse_date(text):
+    """yyyy-mm-dd, dd-mm-yyyy, dd/mm/yyyy, dd-Mon-yyyy, dd Mon yyyy, ISO with time -> date."""
+    s = str(text or "").strip().strip('"').strip()
+    m = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T ].*)?$", s)
+    if m:
+        return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    m = re.match(r"^(\d{1,2})[-/. ](\d{1,2})[-/. ](\d{4})(?:[T ].*)?$", s)
+    if m:   # Indian order: day first
+        return datetime.date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    m = re.match(r"^(\d{1,2})[- ]([A-Za-z]{3})[A-Za-z]*[- ,]+(\d{4})(?:[T ].*)?$", s)
+    if m and m.group(2).lower() in MONTHS:
+        return datetime.date(int(m.group(3)), MONTHS[m.group(2).lower()], int(m.group(1)))
+    m = re.match(r"^([A-Za-z]{3})[A-Za-z]* (\d{1,2}),? (\d{4})$", s)
+    if m and m.group(1).lower() in MONTHS:
+        return datetime.date(int(m.group(3)), MONTHS[m.group(1).lower()], int(m.group(2)))
+    raise DataError("cannot read the date %r" % text)
+
+
+def parse_iso_ist(text):
+    """Kite timestamps: 2026-10-23T09:15:00+0530 / +05:30 / Z / naive (IST) -> naive IST."""
+    s = str(text).strip().replace(" ", "T", 1)
+    s = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", s).replace("Z", "+00:00")
+    try:
+        dt = datetime.datetime.fromisoformat(s)
+    except ValueError:
+        raise DataError("cannot read the time %r" % text)
+    if dt.tzinfo is not None:
+        dt = (dt - dt.utcoffset()).replace(tzinfo=None) + IST
+    return dt
+
+
+def num(x):
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip().replace(",", "").replace("₹", "")
+    if s in ("", "-", "--", "NA", "N/A", "null", "None"):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def fmt(x):
+    if x is None:
+        return ""
+    if isinstance(x, int):
+        return str(x)
+    s = ("%.4f" % x).rstrip("0").rstrip(".")
+    return s if s not in ("", "-0") else "0"
+
+
+def norm_symbol(sym):
+    s = str(sym or "").strip().upper()
+    for suf in (".NS", "-EQ"):
+        if s.endswith(suf):
+            s = s[:-len(suf)]
+    if s.startswith("NSE:"):
+        s = s[4:]
+    if not SYMBOL.match(s):
+        raise DataError("%r is not an NSE symbol (like RELIANCE, M&M, BAJAJ-AUTO)" % sym)
+    return s
+
+
+def bar(date, o, h, low, c, v):
+    return {"date": date if isinstance(date, str) else date.isoformat(), "open": float(o), "high": float(h),
+            "low": float(low), "close": float(c), "volume": int(round(v)) if v is not None else 0}
+
+
+# ---------------------------------------------------------------- validation
+
+def ohlc_problem(o, h, low, c):
+    vals = (o, h, low, c)
+    if any(v is None for v in vals):
+        return "missing price"
+    if min(vals) <= 0:
+        return "price <= 0"
+    eps = 1e-6
+    if low > min(o, c) + eps or h < max(o, c) - eps:
+        return "low/high do not contain open and close (o=%s h=%s l=%s c=%s)" % tuple(fmt(v) for v in vals)
+    return None
+
+
+def compress(dates, limit=8):
+    s = [d.isoformat() if hasattr(d, "isoformat") else d for d in dates]
+    return ", ".join(s[:limit]) + (" and %d more" % (len(s) - limit) if len(s) > limit else "")
+
+
+def validate_daily(rows):
+    """(errors, warnings). Errors block a write; warnings are reported."""
+    errors, warnings = [], []
+    seen, prev = set(), None
+    for r in rows:
+        d = r["date"]
+        try:
+            day = datetime.date.fromisoformat(d)
+        except (TypeError, ValueError):
+            errors.append("bad date %r" % d)
+            continue
+        if d in seen:
+            errors.append("duplicate date %s" % d)
+        seen.add(d)
+        if prev and d <= prev:
+            errors.append("dates not ascending at %s (after %s)" % (d, prev))
+        prev = d
+        p = ohlc_problem(r["open"], r["high"], r["low"], r["close"])
+        if p:
+            errors.append("%s: %s" % (d, p))
+        if r.get("volume") is not None and r["volume"] < 0:
+            errors.append("%s: negative volume" % d)
+        if not trading_day(day) and day.year in CALENDAR_YEARS:
+            warnings.append("%s has a bar but NSE was closed (%s)" % (
+                d, HOLIDAYS.get(d, "weekend")))
+    if rows and not errors:
+        first = datetime.date.fromisoformat(rows[0]["date"])
+        last = datetime.date.fromisoformat(rows[-1]["date"])
+        known = [x for x in trading_days(first, last) if x.year in CALENDAR_YEARS and x.isoformat() not in seen]
+        unknown = [x for x in trading_days(first, last) if x.year not in CALENDAR_YEARS
+                   and x.isoformat() not in seen]
+        if known:
+            warnings.append("gap: %d NSE trading day(s) missing: %s" % (len(known), compress(known)))
+        if unknown:
+            yrs = sorted(set(x.year for x in unknown))
+            warnings.append("%d weekday(s) without a bar in %s (no holiday list for those years, not checked)"
+                            % (len(unknown), ", ".join(map(str, yrs))))
+        for a, b in zip(rows, rows[1:]):
+            ratio = a["close"] / b["open"] if b["open"] else 0
+            for k in (2, 3, 4, 5, 10):
+                if abs(ratio - k) / k < 0.06:
+                    warnings.append("%s opens at 1/%d of the previous close: a split or bonus? "
+                                    "(.adj.csv needs a Yahoo refresh)" % (b["date"], k))
+    return errors, warnings
+
+
+def validate_intraday(bars):
+    """bars: [(ts, o, h, l, c, v)] -> (errors, warnings)."""
+    errors, warnings, prev = [], [], None
+    per_day = {}
+    for b in bars:
+        ts = b[0]
+        t = ts_to_ist(ts)
+        if prev is not None and ts <= prev:
+            errors.append("timestamps not ascending at %s" % t)
+        prev = ts
+        if t.minute % 5 or t.second:
+            errors.append("%s is not on a 5 minute boundary" % t)
+        if not (OPEN_T <= t.time() < CLOSE_T):
+            warnings.append("%s is outside 09:15-15:30 IST" % t)
+        p = ohlc_problem(b[1], b[2], b[3], b[4])
+        if p:
+            errors.append("%s: %s" % (t, p))
+        per_day[t.date()] = per_day.get(t.date(), 0) + 1
+    short = [d for d, n in sorted(per_day.items()) if n != BARS_PER_SESSION]
+    if short:
+        warnings.append("%d session(s) without %d bars: %s" % (
+            len(short), BARS_PER_SESSION, compress(["%s (%d)" % (d, per_day[d]) for d in short])))
+    return errors, warnings
+
+
+# ---------------------------------------------------------------- cache files
+
+def data_paths(data_dir, sym):
+    return (os.path.join(data_dir, "daily", sym + ".csv"), os.path.join(data_dir, "daily", sym + ".adj.csv"),
+            os.path.join(data_dir, "intraday", sym + "-5m.json"))
+
+
+def read_daily(path):
+    if not os.path.exists(path):
+        return []
+    rows = []
+    with open(path, newline="", encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            try:
+                rows.append(bar(r["date"], float(r["open"]), float(r["high"]), float(r["low"]),
+                                float(r["close"]), num(r.get("volume")) or 0))
+            except (KeyError, TypeError, ValueError):
+                raise DataError("%s has a bad row: %r" % (path, r))
+    return rows
+
+
+def _atomic_write(path, text):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def write_daily(path, rows):
+    """Validate, then write. Returns the warnings; raises DataError on errors."""
+    rows = sorted(rows, key=lambda r: r["date"])
+    errors, warnings = validate_daily(rows)
+    if errors:
+        raise DataError("refusing to write %s: %s" % (path, "; ".join(errors[:5])))
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(HEADER)
+    for r in rows:
+        w.writerow([r["date"], fmt(r["open"]), fmt(r["high"]), fmt(r["low"]), fmt(r["close"]),
+                    str(int(r["volume"] or 0))])
+    _atomic_write(path, buf.getvalue())
+    return warnings
+
+
+def merge_rows(old, new):
+    by = {r["date"]: r for r in old}
+    for r in new:
+        by[r["date"]] = r
+    return [by[d] for d in sorted(by)]
+
+
+def split_valid(rows):
+    good, bad = [], []
+    for r in rows:
+        p = ohlc_problem(r["open"], r["high"], r["low"], r["close"])
+        (bad if p else good).append((r, p))
+    return [r for r, _ in good], ["%s: %s" % (r["date"], p) for r, p in bad]
+
+
+def _read_json(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (ValueError, OSError):
+        return default
+
+
+def _write_json(path, doc):
+    _atomic_write(path, json.dumps(doc, indent=1, sort_keys=False) + "\n")
+
+
+def note_meta(data_dir, kind, sym, info):
+    path = os.path.join(data_dir, "cache_meta.json")
+    meta = _read_json(path, {})
+    meta.setdefault(kind, {})[sym] = info
+    _write_json(path, meta)
+
+
+def read_intraday(path):
+    """-> (meta, [(ts, o, h, l, c, v)]) from a Yahoo-shaped chart file."""
+    doc = _read_json(path, None)
+    if not doc:
+        return {}, []
+    return parse_chart(doc)
+
+
+def parse_chart(doc):
+    try:
+        res = doc["chart"]["result"][0]
+    except (KeyError, IndexError, TypeError):
+        err = ((doc or {}).get("chart") or {}).get("error") or {}
+        raise DataError("not a chart: %s" % (err.get("description") or "no chart.result"))
+    q = (res.get("indicators", {}).get("quote") or [{}])[0]
+    out = []
+    cols = [q.get(k) or [] for k in ("open", "high", "low", "close", "volume")]
+    for i, ts in enumerate(res.get("timestamp") or []):
+        vals = [c[i] if i < len(c) else None for c in cols]
+        if any(v is None for v in vals[:4]):
+            continue
+        out.append((int(ts), float(vals[0]), float(vals[1]), float(vals[2]), float(vals[3]),
+                    None if vals[4] is None else int(vals[4])))
+    return res.get("meta", {}) or {}, out
+
+
+def build_chart(sym, bars, meta=None, source=""):
+    bars = sorted(bars)
+    m = dict(meta or {})
+    m.update({"currency": m.get("currency") or "INR", "symbol": m.get("symbol") or sym + ".NS",
+              "exchangeName": m.get("exchangeName") or "NSI", "instrumentType": "EQUITY",
+              "gmtoffset": 19800, "timezone": "IST", "exchangeTimezoneName": "Asia/Kolkata",
+              "dataGranularity": "5m", "source": source or m.get("source", "")})
+    if bars:
+        m["regularMarketPrice"] = bars[-1][4]
+        m["regularMarketTime"] = bars[-1][0] + 300
+    return {"chart": {"result": [{"meta": m, "timestamp": [b[0] for b in bars], "indicators": {"quote": [{
+        "open": [b[1] for b in bars], "high": [b[2] for b in bars], "low": [b[3] for b in bars],
+        "close": [b[4] for b in bars], "volume": [b[5] for b in bars]}]}}], "error": None}}
+
+
+def regular_session(bars):
+    return [b for b in bars if OPEN_T <= ts_to_ist(b[0]).time() < CLOSE_T]
+
+
+def write_intraday(path, sym, new_bars, meta=None, source="", keep_sessions=60):
+    old_meta, old = read_intraday(path)
+    by = {b[0]: b for b in old}
+    for b in regular_session(new_bars):
+        by[b[0]] = b
+    bars = [by[k] for k in sorted(by)]
+    days = sorted(set(ts_to_ist(b[0]).date() for b in bars))[-keep_sessions:]
+    keep = set(days)
+    bars = [b for b in bars if ts_to_ist(b[0]).date() in keep]
+    errors, warnings = validate_intraday(bars)
+    if errors:
+        raise DataError("refusing to write %s: %s" % (path, "; ".join(errors[:5])))
+    m = dict(old_meta)
+    m.update(meta or {})
+    _write_json(path, build_chart(sym, bars, m, source))
+    return bars, warnings
+
+
+def to_5m(points):
+    """[(naive IST datetime, o, h, l, c, v|None)] at any finer step -> 5 minute bars (ts UTC)."""
+    buckets = {}
+    for dt, o, h, low, c, v in sorted(points, key=lambda p: p[0]):
+        if not (OPEN_T <= dt.time() < CLOSE_T):
+            continue
+        start = dt.replace(minute=dt.minute - dt.minute % 5, second=0, microsecond=0)
+        b = buckets.get(start)
+        if b is None:
+            buckets[start] = [o, h, low, c, v]
+        else:
+            b[1], b[2], b[3] = max(b[1], h), min(b[2], low), c
+            b[4] = None if (b[4] is None or v is None) else b[4] + v
+    return [(ist_to_ts(k), v[0], v[1], v[2], v[3], v[4]) for k, v in sorted(buckets.items())]
+
+
+# ---------------------------------------------------------------- HTTP
+
+_transport = None    # tests: fn(url, headers, timeout) -> (status, bytes)
+_sleep = time.sleep
+_clock = time.monotonic
+
+
+class Session(object):
+    """One cookie jar per run, browser-like headers, gzip handled."""
+
+    def __init__(self):
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
+        self.nse_primed = False
+        self.last = {}
+
+    def polite(self, host, gap):
+        t = self.last.get(host)
+        if t is not None and gap:
+            wait = gap - (_clock() - t)
+            if wait > 0:
+                _sleep(wait)
+        self.last[host] = _clock()
+
+    def get(self, url, headers=None, timeout=TIMEOUT, gap=PAUSE):
+        host = urllib.parse.urlsplit(url).netloc
+        self.polite(host, gap)
+        h = dict(BROWSER)
+        h.update(headers or {})
+        if _transport is not None:
+            return _transport(url, h, timeout)
+        req = urllib.request.Request(url, headers=h)
+        try:
+            with self.opener.open(req, timeout=timeout) as r:
+                body = r.read()
+                if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+                    body = gzip.decompress(body)
+                return r.status, body
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read()
+            except Exception:
+                body = b""
+            finally:
+                try:
+                    e.close()
+                except Exception:
+                    pass
+            return e.code, body
+        except socket.timeout:
+            raise SourceError(host, "%s timed out after %ss" % (host, timeout), "network or firewall")
+        except (urllib.error.URLError, OSError) as e:
+            why = str(getattr(e, "reason", e))
+            tip = ("a proxy or firewall on this network blocks %s; use Kite MCP or import-csv" % host
+                   if "403" in why or "407" in why else "no network, DNS or firewall")
+            raise SourceError(host, "could not reach %s: %s" % (host, why), tip)
+
+
+def hint(source, code):
+    if source.startswith("nse") or source.startswith("bhav") or source == "nsearchives":
+        if code == 403:
+            return "403: NSE blocks this IP (cloud, VPN and datacenter IPs usually are); use Kite MCP or import-csv"
+        if code == 401:
+            return "401: NSE wants fresh browser cookies; try again, or use Kite MCP"
+        if code == 404:
+            return "404: not published (holiday, weekend, before ~18:00 IST, or a wrong symbol)"
+    if source.startswith("yahoo"):
+        if code == 429:
+            return "429: Yahoo rate limit; wait a few minutes"
+        if code in (401, 403):
+            return "%d: Yahoo refused this client (cookie/crumb wall or blocked IP); use Kite MCP or import-csv" % code
+        if code == 404:
+            return "404: Yahoo does not know this ticker (.NS)"
+    if code == 403:
+        return "403: blocked by the site or a proxy"
+    if code >= 500:
+        return "%d: the site is having trouble; try later" % code
+    return "HTTP %d" % code
+
+
+def _json(body, source, what):
+    try:
+        return json.loads(body.decode("utf-8", "replace") if isinstance(body, bytes) else body)
+    except ValueError:
+        raise SourceError(source, "%s did not return JSON (a bot wall or an error page)" % what,
+                          "use Kite MCP or import-csv")
+
+
+# ---------------------------------------------------------------- Yahoo
+
+def yahoo_symbol(sym):
+    return urllib.parse.quote(sym) + ".NS"
+
+
+def yahoo_url(host, sym, interval, rng=None, p1=None, p2=None):
+    q = "interval=%s&includePrePost=false&events=div%%2Csplit" % interval
+    q += ("&range=%s" % rng) if rng else ("&period1=%d&period2=%d" % (p1, p2))
+    return "https://%s/v8/finance/chart/%s?%s" % (host, yahoo_symbol(sym), q)
+
+
+def fetch_yahoo(sess, sym, interval, rng=None, p1=None, p2=None, hosts=YAHOO_HOSTS):
+    """query1 then query2, each with retries and back-off on a 429 / 5xx. -> chart dict."""
+    errs = []
+    for host in hosts:
+        src = "yahoo-q%s" % host[5]
+        url = yahoo_url(host, sym, interval, rng, p1, p2)
+        wait = BACKOFF
+        for attempt in range(RETRIES + 1):
+            try:
+                code, body = sess.get(url, {"Accept": "application/json"})
+            except SourceError as e:
+                errs.append("%s: %s" % (src, e))
+                break
+            if code == 200:
+                doc = _json(body, src, "Yahoo")
+                if not (doc.get("chart") or {}).get("result"):
+                    err = (doc.get("chart") or {}).get("error") or {}
+                    raise SourceError(src, "Yahoo has no data for %s.NS: %s" % (
+                        sym, err.get("description", "empty result")))
+                return doc
+            if code == 404:
+                raise SourceError(src, "Yahoo does not know %s.NS" % sym, hint(src, 404))
+            if code == 429 or code >= 500:
+                if attempt < RETRIES:
+                    _sleep(wait)
+                    wait *= 2
+                    continue
+            errs.append("%s: HTTP %d (%s)" % (src, code, hint(src, code)))
+            break
+    raise SourceError("yahoo", "; ".join(errs))
+
+
+def parse_yahoo_daily(doc):
+    """-> (unadjusted rows, split/bonus-adjusted rows, splits [(date, factor)]).
+
+    Yahoo's daily OHLC is already split and bonus adjusted (a 1:1 bonus is a 2:1 split
+    there). The unadjusted series multiplies back every split after each date."""
+    res = doc["chart"]["result"][0]
+    q = (res.get("indicators", {}).get("quote") or [{}])[0]
+    splits = []
+    for ev in ((res.get("events") or {}).get("splits") or {}).values():
+        try:
+            f = float(ev["numerator"]) / float(ev["denominator"])
+            splits.append((ts_to_ist(ev["date"]).date(), f))
+        except (KeyError, ValueError, ZeroDivisionError, TypeError):
+            continue
+    splits.sort()
+    adj, raw = [], []
+    for i, ts in enumerate(res.get("timestamp") or []):
+        try:
+            o, h, low, c, v = (q[k][i] for k in ("open", "high", "low", "close", "volume"))
+        except (KeyError, IndexError):
+            continue
+        if None in (o, h, low, c):
+            continue
+        d = ts_to_ist(ts).date()
+        adj.append(bar(d, round(o, 4), round(h, 4), round(low, 4), round(c, 4), v or 0))
+        f = 1.0
+        for sd, sf in splits:
+            if sd > d:
+                f *= sf
+        raw.append(bar(d, round(o * f, 2), round(h * f, 2), round(low * f, 2), round(c * f, 2),
+                       (v or 0) / f))
+    # Yahoo can send today's partial bar twice; keep the last per date
+    return merge_rows([], raw), merge_rows([], adj), splits
+
+
+# ---------------------------------------------------------------- NSE website (cookie primed)
+
+def nse_prime(sess, force=False):
+    if sess.nse_primed and not force:
+        return
+    code, _ = sess.get(NSE + "/", {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                                   "Referer": NSE + "/", "Upgrade-Insecure-Requests": "1"})
+    if code != 200:
+        raise SourceError("nse-home", "www.nseindia.com home page answered HTTP %d" % code, hint("nse", code))
+    sess.nse_primed = True
+
+
+def nse_api(sess, path, referer):
+    nse_prime(sess)
+    hdr = {"Accept": "application/json, text/plain, */*", "Referer": referer, "X-Requested-With": "XMLHttpRequest"}
+    code, body = sess.get(NSE + path, hdr)
+    if code == 401:
+        nse_prime(sess, force=True)
+        code, body = sess.get(NSE + path, hdr)
+    if code != 200:
+        raise SourceError("nse-api", "NSE %s answered HTTP %d" % (path.split("?")[0], code), hint("nse", code))
+    return _json(body, "nse-api", "NSE " + path.split("?")[0])
+
+
+def nse_hist_path(sym, start, end):
+    return "/api/historical/cm/equity?symbol=%s&series=%s&from=%s&to=%s" % (
+        urllib.parse.quote(sym), urllib.parse.quote('["EQ"]'), start.strftime("%d-%m-%Y"),
+        end.strftime("%d-%m-%Y"))
+
+
+def parse_nse_hist(doc):
+    rows = {}
+    for r in (doc.get("data") if isinstance(doc, dict) else doc) or []:
+        series = str(r.get("CH_SERIES", "EQ")).strip()
+        try:
+            d = parse_date(r.get("CH_TIMESTAMP") or r.get("mTIMESTAMP"))
+        except DataError:
+            continue
+        vals = [num(r.get(k)) for k in ("CH_OPENING_PRICE", "CH_TRADE_HIGH_PRICE", "CH_TRADE_LOW_PRICE",
+                                         "CH_CLOSING_PRICE", "CH_TOT_TRADED_QTY")]
+        if None in vals[:4]:
+            continue
+        if d.isoformat() in rows and series != "EQ":
+            continue
+        rows[d.isoformat()] = bar(d, *vals)
+    return [rows[k] for k in sorted(rows)]
+
+
+def fetch_nse_daily(sess, sym, start, end):
+    out, d = [], start
+    ref = NSE + "/get-quotes/equity?symbol=" + urllib.parse.quote(sym)
+    while d <= end:
+        e = min(end, d + datetime.timedelta(days=NSE_CHUNK_DAYS - 1))
+        out = merge_rows(out, parse_nse_hist(nse_api(sess, nse_hist_path(sym, d, e), ref)))
+        d = e + datetime.timedelta(days=1)
+    return out
+
+
+def nse_quote(sess, sym):
+    return nse_api(sess, "/api/quote-equity?symbol=" + urllib.parse.quote(sym),
+                   NSE + "/get-quotes/equity?symbol=" + urllib.parse.quote(sym))
+
+
+def parse_nse_chart(doc):
+    """chart-databyindex -> 5m bars. Its ms timestamps are IST wall time written as UTC."""
+    pts = doc.get("grapthData") or doc.get("graphData") or []
+    out = []
+    for p in pts:
+        try:
+            ms, price = p[0], float(p[1])
+        except (IndexError, TypeError, ValueError):
+            continue
+        dt = datetime.datetime.fromtimestamp(ms / 1000.0, datetime.timezone.utc).replace(tzinfo=None)
+        if not (datetime.time(8, 0) <= dt.time() <= datetime.time(16, 30)):
+            dt += IST   # a true UTC stamp after all
+        out.append((dt, price, price, price, price, None))
+    return to_5m(out)
+
+
+# ---------------------------------------------------------------- NSE bhavcopy archives
+
+def bhav_urls(d):
+    return [ARCHIVES + "/products/content/sec_bhavdata_full_%s.csv" % d.strftime("%d%m%Y"),
+            ARCHIVES + "/content/cm/BhavCopy_NSE_CM_0_0_0_%s_F_0000.csv.zip" % d.strftime("%Y%m%d")]
+
+
+def _key(h):
+    return " ".join(str(h or "").replace("﻿", "").strip().lower().split())
+
+
+def parse_bhav(text, want=None):
+    """sec_bhavdata_full or the UDiFF CM bhavcopy -> {SYMBOL: bar}. EQ series preferred."""
+    rd = csv.reader(io.StringIO(text))
+    try:
+        head = [_key(h) for h in next(rd)]
+    except StopIteration:
+        return {}
+    pick = lambda *names: next((head.index(n) for n in names if n in head), None)  # noqa: E731
+    ix = {"sym": pick("symbol", "tckrsymb"), "ser": pick("series", "sctysrs"),
+          "date": pick("date1", "traddt", "timestamp"), "o": pick("open_price", "opnpric", "open"),
+          "h": pick("high_price", "hghpric", "high"), "l": pick("low_price", "lwpric", "low"),
+          "c": pick("close_price", "clspric", "close"), "v": pick("ttl_trd_qnty", "ttltradgvol", "tottrdqty")}
+    if None in (ix["sym"], ix["o"], ix["h"], ix["l"], ix["c"], ix["date"]):
+        raise DataError("not a bhavcopy (columns: %s)" % ", ".join(head[:8]))
+    out = {}
+    for r in rd:
+        if len(r) < len(head):
+            continue
+        sym = r[ix["sym"]].strip().upper()
+        if want and sym not in want:
+            continue
+        ser = r[ix["ser"]].strip().upper() if ix["ser"] is not None else "EQ"
+        if ser not in ("EQ", "BE", "BZ", "SM", "ST"):
+            continue
+        if sym in out and ser != "EQ":
+            continue
+        vals = [num(r[ix[k]]) for k in ("o", "h", "l", "c")]
+        if None in vals:
+            continue
+        v = num(r[ix["v"]]) if ix["v"] is not None else 0
+        out[sym] = bar(parse_date(r[ix["date"]]), vals[0], vals[1], vals[2], vals[3], v)
+    return out
+
+
+class Bhav(object):
+    """Fetches each trading day once per run and serves every symbol from it."""
+
+    def __init__(self, sess):
+        self.sess, self.days, self.errors = sess, {}, {}
+
+    def day(self, d):
+        if d in self.days:
+            return self.days[d]
+        table, last = None, None
+        for url in bhav_urls(d):
+            try:
+                code, body = self.sess.get(url, {"Accept": "*/*", "Referer": NSE + "/"}, gap=BHAV_PAUSE)
+            except SourceError as e:
+                last = str(e)
+                break
+            if code == 200:
+                if url.endswith(".zip"):
+                    try:
+                        z = zipfile.ZipFile(io.BytesIO(body))
+                        body = z.read([n for n in z.namelist() if n.lower().endswith(".csv")][0])
+                    except (zipfile.BadZipFile, IndexError, KeyError):
+                        last = "bad zip from %s" % url
+                        continue
+                try:
+                    table = parse_bhav(body.decode("utf-8", "replace"))
+                    break
+                except DataError as e:
+                    last = str(e)
+                    continue
+            last = "HTTP %d (%s)" % (code, hint("bhav", code))
+            if code in (401, 403):
+                break
+        self.days[d] = table
+        if table is None:
+            self.errors[d] = last
+        return table
+
+
+def fetch_bhav_daily(bhav, sym, days, max_days):
+    if len(days) > max_days:
+        days = days[-max_days:]
+    rows, fails = [], []
+    for d in days:
+        t = bhav.day(d)
+        if t is None:
+            fails.append(d)
+            if len(fails) >= 3 and not rows:   # blocked, not a few missing files
+                raise SourceError("bhavcopy", "nsearchives bhavcopy: %s" % bhav.errors.get(d), "")
+            continue
+        if sym in t:
+            rows.append(t[sym])
+    if not rows:
+        raise SourceError("bhavcopy", "no bhavcopy rows for %s (%s)" % (
+            sym, bhav.errors.get(fails[-1], "symbol not in the files") if fails else "symbol not in the files"))
+    return rows
+
+
+def parse_sec_list(text):
+    """sec_list.csv (Symbol, Series, Security Name, Band, ...) -> {SYM: band_pct|None}."""
+    rd = csv.reader(io.StringIO(text))
+    head = [_key(h) for h in next(rd)]
+    try:
+        si, bi = head.index("symbol"), head.index("band")
+    except ValueError:
+        raise DataError("sec_list.csv has no Symbol/Band columns")
+    ser = head.index("series") if "series" in head else None
+    out = {}
+    for r in rd:
+        if len(r) <= max(si, bi):
+            continue
+        s = r[si].strip().upper()
+        if ser is not None and r[ser].strip().upper() not in ("EQ", "BE", "BZ") and s in out:
+            continue
+        out[s] = band_value(r[bi])
+    return out
+
+
+def band_value(text):
+    """'No Band' -> None; '20' / '20%' / 20 -> 20; anything else -> 'unknown'."""
+    s = str(text if text is not None else "").strip().lower().replace("%", "")
+    if s in ("no band", "nb", "none"):
+        return None
+    try:
+        v = float(s)
+        return int(v) if v == int(v) else v
+    except ValueError:
+        return "unknown"
+
+
+def snap_band(prev_close, lower, upper):
+    """Circuit limits from Kite -> nearest standard band % (2, 5, 10, 20), or None."""
+    if not prev_close or not upper:
+        return None
+    pct = (upper / prev_close - 1) * 100
+    best = min(STD_BANDS, key=lambda b: abs(b - pct))
+    return best if abs(best - pct) <= 0.75 else None
+
+
+# ---------------------------------------------------------------- daily command
+
+def window(rows, years, now_ist, fill_gaps):
+    end = last_complete_session(now_ist)
+    if rows:
+        last = datetime.date.fromisoformat(rows[-1]["date"])
+        have = set(r["date"] for r in rows)
+        if fill_gaps:
+            first = datetime.date.fromisoformat(rows[0]["date"])
+            miss = [d for d in trading_days(first, end) if d.isoformat() not in have and d.year in CALENDAR_YEARS]
+        else:
+            miss = trading_days(last + datetime.timedelta(days=1), end)
+        return miss, end
+    if years == "max":
+        start = datetime.date(1994, 11, 3)
+    else:
+        start = end - datetime.timedelta(days=int(round(365.25 * float(years))))
+    return trading_days(start, end), end
+
+
+def get_daily(sess, bhav, sym, miss, end, source, years, max_days):
+    """Fallback chain. -> (raw rows, adj rows|None, source name, [errors])."""
+    chain = {"auto": ["yahoo", "nse", "bhavcopy"], "yahoo": ["yahoo"], "nse": ["nse"],
+             "bhavcopy": ["bhavcopy"]}[source]
+    start = miss[0]
+    errors = []
+    for src in chain:
+        try:
+            if src == "yahoo":
+                if years == "max" and start.year < 1996:
+                    doc = fetch_yahoo(sess, sym, "1d", rng="max")
+                else:
+                    p1 = ist_to_ts(datetime.datetime.combine(start, datetime.time(0, 0)))
+                    p2 = ist_to_ts(datetime.datetime.combine(end, datetime.time(23, 59)))
+                    doc = fetch_yahoo(sess, sym, "1d", p1=p1, p2=p2)
+                raw, adj, splits = parse_yahoo_daily(doc)
+                raw = [r for r in raw if start.isoformat() <= r["date"] <= end.isoformat()]
+                adj = [r for r in adj if start.isoformat() <= r["date"] <= end.isoformat()]
+                if not raw:
+                    raise SourceError("yahoo", "Yahoo returned no bars from %s" % start)
+                return raw, adj, "yahoo", errors, splits
+            if src == "nse":
+                rows = fetch_nse_daily(sess, sym, start, end)
+                if not rows:
+                    raise SourceError("nse-api", "NSE returned no bars for %s from %s" % (sym, start),
+                                      "check the symbol on nseindia.com")
+                return rows, None, "nse-api", errors, []
+            if src == "bhavcopy":
+                return fetch_bhav_daily(bhav, sym, miss, max_days), None, "nse-bhavcopy", errors, []
+        except SourceError as e:
+            errors.append("%s: %s" % (src, e))
+    return None, None, None, errors, []
+
+
+def cmd_daily(a):
+    now = parse_now(a.now)
+    sess, rc = Session(), 0
+    bhav = Bhav(sess)
+    for s in a.symbols:
+        sym = norm_symbol(s)
+        raw_p, adj_p, _ = data_paths(a.data, sym)
+        old = read_daily(raw_p)
+        miss, end = window(old, a.years, now, a.fill_gaps)
+        if not miss:
+            print("%s: up to date (last session %s)." % (sym, old[-1]["date"] if old else end))
+            continue
+        raw, adj, src, errors, splits = get_daily(sess, bhav, sym, miss, end, a.source, a.years, a.max_days)
+        if raw is None:
+            rc = 1
+            print("%s: every source failed:" % sym)
+            for e in errors:
+                print("  - " + e)
+            print("  Fix: in Claude, call the Kite MCP tool get_historical_data and run import-kite, "
+                  "or download a CSV (Kite Console / nseindia.com) and run import-csv.")
+            continue
+        raw, bad = split_valid(raw)
+        merged = merge_rows(old, raw)
+        try:
+            warns = write_daily(raw_p, merged)
+        except DataError as e:
+            rc = 1
+            print("%s: %s" % (sym, e))
+            continue
+        old_adj = read_daily(adj_p)
+        if adj is not None:
+            adj, bad2 = split_valid(adj)
+            if old_adj and splits and any(d > datetime.date.fromisoformat(old_adj[0]["date"]) for d, _ in splits):
+                # a split inside the window rescales all history: refetch the whole adjusted series
+                try:
+                    p1 = ist_to_ts(datetime.datetime.combine(
+                        datetime.date.fromisoformat(old_adj[0]["date"]), datetime.time(0, 0)))
+                    _, adj, _ = parse_yahoo_daily(fetch_yahoo(sess, sym, "1d", p1=p1, p2=ist_to_ts(now)))
+                    old_adj = []
+                except SourceError as e:
+                    errors.append("adjusted refresh: %s" % e)
+            write_daily(adj_p, merge_rows(old_adj, adj))
+        elif old_adj:
+            # unadjusted bars after the last split equal adjusted ones; flagged if a split shows up
+            write_daily(adj_p, merge_rows(old_adj, raw))
+        added = len(set(r["date"] for r in merged) - set(r["date"] for r in old))
+        note_meta(a.data, "daily", sym, {"source": src, "fetched_at": stamp(), "rows": len(merged),
+                                         "first": merged[0]["date"], "last": merged[-1]["date"],
+                                         "adjusted_file": os.path.exists(adj_p)})
+        print("%s: +%d bar(s) from %s, %d cached (%s to %s)%s." % (
+            sym, added, src, len(merged), merged[0]["date"], merged[-1]["date"],
+            ", .adj.csv updated" if os.path.exists(adj_p) else ""))
+        if src == "nse-bhavcopy" and len(miss) > a.max_days:
+            print("  note: bhavcopy is one file per day; fetched the latest %d of %d missing sessions "
+                  "(run again, or raise --max-days)" % (a.max_days, len(miss)))
+        for e in errors:
+            print("  tried first: " + e)
+        for b in bad:
+            print("  dropped bad bar " + b)
+        for w in warns:
+            print("  warning: " + w)
+    return rc
+
+
+# ---------------------------------------------------------------- intraday command
+
+def cmd_intraday(a):
+    sess, rc = Session(), 0
+    days = max(1, min(60, a.days))
+    for s in a.symbols:
+        sym = norm_symbol(s)
+        path = data_paths(a.data, sym)[2]
+        errors, bars, meta, src = [], None, {}, None
+        if a.source in ("auto", "yahoo"):
+            try:
+                doc = fetch_yahoo(sess, sym, "5m", rng="%dd" % days)
+                meta, bars = parse_chart(doc)
+                meta = {k: v for k, v in meta.items() if k not in ("tradingPeriods", "currentTradingPeriod")}
+                src = "yahoo"
+            except (SourceError, DataError) as e:
+                errors.append("yahoo: %s" % e)
+        if bars is None and a.source in ("auto", "nse"):
+            try:
+                doc = nse_api(sess, "/api/chart-databyindex?index=%sEQN" % urllib.parse.quote(sym),
+                              NSE + "/get-quotes/equity?symbol=" + urllib.parse.quote(sym))
+                bars, src = parse_nse_chart(doc), "nse-chart"
+                if not bars:
+                    raise SourceError("nse-chart", "NSE chart had no ticks in market hours")
+            except (SourceError, DataError) as e:
+                bars = None
+                errors.append("nse: %s" % e)
+        if not bars:
+            rc = 1
+            print("%s: every intraday source failed:" % sym)
+            for e in errors:
+                print("  - " + e)
+            print("  Fix: call Kite MCP get_historical_data with interval \"5minute\" (or \"minute\") and run "
+                  "import-kite --kind historical.")
+            continue
+        try:
+            allbars, warns = write_intraday(path, sym, bars, meta, src)
+        except DataError as e:
+            rc = 1
+            print("%s: %s" % (sym, e))
+            continue
+        sessions = sorted(set(ts_to_ist(b[0]).date() for b in allbars))
+        note_meta(a.data, "intraday", sym, {"source": src, "fetched_at": stamp(), "bars": len(allbars),
+                                            "sessions": len(sessions), "last": sessions[-1].isoformat()})
+        print("%s: %d 5m bars from %s, %d session(s) cached, last %s%s." % (
+            sym, len(regular_session(bars)), src, len(sessions), sessions[-1],
+            " (NSE chart: one session, no volume)" if src == "nse-chart" else ""))
+        for e in errors:
+            print("  tried first: " + e)
+        for w in warns:
+            print("  warning: " + w)
+    return rc
+
+
+# ---------------------------------------------------------------- bands command
+
+def write_bands(data_dir, entries, unknown, as_of, source):
+    path = os.path.join(data_dir, "bands.json")
+    doc = _read_json(path, {})
+    bands = dict(doc.get("bands") or {})
+    bands.update(entries)
+    unk = sorted((set(doc.get("unknown") or []) | set(unknown)) - set(bands))
+    srcs = sorted(set([source] + [x for x in str(doc.get("source") or "").split(",") if x]))
+    out = {"as_of": as_of, "source": ",".join(s for s in srcs if s), "bands": dict(sorted(bands.items())),
+           "unknown": unk}
+    _write_json(path, out)
+    return out
+
+
+def cmd_bands(a):
+    now = parse_now(a.now)
+    syms = [norm_symbol(s) for s in a.symbols]
+    if not syms:
+        dd = os.path.join(a.data, "daily")
+        syms = sorted(f[:-4] for f in (os.listdir(dd) if os.path.isdir(dd) else [])
+                      if f.endswith(".csv") and not f.endswith(".adj.csv"))
+        syms += [s for s in (_read_json(os.path.join(a.data, "bands.json"), {}).get("bands") or {})
+                 if s not in syms]
+    if not syms:
+        raise DataError("no symbols: give some, or fill the daily cache first")
+    sess, entries, unknown, errors, used = Session(), {}, [], [], set()
+    today = now.date().isoformat()
+    nse_ok = a.source in ("auto", "nse")
+    for sym in syms:
+        if not nse_ok:
+            break
+        try:
+            pi = nse_quote(sess, sym).get("priceInfo") or {}
+            bv = band_value(pi.get("pPriceBand"))
+            if bv == "unknown":
+                raise SourceError("nse-api", "NSE quote for %s has no pPriceBand" % sym)
+            entries[sym] = {"band_pct": bv, "lower": num(pi.get("lowerCP")), "upper": num(pi.get("upperCP")),
+                            "source": "nse-quote", "as_of": today}
+            used.add("nse-quote")
+        except SourceError as e:
+            errors.append("nse quote %s: %s" % (sym, e))
+            if e.source in ("nse-home",) or "403" in str(e):
+                nse_ok = False   # blocked: do not hammer it
+    rest = [s for s in syms if s not in entries]
+    if rest and a.source in ("auto", "seclist"):
+        try:
+            code, body = sess.get(SEC_LIST, {"Referer": NSE + "/"})
+            if code != 200:
+                raise SourceError("nsearchives", "sec_list.csv answered HTTP %d" % code, hint("nse", code))
+            table = parse_sec_list(body.decode("utf-8", "replace"))
+            for sym in rest:
+                bv = table.get(sym, "unknown")
+                if bv != "unknown":
+                    entries[sym] = {"band_pct": bv, "lower": None, "upper": None, "source": "nse-sec-list",
+                                    "as_of": today}
+                    used.add("nse-sec-list")
+        except (SourceError, DataError) as e:
+            errors.append("sec_list: %s" % e)
+    unknown = [s for s in syms if s not in entries]
+    doc = write_bands(a.data, entries, unknown, today, ",".join(sorted(used)))
+    for sym in syms:
+        e = entries.get(sym)
+        if e:
+            print("%-12s band %-8s lower %-10s upper %-10s (%s)" % (
+                sym, "none" if e["band_pct"] is None else "%s%%" % e["band_pct"], fmt(e["lower"]) or "-",
+                fmt(e["upper"]) or "-", e["source"]))
+        else:
+            print("%-12s band unknown (not guessed)" % sym)
+    for e in errors:
+        print("  " + e)
+    if unknown:
+        print("Unknown bands stay unknown. Kite MCP get_quotes gives lower_circuit_limit / upper_circuit_limit: "
+              "save it and run import-kite --kind quotes.")
+    print("Wrote %s (%d known)." % (os.path.join(a.data, "bands.json"), len(doc["bands"])))
+    return 0 if not unknown else 1
+
+
+# ---------------------------------------------------------------- Kite MCP imports
+
+def _unwrap(doc):
+    if isinstance(doc, dict) and "data" in doc and (doc.get("status") in (None, "success") or len(doc) <= 3):
+        return doc["data"]
+    return doc
+
+
+def kite_candles(doc):
+    """[ts, o, h, l, c, v(, oi)] lists or {date, open, ...} dicts -> [(IST dt, o, h, l, c, v)]."""
+    d = _unwrap(doc)
+    if isinstance(d, dict):
+        d = d.get("candles") or d.get("data") or []
+    out = []
+    for c in d:
+        if isinstance(c, dict):
+            ts, vals = c.get("date") or c.get("timestamp"), [c.get(k) for k in ("open", "high", "low", "close",
+                                                                                "volume")]
+        else:
+            ts, vals = c[0], list(c[1:6]) + [None] * (5 - len(c[1:6]))
+        out.append((parse_iso_ist(ts),) + tuple(num(v) for v in vals))
+    return sorted(out, key=lambda x: x[0])
+
+
+def import_kite_historical(a, doc):
+    if not a.symbol:
+        raise DataError("--symbol is required for --kind historical (Kite candles do not name the stock)")
+    sym = norm_symbol(a.symbol)
+    cs = kite_candles(doc)
+    if not cs:
+        raise DataError("no candles in %s" % a.file)
+    daily = all(c[0].time() == datetime.time(0, 0) for c in cs)
+    raw_p, adj_p, intra_p = data_paths(a.data, sym)
+    if daily:
+        rows, bad = split_valid([bar(c[0].date(), c[1], c[2], c[3], c[4], c[5]) for c in cs])
+        target = adj_p if a.adjusted else raw_p
+        merged = merge_rows(read_daily(target), rows)
+        warns = write_daily(target, merged)
+        note_meta(a.data, "daily", sym, {"source": "kite-mcp", "fetched_at": stamp(), "rows": len(merged),
+                                         "first": merged[0]["date"], "last": merged[-1]["date"],
+                                         "file": os.path.basename(target)})
+        print("%s: %d daily bar(s) from Kite into %s (%s to %s)." % (sym, len(rows), target, rows[0]["date"],
+                                                                     rows[-1]["date"]))
+    else:
+        steps = sorted(set(int((b[0] - x[0]).total_seconds()) for x, b in zip(cs, cs[1:])
+                           if b[0].date() == x[0].date()))
+        step = steps[0] if steps else 300
+        if step > 300 or 300 % step:
+            raise DataError("these candles are %d seconds apart; need minute, 3minute or 5minute" % step)
+        bars = to_5m(cs)
+        allbars, warns = write_intraday(intra_p, sym, bars, {"source": "kite-mcp"}, "kite-mcp")
+        sessions = sorted(set(ts_to_ist(b[0]).date() for b in allbars))
+        note_meta(a.data, "intraday", sym, {"source": "kite-mcp", "fetched_at": stamp(), "bars": len(allbars),
+                                            "sessions": len(sessions), "last": sessions[-1].isoformat()})
+        bad = []
+        print("%s: %d 5m bar(s) from Kite (%d-second candles) into %s." % (sym, len(bars), step, intra_p))
+    for b in bad:
+        print("  dropped bad bar " + b)
+    for w in warns:
+        print("  warning: " + w)
+    return 0
+
+
+def import_kite_quotes(a, doc, kind):
+    now = parse_now(a.now)
+    d = _unwrap(doc)
+    if not isinstance(d, dict):
+        raise DataError("expected an object keyed by \"NSE:SYMBOL\"")
+    want = norm_symbol(a.symbol) if a.symbol else None
+    entries, wrote = {}, 0
+    for key, q in sorted(d.items()):
+        if not isinstance(q, dict):
+            continue
+        if ":" in key and not key.upper().startswith("NSE:"):
+            continue
+        sym = norm_symbol(key.split(":")[-1])
+        if want and sym != want:
+            continue
+        ohlc = q.get("ohlc") or {}
+        prev = num(ohlc.get("close"))
+        lo, up = num(q.get("lower_circuit_limit")), num(q.get("upper_circuit_limit"))
+        if lo and up:
+            entries[sym] = {"band_pct": snap_band(prev, lo, up), "lower": lo, "upper": up, "source": "kite-mcp",
+                            "as_of": now.date().isoformat()}
+        # a daily bar only when the session is over: ohlc.close is the PREVIOUS close in Kite
+        when = parse_iso_ist(q["timestamp"]) if q.get("timestamp") else None
+        if kind == "ohlc" and a.date:
+            when = datetime.datetime.combine(parse_date(a.date), CLOSE_T)
+        elif when is None:
+            when = now
+        last = num(q.get("last_price"))
+        o, h, low = num(ohlc.get("open")), num(ohlc.get("high")), num(ohlc.get("low"))
+        if when.time() >= CLOSE_T and trading_day(when.date()) and None not in (o, h, low, last):
+            raw_p = data_paths(a.data, sym)[0]
+            row = bar(when.date(), o, h, low, last, num(q.get("volume")) or num(q.get("volume_traded")) or 0)
+            p = ohlc_problem(o, h, low, last)
+            if p:
+                print("%s: not saving the %s bar: %s" % (sym, row["date"], p))
+            else:
+                write_daily(raw_p, merge_rows(read_daily(raw_p), [row]))
+                wrote += 1
+                print("%s: saved the %s daily bar (close %s = last_price after 15:30)." % (
+                    sym, row["date"], fmt(last)))
+        else:
+            print("%s: no daily bar saved (session not over at %s; pass --date for get_ohlc after the close)." % (
+                sym, when.strftime("%Y-%m-%d %H:%M")))
+    if entries:
+        write_bands(a.data, entries, [], now.date().isoformat(), "kite-mcp")
+        for sym, e in entries.items():
+            print("%s: band %s, lower %s, upper %s -> bands.json" % (
+                sym, "?" if e["band_pct"] is None else "%s%%" % e["band_pct"], fmt(e["lower"]), fmt(e["upper"])))
+    if not entries and not wrote:
+        raise DataError("nothing usable in %s" % a.file)
+    return 0
+
+
+def cmd_import_kite(a):
+    with open(a.file, encoding="utf-8-sig") as fh:
+        try:
+            doc = json.load(fh)
+        except ValueError:
+            raise DataError("%s is not JSON (save the tool output as-is)" % a.file)
+    if a.kind == "historical":
+        return import_kite_historical(a, doc)
+    return import_kite_quotes(a, doc, a.kind)
+
+
+# ---------------------------------------------------------------- CSV imports
+
+CSV_COLS = {
+    "date": ["date", "timestamp", "trade date", "tradedt", "date1", "ch_timestamp", "datetime"],
+    "open": ["open", "open price", "open_price", "opnpric", "opening price"],
+    "high": ["high", "high price", "high_price", "hghpric"],
+    "low": ["low", "low price", "low_price", "lwpric"],
+    "close": ["close", "close price", "close_price", "closing price", "clspric", "last", "last price", "ltp"],
+    "volume": ["volume", "total traded quantity", "ttl_trd_qnty", "ttltradgvol", "shares traded",
+               "no. of shares", "tottrdqty", "qty", "vol"],
+    "series": ["series", "sctysrs"],
+    "symbol": ["symbol", "tckrsymb"],
+}
+
+
+def parse_ohlc_csv(text, symbol=None):
+    """Kite Console, NSE website, Yahoo, eod2 or bhavcopy-style CSV -> (rows, notes)."""
+    rd = csv.reader(io.StringIO(text))
+    head = None
+    for r in rd:
+        if r and any(_key(c) in CSV_COLS["date"] for c in r):
+            head = [_key(c) for c in r]
+            break
+    if not head:
+        raise DataError("no header row with a Date column")
+    ix = {}
+    for k, names in CSV_COLS.items():
+        for n in names:
+            if n in head:
+                ix[k] = head.index(n)
+                break
+    missing = [k for k in ("date", "open", "high", "low", "close") if k not in ix]
+    if missing:
+        raise DataError("missing column(s): %s (header: %s)" % (", ".join(missing), ", ".join(head)))
+    by, notes, series_seen, skipped = {}, [], set(), 0
+    for r in rd:
+        if not r or len(r) <= max(ix.values()) or not "".join(r).strip():
+            continue
+        if "symbol" in ix and symbol and r[ix["symbol"]].strip().upper() != symbol:
+            continue
+        ser = r[ix["series"]].strip().upper() if "series" in ix else "EQ"
+        series_seen.add(ser)
+        try:
+            d = parse_date(r[ix["date"]])
+        except DataError:
+            skipped += 1
+            continue
+        vals = [num(r[ix[k]]) for k in ("open", "high", "low", "close")]
+        if None in vals:
+            skipped += 1
+            continue
+        v = num(r[ix["volume"]]) if "volume" in ix else 0
+        if d.isoformat() in by and ser != "EQ":
+            continue
+        by[d.isoformat()] = bar(d, vals[0], vals[1], vals[2], vals[3], v)
+    if skipped:
+        notes.append("skipped %d row(s) without a date or prices" % skipped)
+    if len(series_seen) > 1:
+        notes.append("series seen: %s (EQ kept where a date repeats)" % ", ".join(sorted(series_seen)))
+    if "volume" not in ix:
+        notes.append("no volume column: volume saved as 0")
+    return [by[k] for k in sorted(by)], notes
+
+
+def cmd_import_csv(a):
+    sym = norm_symbol(a.symbol)
+    with open(a.file, encoding="utf-8-sig", newline="") as fh:
+        rows, notes = parse_ohlc_csv(fh.read(), sym)
+    if not rows:
+        raise DataError("no bars in %s" % a.file)
+    good, bad = split_valid(rows)
+    if bad and not a.drop_bad:
+        raise DataError("%d bar(s) fail OHLC checks, e.g. %s; fix the file or pass --drop-bad" % (len(bad), bad[0]))
+    raw_p, adj_p, _ = data_paths(a.data, sym)
+    target = adj_p if a.adjusted else raw_p
+    merged = good if a.replace else merge_rows(read_daily(target), good)
+    warns = write_daily(target, merged)
+    note_meta(a.data, "daily", sym, {"source": "import-csv:" + os.path.basename(a.file), "fetched_at": stamp(),
+                                     "rows": len(merged), "first": merged[0]["date"], "last": merged[-1]["date"],
+                                     "file": os.path.basename(target)})
+    print("%s: imported %d bar(s) (%s to %s) into %s; %d cached." % (
+        sym, len(good), good[0]["date"], good[-1]["date"], target, len(merged)))
+    for n in notes + ["dropped bad bar " + b for b in bad]:
+        print("  note: " + n)
+    for w in warns:
+        print("  warning: " + w)
+    return 0
+
+
+# ---------------------------------------------------------------- doctor
+
+def probes(now_ist):
+    bd = last_complete_session(now_ist)
+    return [
+        ("yahoo-q1", "price", yahoo_url(YAHOO_HOSTS[0], "RELIANCE", "1d", rng="5d"), "yahoo"),
+        ("yahoo-q2", "price", yahoo_url(YAHOO_HOSTS[1], "RELIANCE", "1d", rng="5d"), "yahoo"),
+        ("nse-home", "gate", NSE + "/", "html"),
+        ("nse-api", "price", NSE + "/api/quote-equity?symbol=RELIANCE", "nse"),
+        ("nsearchives", "price", bhav_urls(bd)[0], "bhav"),
+        ("niftyindices", "list", NIFTY_LIST, "csv"),
+        ("google-news", "news", GNEWS, "rss"),
+        ("kite-mcp", "info", KITE_MCP, "any"),
+    ]
+
+
+def check_body(kind, code, body):
+    if kind == "any":
+        return code < 500 and code not in (403, 407), ""
+    if code not in (200, 206):
+        return False, ""
+    text = body[:4000].decode("utf-8", "replace") if isinstance(body, bytes) else str(body)[:4000]
+    if kind == "yahoo":
+        try:
+            return bool(json.loads(body)["chart"]["result"]), ""
+        except (ValueError, KeyError, TypeError):
+            return False, "not chart JSON"
+    if kind == "nse":
+        try:
+            return "priceInfo" in json.loads(body), ""
+        except ValueError:
+            return False, "not JSON (bot wall)"
+    if kind == "bhav":
+        return "SYMBOL" in text.upper(), "not a bhavcopy"
+    if kind == "csv":
+        return "symbol" in text.lower(), "not the index CSV"
+    if kind == "rss":
+        return "<rss" in text or "<item" in text, "not RSS"
+    return True, ""
+
+
+def cmd_doctor(a):
+    now = parse_now(a.now)
+    sess = Session()
+    results = {}
+    print("%-13s %-6s %-5s %8s  %s" % ("source", "kind", "ok", "latency", "error / hint"))
+    for name, kind, url, check in probes(now):
+        t0 = _clock()
+        ok, err, code = False, "", None
+        try:
+            hdr = {"Referer": NSE + "/"} if "nse" in url else {}
+            if check == "bhav":
+                hdr["Range"] = "bytes=0-2047"
+            if name == "nse-api":
+                hdr.update({"Accept": "application/json", "Referer": NSE + "/get-quotes/equity?symbol=RELIANCE"})
+            code, body = sess.get(url, hdr, timeout=a.timeout, gap=0)
+            ok, why = check_body(check, code, body)
+            if not ok:
+                err = hint(name, code) if code not in (200, 206) else why
+            if name == "nse-home" and ok:
+                sess.nse_primed = True
+        except SourceError as e:
+            err = str(e)
+        ms = int(round((_clock() - t0) * 1000))
+        if name == "kite-mcp":
+            err = ("reachable; its tools work only inside Claude with the Kite connector (no keys here)"
+                   if ok else (err or "not reachable from here; Claude's connector may still work"))
+        results[name] = {"ok": ok, "kind": kind, "status": code, "latency_ms": ms, "error": err,
+                         "url": url.split("?")[0], "checked_at": stamp()}
+        print("%-13s %-6s %-5s %6dms  %s" % (name, kind, "ok" if ok else "FAIL", ms, err))
+    price_ok = [n for n, r in results.items() if r["kind"] == "price" and r["ok"]]
+    doc = {"checked_at": stamp(), "price_sources_ok": price_ok, "sources": results}
+    _write_json(os.path.join(a.data, "sources.json"), doc)
+    if price_ok:
+        print("Price data OK via: %s. Wrote %s." % (", ".join(price_ok), os.path.join(a.data, "sources.json")))
+        return 0
+    print("No free price source works from this machine. Use the Kite MCP connector (get_historical_data, "
+          "get_quotes) + import-kite, or download CSVs and import-csv.")
+    return 1
+
+
+# ---------------------------------------------------------------- record
+
+def default_fixture_dir():
+    return os.path.join(os.path.dirname(HERE), "tests", "fixtures", "real")
+
+
+def cmd_record(a):
+    sym = norm_symbol(a.symbol)
+    errors = []
+    if not a.no_fetch:
+        for name, fn, ns in (
+                ("daily", cmd_daily, argparse.Namespace(symbols=[sym], years=a.years, source="auto", data=a.data,
+                                                        fill_gaps=False, max_days=300, now=a.now)),
+                ("intraday", cmd_intraday, argparse.Namespace(symbols=[sym], days=60, source="auto", data=a.data)),
+                ("bands", cmd_bands, argparse.Namespace(symbols=[sym], source="auto", data=a.data, now=a.now))):
+            try:
+                if fn(ns):
+                    errors.append("%s did not fully succeed" % name)
+            except DataError as e:
+                errors.append("%s: %s" % (name, e))
+    out = os.path.join(a.out or default_fixture_dir(), sym)
+    raw_p, adj_p, intra_p = data_paths(a.data, sym)
+    meta = _read_json(os.path.join(a.data, "cache_meta.json"), {})
+    prov = {"symbol": sym, "recorded_by": "trader-data record", "fetched_at": stamp(), "files": {}}
+    os.makedirs(out, exist_ok=True)
+    if os.path.exists(raw_p):
+        rows = read_daily(raw_p)
+        write_daily(os.path.join(out, "daily.csv"), rows)
+        prov["files"]["daily.csv"] = dict(meta.get("daily", {}).get(sym, {}), rows=len(rows))
+        if os.path.exists(adj_p):
+            shutil.copyfile(adj_p, os.path.join(out, "daily.adj.csv"))
+            prov["files"]["daily.adj.csv"] = {"from": "cache"}
+    m, bars = read_intraday(intra_p)
+    if bars:
+        days = sorted(set(ts_to_ist(b[0]).date() for b in bars))
+        want = parse_date(a.date) if a.date else days[-1]
+        sb = [b for b in bars if ts_to_ist(b[0]).date() == want]
+        if sb:
+            name = "intraday-5m-%s.json" % want.isoformat()
+            _write_json(os.path.join(out, name), build_chart(sym, sb, m, m.get("source", "")))
+            prov["files"][name] = dict(meta.get("intraday", {}).get(sym, {}), bars=len(sb))
+        else:
+            errors.append("no intraday session on %s in the cache (have %s)" % (want, compress(days, 5)))
+    band = (_read_json(os.path.join(a.data, "bands.json"), {}).get("bands") or {}).get(sym)
+    if band:
+        _write_json(os.path.join(out, "bands.json"), {"as_of": band.get("as_of"), "source": band.get("source"),
+                                                      "bands": {sym: band}})
+        prov["files"]["bands.json"] = {"source": band.get("source"), "as_of": band.get("as_of")}
+    if not prov["files"]:
+        raise DataError("nothing cached for %s to record (%s)" % (sym, "; ".join(errors) or "run daily first"))
+    prov["source"] = sorted(set(str(v.get("source")) for v in prov["files"].values() if v.get("source")))
+    prov["problems"] = errors
+    _write_json(os.path.join(out, "provenance.json"), prov)
+    print("Recorded %s into %s: %s." % (sym, out, ", ".join(sorted(prov["files"]))))
+    for e in errors:
+        print("  " + e)
+    return 0
+
+
+# ---------------------------------------------------------------- status
+
+def cmd_status(a):
+    now = parse_now(a.now)
+    end = last_complete_session(now)
+    dd = os.path.join(a.data, "daily")
+    files = sorted(f for f in (os.listdir(dd) if os.path.isdir(dd) else []) if f.endswith(".csv"))
+    print("Last complete NSE session: %s" % end)
+    if not files:
+        print("No daily cache in %s. Run: data.py daily RELIANCE" % dd)
+    for f in files:
+        rows = read_daily(os.path.join(dd, f))
+        if not rows:
+            continue
+        last = datetime.date.fromisoformat(rows[-1]["date"])
+        behind = len(trading_days(last + datetime.timedelta(days=1), end))
+        errs, warns = validate_daily(rows)
+        gaps = [w for w in warns if w.startswith("gap:")]
+        print("%-22s %5d bars %s..%s  %s%s" % (
+            f, len(rows), rows[0]["date"], rows[-1]["date"],
+            "fresh" if behind == 0 else "%d session(s) behind" % behind,
+            ("  " + gaps[0]) if gaps else "") + ("  ERRORS: " + errs[0] if errs else ""))
+    idir = os.path.join(a.data, "intraday")
+    for f in sorted(os.listdir(idir) if os.path.isdir(idir) else []):
+        if f.endswith(".json"):
+            _, bars = read_intraday(os.path.join(idir, f))
+            days = sorted(set(ts_to_ist(b[0]).date() for b in bars))
+            print("%-22s %5d bars, %d session(s), last %s" % (f, len(bars), len(days), days[-1] if days else "-"))
+    b = _read_json(os.path.join(a.data, "bands.json"), None)
+    if b:
+        print("bands.json as of %s: %d known, unknown: %s" % (b.get("as_of"), len(b.get("bands") or {}),
+                                                             ", ".join(b.get("unknown") or []) or "none"))
+    s = _read_json(os.path.join(a.data, "sources.json"), None)
+    if s:
+        print("sources.json (%s): price sources OK: %s" % (s.get("checked_at"),
+                                                          ", ".join(s.get("price_sources_ok") or []) or "none"))
+    return 0
+
+
+# ---------------------------------------------------------------- CLI
+
+def years_arg(x):
+    if str(x).lower() == "max":
+        return "max"
+    try:
+        v = float(x)
+    except ValueError:
+        raise argparse.ArgumentTypeError("--years wants a number or max")
+    if v <= 0:
+        raise argparse.ArgumentTypeError("--years must be positive")
+    return v
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="NSE market data with source fallbacks (trader-data).")
+    sub = ap.add_subparsers(dest="cmd")
+
+    def common(p):
+        p.add_argument("--data", default="trader/data", help="cache folder (default trader/data)")
+        p.add_argument("--now", help="pretend it is this IST time")
+
+    p = sub.add_parser("daily", help="fill the daily OHLC cache")
+    common(p)
+    p.add_argument("symbols", nargs="+")
+    p.add_argument("--years", type=years_arg, default=3.0)
+    p.add_argument("--source", default="auto", choices=["auto", "yahoo", "nse", "bhavcopy"])
+    p.add_argument("--fill-gaps", action="store_true", help="also refetch holes inside the cache")
+    p.add_argument("--max-days", type=int, default=300, help="cap on bhavcopy files per run")
+    p = sub.add_parser("intraday", help="fill the 5 minute cache")
+    common(p)
+    p.add_argument("symbols", nargs="+")
+    p.add_argument("--days", type=int, default=60)
+    p.add_argument("--source", default="auto", choices=["auto", "yahoo", "nse"])
+    p = sub.add_parser("bands", help="price bands into bands.json")
+    common(p)
+    p.add_argument("symbols", nargs="*")
+    p.add_argument("--source", default="auto", choices=["auto", "nse", "seclist"])
+    p = sub.add_parser("import-kite", help="normalise saved Kite MCP JSON")
+    common(p)
+    p.add_argument("file")
+    p.add_argument("--kind", required=True, choices=["historical", "quotes", "ohlc"])
+    p.add_argument("--symbol")
+    p.add_argument("--date", help="get_ohlc only: the session date the numbers are for (after 15:30)")
+    p.add_argument("--adjusted", action="store_true", help="historical daily candles go to .adj.csv")
+    p = sub.add_parser("import-csv", help="import a Kite Console / NSE website / generic OHLC CSV")
+    common(p)
+    p.add_argument("file")
+    p.add_argument("--symbol", required=True)
+    p.add_argument("--adjusted", action="store_true", help="the file is split/bonus adjusted: write .adj.csv")
+    p.add_argument("--drop-bad", action="store_true", help="skip bars that fail OHLC checks")
+    p.add_argument("--replace", action="store_true", help="replace the cache instead of merging")
+    p = sub.add_parser("doctor", help="probe every source")
+    common(p)
+    p.add_argument("--timeout", type=float, default=10)
+    p = sub.add_parser("record", help="capture real data into tests/fixtures/real/<SYM>/")
+    common(p)
+    p.add_argument("symbol")
+    p.add_argument("--date", help="intraday session to keep (default: the latest)")
+    p.add_argument("--years", type=years_arg, default=3.0)
+    p.add_argument("--out", help="fixtures folder (default: this pack's tests/fixtures/real)")
+    p.add_argument("--no-fetch", action="store_true", help="copy what is cached, fetch nothing")
+    p = sub.add_parser("status", help="what is cached, freshness, gaps")
+    common(p)
+    a = ap.parse_args(argv)
+    if not a.cmd:
+        ap.print_help()
+        return 1
+    try:
+        return {"daily": cmd_daily, "intraday": cmd_intraday, "bands": cmd_bands, "import-kite": cmd_import_kite,
+                "import-csv": cmd_import_csv, "doctor": cmd_doctor, "record": cmd_record,
+                "status": cmd_status}[a.cmd](a)
+    except DataError as e:
+        print("data.py: %s" % e, file=sys.stderr)
+        return 1
+    except OSError as e:
+        print("data.py: %s" % e, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
