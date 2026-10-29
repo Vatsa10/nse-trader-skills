@@ -12,6 +12,7 @@ saved yourself (Kite MCP JSON, Kite Console / NSE website CSV).
     python3 data.py import-kite kite-quotes.json --kind quotes
     python3 data.py import-csv RELIANCE.csv --symbol RELIANCE [--adjusted]
     python3 data.py calendar [--refresh]
+    python3 data.py delivery RELIANCE TCS [--window 30] [--no-fetch]
     python3 data.py doctor
     python3 data.py record RELIANCE [--date 2026-10-23]
     python3 data.py status
@@ -24,6 +25,8 @@ Writes (shared contracts, see PORT_V4_SPEC.md):
   trader/data/sources.json           doctor's per-source health
   trader/data/cache_meta.json        where each cached file came from and when
   trader/data/calendar.json          {"fetched_at","years","holidays","special_sessions","last_circular_check","warnings"}
+  trader/data/delivery/<SYM>.csv     date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series (blank = unknown)
+  trader/data/delivery/pending.json  {"pending": [dates whose delivery file is not published yet]}
 
 NSE requests (www.nseindia.com, nsearchives) retry up to 5 times on a 429, 502, 503, 504
 or a timeout, waiting 2^n seconds with jitter (never over 8 s, or the Retry-After the server
@@ -96,6 +99,13 @@ CAL_REFERER = NSE + "/resources/exchange-communication-holidays"
 CIRCULAR_FIRST_DAYS = 5     # the first circular check looks this far back
 CIRCULAR_TAG = "Circular: "  # marks a calendar.json entry that came from a circular, not the holiday list
 MAX_WARNINGS = 20
+DELIVERY_HEADER = ["date", "volume", "trades", "deliv_qty", "deliv_pct", "qty_per_trade", "series"]
+DELIVERY_SERIES = ("EQ", "BE", "BZ")
+T2T_SERIES = ("BE", "BZ")     # trade-to-trade: every share is delivered
+DELIVERY_WINDOW = 30          # sessions the means are taken over
+DELIVERY_MIN = 5              # fewer delivery values than this is "not enough delivery data"
+IM_LEVEL = 1.2                # institutional money: DQ and TQ both above this
+PENDING_DAYS = 5              # a delivery file still missing after this many days is given up on
 
 # ---------------------------------------------------------------- NSE trading calendar
 # 2026 comes from trader-alerts/alerts.py (loaded below, with this copy as the fallback).
@@ -424,8 +434,8 @@ def validate_daily(rows):
             warnings.append("gap: %d NSE trading day(s) missing: %s" % (len(known), compress(known)))
         if unknown:
             yrs = sorted(set(x.year for x in unknown))
-            warnings.append("%d weekday(s) without a bar in %s (no holiday list for those years, not checked: run data.py calendar)"
-                            % (len(unknown), ", ".join(map(str, yrs))))
+            warnings.append("%d weekday(s) without a bar in %s (no holiday list for those years, not checked: "
+                            "run data.py calendar)" % (len(unknown), ", ".join(map(str, yrs))))
         for a, b in zip(rows, rows[1:]):
             ratio = a["close"] / b["open"] if b["open"] else 0
             for k in (2, 3, 4, 5, 10):
@@ -1010,15 +1020,31 @@ def parse_bhav(text, want=None):
 
 
 class Bhav(object):
-    """Fetches each trading day once per run and serves every symbol from it."""
+    """Fetches each trading day once per run and serves every symbol from it. The same file also
+    feeds the delivery analytics: `deliv` holds each day's delivery rows, `full` the days whose
+    rows came from sec_bhavdata_full (the only file with delivery), `sec_missing` the days that
+    have a bar table but no delivery file yet."""
 
     def __init__(self, sess):
         self.sess, self.days, self.errors = sess, {}, {}
+        self.deliv, self.full, self.sec_missing = {}, set(), set()
+        self.tried, self.deliv_errors = set(), {}
+
+    def take_delivery(self, d, text, full):
+        try:
+            rows = parse_delivery(text)
+        except DataError:
+            return
+        if full or d not in self.deliv:
+            self.deliv[d] = rows
+        if full:
+            self.full.add(d)
 
     def day(self, d):
         if d in self.days:
             return self.days[d]
         table, last = None, None
+        self.tried.add(d)
         for url in bhav_urls(d):
             try:
                 code, body = self.sess.get(url, {"Accept": "*/*", "Referer": NSE + "/"}, gap=BHAV_PAUSE)
@@ -1034,7 +1060,9 @@ class Bhav(object):
                         last = "bad zip from %s" % url
                         continue
                 try:
-                    table = parse_bhav(body.decode("utf-8", "replace"))
+                    text = body.decode("utf-8", "replace")
+                    table = parse_bhav(text)
+                    self.take_delivery(d, text, "sec_bhavdata_full" in url)
                     break
                 except DataError as e:
                     last = str(e)
@@ -1045,7 +1073,29 @@ class Bhav(object):
         self.days[d] = table
         if table is None:
             self.errors[d] = last
+        elif d not in self.full:
+            self.sec_missing.add(d)
         return table
+
+    def delivery_day(self, d):
+        """Fetch only the delivery file of one day (once per run). True when its rows are in `deliv`."""
+        if d in self.full:
+            return True
+        if d in self.tried:
+            return False
+        self.tried.add(d)
+        url = bhav_urls(d)[0]
+        try:
+            code, body = self.sess.get(url, {"Accept": "*/*", "Referer": NSE + "/"}, gap=BHAV_PAUSE)
+            if code != 200:
+                raise SourceError("nsearchives", "HTTP %d (%s)" % (code, hint("bhav", code)))
+            self.take_delivery(d, body.decode("utf-8", "replace"), True)
+        except SourceError as e:
+            self.deliv_errors[d] = str(e)
+        if d not in self.full:
+            self.sec_missing.add(d)
+            return False
+        return True
 
 
 def fetch_bhav_daily(bhav, sym, days, max_days):
@@ -1223,6 +1273,272 @@ def cmd_daily(a):
             print("  dropped bad bar " + b)
         for w in warns:
             print("  warning: " + w)
+    for line in fill_delivery(a.data, bhav, [norm_symbol(x) for x in a.symbols], now.date()):
+        print(line)
+    return rc
+
+
+# ---------------------------------------------------------------- delivery analytics
+
+def _int(x):
+    v = num(x)
+    return None if v is None else int(round(v))
+
+
+def parse_delivery(text, want=None):
+    """sec_bhavdata_full (or a plain bhavcopy) -> {SYMBOL: row} for the delivery file.
+
+    A row is {date, volume, trades, deliv_qty, deliv_pct, qty_per_trade, series}; a value NSE
+    leaves blank ("-") is None, never 0. In the trade-to-trade series (BE, BZ) every share is
+    delivered, so delivery is the full volume. Rights symbols (-RE) are skipped; EQ wins when a
+    symbol has several series. The UDiFF and legacy files carry no delivery, so those rows keep
+    volume and trades and leave the delivery fields empty."""
+    rd = csv.reader(io.StringIO(text))
+    try:
+        head = [_key(h) for h in next(rd)]
+    except StopIteration:
+        return {}
+    pick = lambda *names: next((head.index(n) for n in names if n in head), None)  # noqa: E731
+    ix = {"sym": pick("symbol", "tckrsymb"), "ser": pick("series", "sctysrs"),
+          "date": pick("date1", "traddt", "timestamp"), "v": pick("ttl_trd_qnty", "ttltradgvol", "tottrdqty"),
+          "n": pick("no_of_trades", "ttlnboftxsexctd", "totaltrades"), "dq": pick("deliv_qty"),
+          "dp": pick("deliv_per")}
+    if None in (ix["sym"], ix["date"], ix["v"]):
+        raise DataError("not a bhavcopy (columns: %s)" % ", ".join(head[:8]))
+    out = {}
+    for r in rd:
+        if len(r) < len(head):
+            continue
+        sym = r[ix["sym"]].strip().upper()
+        if (want and sym not in want) or sym.endswith("-RE"):
+            continue
+        ser = r[ix["ser"]].strip().upper() if ix["ser"] is not None else "EQ"
+        if ser not in DELIVERY_SERIES or (sym in out and ser != "EQ"):
+            continue
+        try:
+            day = parse_date(r[ix["date"]])
+        except DataError:
+            continue
+        vol = _int(r[ix["v"]])
+        trades = _int(r[ix["n"]]) if ix["n"] is not None else None
+        if ser in T2T_SERIES:
+            dq = vol
+        else:
+            dq = _int(r[ix["dq"]]) if ix["dq"] is not None else None
+        pct = round(dq * 100.0 / vol, 2) if dq is not None and vol else None
+        if pct is None and dq is None and ix["dp"] is not None:
+            given = num(r[ix["dp"]])
+            pct = None if given is None else round(given, 2)
+        out[sym] = {"date": day.isoformat(), "volume": vol, "trades": trades, "deliv_qty": dq, "deliv_pct": pct,
+                    "qty_per_trade": round(vol / float(trades), 2) if vol is not None and trades else None,
+                    "series": ser}
+    return out
+
+
+def delivery_dir(data_dir):
+    return os.path.join(data_dir, "delivery")
+
+
+def delivery_path(data_dir, sym):
+    return os.path.join(delivery_dir(data_dir), sym + ".csv")
+
+
+def read_delivery(path):
+    """delivery/<SYM>.csv -> rows ascending by date; a blank cell is None."""
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, newline="", encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            try:
+                datetime.date.fromisoformat(r["date"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            rows.append({"date": r["date"], "volume": _int(r.get("volume")), "trades": _int(r.get("trades")),
+                         "deliv_qty": _int(r.get("deliv_qty")), "deliv_pct": num(r.get("deliv_pct")),
+                         "qty_per_trade": num(r.get("qty_per_trade")), "series": (r.get("series") or "").strip()})
+    return sorted(rows, key=lambda r: r["date"])
+
+
+def merge_delivery(old, new):
+    """By date; a value in the new row replaces the old one, a blank never wipes a value."""
+    by = dict((r["date"], dict(r)) for r in old)
+    for r in new:
+        cur = by.setdefault(r["date"], dict(r))
+        for k, v in r.items():
+            if v not in (None, ""):
+                cur[k] = v
+    return [by[d] for d in sorted(by)]
+
+
+def write_delivery(data_dir, sym, new_rows):
+    """Merge rows into delivery/<SYM>.csv (header date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series;
+    a missing value is an empty cell). -> rows now in the file."""
+    path = delivery_path(data_dir, sym)
+    rows = merge_delivery(read_delivery(path), new_rows)
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(DELIVERY_HEADER)
+    cell = lambda v: "" if v is None else str(v)  # noqa: E731
+    for r in rows:
+        w.writerow([r["date"], cell(r["volume"]), cell(r["trades"]), cell(r["deliv_qty"]),
+                    "" if r["deliv_pct"] is None else "%.2f" % r["deliv_pct"],
+                    "" if r["qty_per_trade"] is None else "%.2f" % r["qty_per_trade"], r["series"] or ""])
+    _atomic_write(path, buf.getvalue())
+    return rows
+
+
+def pending_path(data_dir):
+    return os.path.join(delivery_dir(data_dir), "pending.json")
+
+
+def read_pending(data_dir):
+    doc = _read_json(pending_path(data_dir), {})
+    out = set()
+    for d in (doc.get("pending") if isinstance(doc, dict) else None) or []:
+        try:
+            out.add(datetime.date.fromisoformat(str(d)))
+        except ValueError:
+            continue
+    return out
+
+
+def tracked_symbols(data_dir):
+    dd = delivery_dir(data_dir)
+    return sorted(f[:-4] for f in (os.listdir(dd) if os.path.isdir(dd) else []) if f.endswith(".csv"))
+
+
+def store_delivery(data_dir, bhav, syms):
+    """Write the delivery rows the Bhav fetched for each symbol. -> {symbol: rows added or filled in}."""
+    done = {}
+    for sym in syms:
+        rows = [bhav.deliv[d][sym] for d in sorted(bhav.deliv) if sym in bhav.deliv[d]]
+        if not rows:
+            continue
+        before = read_delivery(delivery_path(data_dir, sym))
+        after = write_delivery(data_dir, sym, rows)
+        n = sum(1 for r in after if r not in before)
+        if n:
+            done[sym] = n
+    return done
+
+
+def fill_delivery(data_dir, bhav, syms, today):
+    """After a run that fetched bhavcopies: retry the pending delivery days, store the rows for the
+    symbols named plus every symbol already tracked, and keep pending.json (a day still missing after
+    PENDING_DAYS is dropped with a warning). -> printable lines."""
+    pend = read_pending(data_dir)
+    if not (bhav.deliv or pend or bhav.sec_missing):
+        return []
+    lines = []
+    for d in sorted(pend):
+        if (today - d).days <= PENDING_DAYS:
+            bhav.delivery_day(d)
+    names = sorted(set(syms) | set(tracked_symbols(data_dir)))
+    done = store_delivery(data_dir, bhav, names)
+    if done:
+        lines.append("delivery: %d row(s) written for %d symbol(s) in %s" % (
+            sum(done.values()), len(done), delivery_dir(data_dir)))
+    keep = set()
+    for d in sorted(pend):
+        if d in bhav.full:
+            continue
+        if (today - d).days > PENDING_DAYS:
+            lines.append("warning: the delivery file for %s did not appear within %d days; those days stay empty"
+                         % (d, PENDING_DAYS))
+        else:
+            keep.add(d)
+    keep |= set(d for d in bhav.sec_missing if d not in bhav.full and (today - d).days <= PENDING_DAYS)
+    if keep != pend or os.path.exists(pending_path(data_dir)):
+        _write_json(pending_path(data_dir), {"pending": sorted(d.isoformat() for d in keep)})
+    if keep:
+        lines.append("delivery pending (file not published yet, retried on the next run): %s" % compress(sorted(keep)))
+    return lines
+
+
+def delivery_metrics(rows, window=DELIVERY_WINDOW):
+    """The latest row against the mean of the last `window` rows (it included):
+    DQ = delivery quantity, TQ = quantity per trade, VOL = volume, each over its mean.
+    Institutional money: DQ > 1.2 and TQ > 1.2 on a series that is not trade-to-trade.
+    Band on DQ: >= 2 strong, >= 1.5 high, > 1 above normal, else normal.
+    Fewer than DELIVERY_MIN delivery values in the window -> status "not enough delivery data"."""
+    win = rows[-window:]
+    last = win[-1]
+    out = {"date": last["date"], "series": last["series"], "window": len(win), "status": "ok"}
+    for name, key in (("dq", "deliv_qty"), ("tq", "qty_per_trade"), ("vol", "volume")):
+        vals = [r[key] for r in win if r[key] is not None]
+        mean = sum(vals) / len(vals) if vals else 0
+        out[name] = last[key] / mean if last[key] is not None and mean else None
+        out["n_" + name] = len(vals)
+    out["t2t"] = last["series"] in T2T_SERIES
+    if out["n_dq"] < DELIVERY_MIN:
+        out["status"] = "not enough delivery data"
+    dq, tq = out["dq"], out["tq"]
+    out["band"] = (None if dq is None else "strong" if dq >= 2 else "high" if dq >= 1.5
+                   else "above normal" if dq > 1 else "normal")
+    out["institutional"] = bool(dq is not None and tq is not None and dq > IM_LEVEL and tq > IM_LEVEL
+                                and not out["t2t"] and out["status"] == "ok")
+    out["last"] = last
+    return out
+
+
+def cmd_delivery(a):
+    now = parse_now(a.now)
+    today = now.date()
+    syms = [norm_symbol(s) for s in a.symbols] or tracked_symbols(a.data)
+    if not syms:
+        raise DataError("no symbols: name some (delivery RELIANCE TCS), or fill the cache with daily first")
+    window = max(DELIVERY_MIN, a.window)
+    if not a.no_fetch:
+        end = last_complete_session(now)
+        sessions = trading_days(end - datetime.timedelta(days=int(window * 7 / 5) + 10), end)[-(window + 5):]
+        have = dict((s, set(r["date"] for r in read_delivery(delivery_path(a.data, s)))) for s in syms)
+        need = [d for d in sessions if any(d.isoformat() not in have[s] for s in syms)]
+        need += [d for d in read_pending(a.data) if d not in need and (today - d).days <= PENDING_DAYS]
+        bhav = Bhav(Session(a.data))
+        for d in sorted(need):
+            bhav.delivery_day(d)
+        for line in fill_delivery(a.data, bhav, syms, today):
+            print(line)
+        for d, why in sorted(bhav.deliv_errors.items())[:5]:
+            print("  %s: %s" % (d, why))
+    rc = 0
+    for sym in syms:
+        rows = read_delivery(delivery_path(a.data, sym))
+        if not rows:
+            rc = 1
+            print("%s: no delivery data cached%s" % (sym, "" if a.no_fetch else " (NSE has no delivery file for it yet)"))
+            continue
+        m = delivery_metrics(rows, window)
+        last = m["last"]
+        print("%s  %s  series %s  (%d session(s) in the window of %d)" % (sym, m["date"], m["series"] or "?",
+                                                                       m["window"], window))
+        if m["status"] != "ok":
+            rc = 1
+            print("  not enough delivery data: %d value(s) in the window, %d needed%s" % (
+                m["n_dq"], DELIVERY_MIN, "" if a.no_fetch else "; NSE publishes the file after the close"))
+            continue
+        ratio = lambda x: "n/a" if x is None else "%.2fx" % x  # noqa: E731
+        if last["deliv_qty"] is not None:
+            print("  delivered %s of %s shares (%s%%), %s shares per trade" % (
+                format(last["deliv_qty"], ","), format(last["volume"] or 0, ","),
+                "?" if last["deliv_pct"] is None else "%.1f" % last["deliv_pct"],
+                "?" if last["qty_per_trade"] is None else "%.1f" % last["qty_per_trade"]))
+        else:
+            print("  delivery for %s is not published yet (volume and trades only)" % m["date"])
+        print("  DQ %s   TQ %s   VOL %s   (each against the mean of the last %d sessions with data)" % (
+            ratio(m["dq"]), ratio(m["tq"]), ratio(m["vol"]), m["window"]))
+        if m["t2t"]:
+            print("  band: %s   institutional money: no (trade-to-trade series %s: delivery is all volume)" % (
+                m["band"] or "n/a", m["series"]))
+        elif m["institutional"]:
+            print("  band: %s   institutional money: YES (DQ and TQ both above %.1f: heavy delivery in big tickets)"
+                  % (m["band"], IM_LEVEL))
+        else:
+            why = ("delivery is not published yet" if m["dq"] is None else
+                   "needs DQ and TQ both above %.1f" % IM_LEVEL)
+            print("  band: %s   institutional money: no (%s)" % (m["band"] or "n/a", why))
+    print("A rule of thumb from delivery and ticket size, not a signal: confirm with price and your own plan.")
     return rc
 
 
@@ -1979,6 +2295,10 @@ def cmd_status(a):
             _, bars = read_intraday(os.path.join(idir, f))
             days = sorted(set(ts_to_ist(b[0]).date() for b in bars))
             print("%-22s %5d bars, %d session(s), last %s" % (f, len(bars), len(days), days[-1] if days else "-"))
+    tracked = tracked_symbols(a.data)
+    if tracked:
+        print("delivery/: %d symbol file(s); pending days: %s" % (
+            len(tracked), ", ".join(d.isoformat() for d in sorted(read_pending(a.data))) or "none"))
     cal = _CAL
     if cal:
         print("calendar.json: years %s, %d holiday(s), fetched %s, circulars checked %s" % (
@@ -2051,6 +2371,11 @@ def main(argv=None):
     p.add_argument("--adjusted", action="store_true", help="the file is split/bonus adjusted: write .adj.csv")
     p.add_argument("--drop-bad", action="store_true", help="skip bars that fail OHLC checks")
     p.add_argument("--replace", action="store_true", help="replace the cache instead of merging")
+    p = sub.add_parser("delivery", help="delivery analytics: DQ, TQ, VOL and the institutional money flag")
+    common(p)
+    p.add_argument("symbols", nargs="*", help="default: every symbol with a delivery file")
+    p.add_argument("--window", type=int, default=DELIVERY_WINDOW, help="sessions for the means (default 30)")
+    p.add_argument("--no-fetch", action="store_true", help="use the cached delivery files only")
     p = sub.add_parser("calendar", help="refresh the NSE holiday calendar (calendar.json)")
     common(p)
     p.add_argument("--refresh", action="store_true", help="refetch the holiday list and the circulars now")
@@ -2074,8 +2399,8 @@ def main(argv=None):
     saved, _CAL = _CAL, load_calendar(a.data)
     try:
         return {"daily": cmd_daily, "intraday": cmd_intraday, "bands": cmd_bands, "import-kite": cmd_import_kite,
-                "import-csv": cmd_import_csv, "calendar": cmd_calendar, "doctor": cmd_doctor, "record": cmd_record,
-                "status": cmd_status}[a.cmd](a)
+                "import-csv": cmd_import_csv, "calendar": cmd_calendar, "delivery": cmd_delivery,
+                "doctor": cmd_doctor, "record": cmd_record, "status": cmd_status}[a.cmd](a)
     except DataError as e:
         print("data.py: %s" % e, file=sys.stderr)
         return 1

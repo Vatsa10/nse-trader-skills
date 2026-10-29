@@ -829,6 +829,267 @@ class LegacyBhav(Net):
         self.assertEqual(f.urls("BhavCopy_NSE_CM"), [])         # UDiFF is not tried before its start date
 
 
+# ---------------------------------------------------------------- delivery analytics
+
+HEAD = "date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series"
+
+
+def drow(date, vol, trades, dq, series="EQ"):
+    """A delivery row as read_delivery returns it (a blank is None)."""
+    pct = round(dq * 100.0 / vol, 2) if dq is not None and vol else None
+    return {"date": date, "volume": vol, "trades": trades, "deliv_qty": dq, "deliv_pct": pct,
+            "qty_per_trade": round(vol / float(trades), 2) if vol is not None and trades else None, "series": series}
+
+
+def spike_rows(n=30, last=300):
+    """n sessions at delivery 100 / volume 200 / 10 trades, then a last day at 300 / 600 / 10 trades."""
+    start = datetime.date(2026, 8, 3)
+    days = []
+    d = start
+    while len(days) < n + 1:
+        if d.weekday() < 5:
+            days.append(d.isoformat())
+        d += datetime.timedelta(days=1)
+    return [drow(x, 200, 10, 100) for x in days[:n]] + [drow(days[n], 600, 10, last)]
+
+
+class DeliveryParse(unittest.TestCase):
+    def rows(self):
+        return data.parse_delivery(rd(os.path.join(DFIX, "sec_bhavdata_full_delivery_cases.csv")))
+
+    def test_padded_headers_dashes_and_series(self):
+        t = self.rows()
+        self.assertEqual(t["ALPHA"], {"date": "2026-10-23", "volume": 1000, "trades": 50, "deliv_qty": 400,
+                                      "deliv_pct": 40.0, "qty_per_trade": 20.0, "series": "EQ"})   # EQ, not the BL row
+        self.assertIsNone(t["BETA"]["deliv_qty"])                  # "-" is missing, never 0
+        self.assertIsNone(t["BETA"]["deliv_pct"])
+        self.assertEqual(t["BETA"]["qty_per_trade"], 20.0)
+        self.assertEqual((t["GAMMA"]["deliv_qty"], t["GAMMA"]["deliv_pct"]), (500, 100.0))   # BE: all volume
+        self.assertEqual(t["GAMMA"]["series"], "BE")
+        self.assertIsNone(t["DELTA"]["qty_per_trade"])             # zero trades
+        self.assertEqual(t["DELTA"]["deliv_qty"], 200)
+        self.assertNotIn("ALPHA-RE", t)                            # rights
+        self.assertEqual(t["OMEGA"]["deliv_pct"], 50.0)
+        self.assertEqual(data.parse_delivery(rd(os.path.join(DFIX, "sec_bhavdata_full_delivery_cases.csv")),
+                                             want={"GAMMA"}).keys(), {"GAMMA"})
+
+    def test_udiff_keeps_volume_and_trades_only(self):
+        text = ("TradDt,BizDt,Sgmt,Src,FinInstrmTp,FinInstrmId,ISIN,TckrSymb,SctySrs,OpnPric,HghPric,LwPric,ClsPric,"
+                "TtlTradgVol,TtlNbOfTxsExctd\n2026-10-23,2026-10-23,CM,NSE,STK,1,X,RELIANCE,EQ,1,1,1,1,14905641,241397\n")
+        r = data.parse_delivery(text)["RELIANCE"]
+        self.assertEqual((r["volume"], r["trades"], r["qty_per_trade"]), (14905641, 241397, 61.75))
+        self.assertIsNone(r["deliv_qty"])
+        self.assertIsNone(r["deliv_pct"])
+        with self.assertRaises(data.DataError):
+            data.parse_delivery("Foo,Bar\n1,2\n")
+
+    def test_csv_contract(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        t = self.rows()
+        data.write_delivery(d, "BETA", [t["BETA"]])
+        data.write_delivery(d, "GAMMA", [t["GAMMA"]])
+        data.write_delivery(d, "DELTA", [t["DELTA"]])
+        path = lambda s: os.path.join(d, "delivery", s + ".csv")  # noqa: E731
+        self.assertEqual(rd(path("BETA")), HEAD + "\n2026-10-23,2000,100,,,20.00,EQ\n")      # blank cells, no zeros
+        self.assertEqual(rd(path("GAMMA")), HEAD + "\n2026-10-23,500,20,500,100.00,25.00,BE\n")
+        self.assertEqual(rd(path("DELTA")), HEAD + "\n2026-10-23,800,0,200,25.00,,EQ\n")
+        back = data.read_delivery(path("BETA"))
+        self.assertEqual(back, [t["BETA"]])
+        self.assertIsNone(back[0]["deliv_qty"])
+
+    def test_a_blank_never_wipes_a_value(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        data.write_delivery(d, "X", [drow("2026-10-23", 1000, 50, 400)])
+        rows = data.write_delivery(d, "X", [drow("2026-10-23", 1000, 50, None), drow("2026-10-22", 900, 45, None)])
+        self.assertEqual([(r["date"], r["deliv_qty"]) for r in rows], [("2026-10-22", None), ("2026-10-23", 400)])
+        rows = data.write_delivery(d, "X", [drow("2026-10-22", 900, 45, 300)])       # a late file fills the blank
+        self.assertEqual(rows[0]["deliv_qty"], 300)
+
+
+class DeliveryMetrics(unittest.TestCase):
+    def test_a_spike_day(self):
+        rows = spike_rows()
+        self.assertEqual(len(rows), 31)
+        m = data.delivery_metrics(rows)
+        self.assertEqual(m["window"], 30)
+        self.assertAlmostEqual(m["dq"], 300 / ((29 * 100 + 300) / 30.0))
+        self.assertAlmostEqual(m["dq"], 2.8125)
+        self.assertAlmostEqual(m["tq"], 60 / ((29 * 20 + 60) / 30.0))
+        self.assertAlmostEqual(m["vol"], 600 / ((29 * 200 + 600) / 30.0))
+        self.assertTrue(m["institutional"])
+        self.assertEqual(m["band"], "strong")
+        self.assertEqual(m["status"], "ok")
+
+    def test_bands(self):
+        def band(last):
+            return data.delivery_metrics(spike_rows(last=last))["band"]
+        self.assertEqual(band(100), "normal")
+        self.assertEqual(band(150), "above normal")      # 150 / 101.7 = 1.47
+        self.assertEqual(band(170), "high")              # 1.62
+        self.assertEqual(band(1000), "strong")
+
+    def test_dq_without_big_tickets_is_not_institutional(self):
+        rows = spike_rows()
+        rows[-1] = drow(rows[-1]["date"], 200, 10, 300)        # delivery up, ticket size flat
+        m = data.delivery_metrics(rows)
+        self.assertGreater(m["dq"], 1.2)
+        self.assertLessEqual(m["tq"], 1.2)
+        self.assertFalse(m["institutional"])
+
+    def test_trade_to_trade_is_never_flagged(self):
+        rows = spike_rows()
+        rows[-1] = drow(rows[-1]["date"], 600, 10, 600, "BE")
+        m = data.delivery_metrics(rows)
+        self.assertTrue(m["t2t"])
+        self.assertFalse(m["institutional"])
+
+    def test_a_missing_day_is_left_out_of_the_mean_not_counted_as_zero(self):
+        rows = spike_rows()
+        rows[3]["deliv_qty"] = None
+        rows[3]["deliv_pct"] = None
+        m = data.delivery_metrics(rows)
+        self.assertEqual(m["n_dq"], 29)
+        self.assertAlmostEqual(m["dq"], 300 / ((28 * 100 + 300) / 29.0))
+
+    def test_not_enough_data(self):
+        m = data.delivery_metrics(spike_rows(n=3))
+        self.assertEqual(m["status"], "not enough delivery data")
+        self.assertFalse(m["institutional"])
+        self.assertEqual(data.delivery_metrics(spike_rows(n=4))["status"], "ok")      # 5 values
+
+    def test_latest_delivery_still_pending(self):
+        rows = spike_rows()
+        rows[-1] = drow(rows[-1]["date"], 600, 10, None)
+        m = data.delivery_metrics(rows)
+        self.assertIsNone(m["dq"])
+        self.assertIsNone(m["band"])
+        self.assertFalse(m["institutional"])
+        self.assertIsNotNone(m["tq"])
+
+
+class DeliveryCommands(Net):
+    NOW = "2026-10-23 19:00"
+
+    def bhav_net(self, extra=()):
+        def bhav(url):
+            name = url.rsplit("/", 1)[-1]
+            return (200, fx(name)) if os.path.exists(os.path.join(DFIX, name)) else (404, b"")
+        return self.net(list(extra) + [("sec_bhavdata_full", None, bhav), ("yahoo.com", 403, b""),
+                                       ("nseindia.com", 404, b"")])
+
+    def drows(self, sym):
+        return data.read_delivery(data.delivery_path(self.dd, sym))
+
+    def pending(self):
+        return json.loads(rd(os.path.join(self.dd, "delivery", "pending.json")))
+
+    def put_csv(self, sym, rows):
+        data.write_delivery(self.dd, sym, rows)
+
+    def test_daily_through_bhavcopy_fills_the_delivery_files(self):
+        self.bhav_net()
+        self.seed("RELIANCE", "2026-10-21")
+        self.seed("TCS", "2026-10-21")
+        code, out, _ = self.run_d("daily", "RELIANCE", "TCS", "--source", "bhavcopy", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertIn("delivery: 4 row(s) written for 2 symbol(s)", out)
+        text = rd(data.delivery_path(self.dd, "RELIANCE"))
+        self.assertEqual(text.splitlines()[0], HEAD)
+        self.assertEqual(text.splitlines()[1:], ["2026-10-22,14957042,213072,5009411,33.49,70.20,EQ",
+                                                 "2026-10-23,14905641,241397,7634419,51.22,61.75,EQ"])
+        self.assertEqual(self.drows("TCS")[-1]["deliv_qty"], 2356372)
+        self.assertEqual(self.pending() if os.path.exists(os.path.join(self.dd, "delivery", "pending.json"))
+                         else {"pending": []}, {"pending": []})
+        # the file the scanner reads also keeps the plain OHLC cache untouched
+        self.assertEqual(rd(data.data_paths(self.dd, "RELIANCE")[0]).splitlines()[0], "date,open,high,low,close,volume")
+
+    def test_late_delivery_file_becomes_pending_then_arrives(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("BhavCopy_NSE_CM_0_0_0_20261023_F_0000.csv",
+                       "TradDt,TckrSymb,SctySrs,OpnPric,HghPric,LwPric,ClsPric,TtlTradgVol,TtlNbOfTxsExctd\n"
+                       "2026-10-23,RELIANCE,EQ,1184.00,1201.90,1163.10,1190.00,14905641,241397\n")
+        self.net([("sec_bhavdata_full", 404, b""), ("BhavCopy_NSE_CM_0_0_0_20261023", 200, buf.getvalue()),
+                  ("nsearchives", 404, b"")])
+        self.seed("RELIANCE", "2026-10-22")
+        code, out, _ = self.run_d("daily", "RELIANCE", "--source", "bhavcopy", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertIn("delivery pending", out)
+        self.assertEqual(rd(data.delivery_path(self.dd, "RELIANCE")), HEAD + "\n2026-10-23,14905641,241397,,,61.75,EQ\n")
+        self.assertEqual(self.pending(), {"pending": ["2026-10-23"]})
+        # the file appears: the next run retries the day without being asked
+        f = self.bhav_net()
+        self.run_d("daily", "RELIANCE", "--source", "bhavcopy", "--now", "2026-10-26 10:00")
+        self.assertEqual(self.drows("RELIANCE")[-1]["deliv_qty"], 7634419)
+        self.assertEqual(self.pending(), {"pending": []})
+        self.assertEqual(len(f.urls("sec_bhavdata_full_23102026")), 1)
+
+    def test_a_pending_day_is_dropped_after_five_days(self):
+        os.makedirs(os.path.join(self.dd, "delivery"))
+        wr(os.path.join(self.dd, "delivery", "pending.json"), json.dumps({"pending": ["2026-10-20", "2026-10-27"]}))
+        f = self.bhav_net()
+        self.seed("RELIANCE", "2026-10-23")
+        code, out, _ = self.run_d("daily", "RELIANCE", "--source", "bhavcopy", "--now", "2026-10-27 19:00")
+        self.assertIn("warning: the delivery file for 2026-10-20 did not appear within 5 days", out)
+        self.assertEqual(self.pending(), {"pending": ["2026-10-27"]})
+        self.assertEqual(f.urls("sec_bhavdata_full_20102026"), [])        # too old to ask again
+
+    def test_a_run_without_bhavcopy_touches_nothing(self):
+        self.net([("query1", 200, fx("yahoo-daily-RELIANCE.json"))])
+        self.run_d("daily", "RELIANCE", "--now", "2026-10-23 19:00")
+        self.assertFalse(os.path.exists(os.path.join(self.dd, "delivery")))
+
+    def test_delivery_command_from_the_cache(self):
+        self.put_csv("ABC", spike_rows())
+        code, out, _ = self.run_d("delivery", "ABC", "--no-fetch")
+        self.assertEqual(code, 0, out)
+        self.assertIn("DQ 2.81x", out)
+        self.assertIn("TQ 2.81x", out)
+        self.assertIn("VOL 2.81x", out)
+        self.assertIn("band: strong   institutional money: YES", out)
+        self.assertIn("delivered 300 of 600 shares (50.0%), 60.0 shares per trade", out)
+        # no symbols named: every tracked file
+        code, out, _ = self.run_d("delivery", "--no-fetch")
+        self.assertIn("ABC  2026-09-14", out)
+
+    def test_delivery_command_edge_cases(self):
+        rows = spike_rows()
+        rows[-1] = drow(rows[-1]["date"], 600, 10, 600, "BZ")
+        self.put_csv("T2T", rows)
+        self.put_csv("FEW", spike_rows(n=3))
+        self.put_csv("LATE", spike_rows()[:-1] + [drow("2026-09-14", 600, 10, None)])
+        code, out, _ = self.run_d("delivery", "T2T", "FEW", "LATE", "NONE", "--no-fetch")
+        self.assertEqual(code, 1)
+        self.assertIn("institutional money: no (trade-to-trade series BZ", out)
+        self.assertIn("not enough delivery data: 4 value(s)", out)
+        self.assertIn("delivery for 2026-09-14 is not published yet", out)
+        self.assertIn("NONE: no delivery data cached", out)
+
+    def test_delivery_command_fetches_the_missing_sessions_once(self):
+        f = self.bhav_net()
+        code, out, _ = self.run_d("delivery", "RELIANCE", "--window", "5", "--now", self.NOW)
+        self.assertEqual(code, 1)                      # two days is not enough
+        self.assertIn("not enough delivery data: 2 value(s)", out)
+        rows = self.drows("RELIANCE")
+        self.assertEqual([r["date"] for r in rows], ["2026-10-22", "2026-10-23"])
+        self.assertEqual(len(f.urls("sec_bhavdata_full_23102026")), 1)
+        self.assertEqual(len(f.urls("sec_bhavdata_full_22102026")), 1)
+        self.assertEqual(f.urls("BhavCopy_NSE_CM"), [])          # delivery asks for the delivery file only
+        pend = self.pending()["pending"]
+        self.assertNotIn("2026-10-23", pend)
+        self.assertTrue(set(pend) <= {"2026-10-19", "2026-10-21"})      # recent 404s are retried later
+        before = len(f.calls)
+        self.run_d("delivery", "RELIANCE", "--window", "5", "--no-fetch")
+        self.assertEqual(len(f.calls), before)                                  # --no-fetch asks nobody
+
+    def test_status_lists_the_delivery_files(self):
+        self.put_csv("ABC", spike_rows())
+        code, out, _ = self.run_d("status", "--now", self.NOW)
+        self.assertIn("delivery/: 1 symbol file(s); pending days: none", out)
+
+
 # ---------------------------------------------------------------- intraday
 
 class Intraday(Net):

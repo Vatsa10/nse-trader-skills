@@ -13,12 +13,14 @@ description: >-
   (OHLC sanity, no duplicates, ascending dates, gaps against the NSE trading
   calendar), fetches only missing dates, probes every source with `doctor`,
   keeps a self-updating NSE holiday calendar (`calendar`, so 2027 and later
-  work without a code change), and records real data as test fixtures. Use when the user says "get me
+  work without a code change), turns the delivery file into delivery
+  analytics (`delivery`: delivery quantity, trade size, the institutional
+  money flag), and records real data as test fixtures. Use when the user says "get me
   RELIANCE history", "update my data", "download prices", "Yahoo is not
   working", "NSE blocked me", "what is the price band / circuit limit",
   "import this CSV", "is my data fresh", or before a backtest, an
   investment check or a scan that needs daily bars.
-argument-hint: "[daily|intraday|bands|calendar|doctor|status] [symbol]"
+argument-hint: "[daily|intraday|bands|calendar|delivery|doctor|status] [symbol]"
 ---
 
 # trader-data
@@ -41,6 +43,8 @@ python3 "${CLAUDE_SKILL_DIR}/data.py" import-kite kite-hist.json --kind historic
 python3 "${CLAUDE_SKILL_DIR}/data.py" import-kite kite-quotes.json --kind quotes
 python3 "${CLAUDE_SKILL_DIR}/data.py" import-kite kite-ohlc.json --kind ohlc --date 2026-10-23
 python3 "${CLAUDE_SKILL_DIR}/data.py" import-csv ~/Downloads/RELIANCE.csv --symbol RELIANCE
+python3 "${CLAUDE_SKILL_DIR}/data.py" delivery RELIANCE TCS               # DQ, TQ, VOL, institutional money flag
+python3 "${CLAUDE_SKILL_DIR}/data.py" delivery RELIANCE --no-fetch         # from the cached delivery files only
 python3 "${CLAUDE_SKILL_DIR}/data.py" calendar                            # keep the NSE holiday calendar current
 python3 "${CLAUDE_SKILL_DIR}/data.py" calendar --refresh                   # refetch holidays and circulars now
 python3 "${CLAUDE_SKILL_DIR}/data.py" status                              # cached, fresh, gaps
@@ -60,6 +64,8 @@ Every command takes `--data DIR` (default `trader/data`) and `--now
 | `trader/data/bands.json` | `{"as_of","source","bands":{SYM:{"band_pct","lower","upper"}},"unknown":[...]}` | risk, exit, broker |
 | `trader/data/sources.json` | doctor's result per source: ok, latency, error, checked_at | everyone, to pick a source |
 | `trader/data/cache_meta.json` | which source filled each file and when | status, record |
+| `trader/data/delivery/<SYM>.csv` | `date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series`, ascending; a value NSE did not publish is an empty cell, never 0 | scanner, invest, `delivery` |
+| `trader/data/delivery/pending.json` | `{"pending": ["2026-10-22"]}`: days whose delivery file was not published yet | data.py only |
 | `trader/data/nse_cookies.txt` | the NSE cookie jar (Mozilla format), reused between runs | data.py only |
 | `trader/data/calendar.json` | NSE holidays and special sessions (contract below) | data, alerts, and the skills that load alerts |
 
@@ -155,6 +161,43 @@ stops the import unless `--drop-bad`; `--adjusted` files it in `.adj.csv`;
   gap (a split or bonus: refresh `.adj.csv` from Yahoo). Muhurat, budget-day
   and Saturday DR sessions are accepted as real.
 - Intraday: 5 minute boundaries, 09:15-15:30 IST, 75 bars per full session.
+
+## Delivery analytics (`delivery`, `trader/data/delivery/`)
+
+NSE's `sec_bhavdata_full` file (the first bhavcopy URL above) carries the
+trade count and the delivery quantity next to the OHLC. The price cache keeps
+its six columns, so the extra numbers go in `trader/data/delivery/<SYM>.csv`.
+They are filled automatically whenever a `daily` run fetches that file
+(series EQ, BE, BZ; rights symbols ending `-RE` are skipped), and `delivery`
+fetches the missing sessions of the symbols you name (the last 35 sessions,
+one file a second, each file once).
+
+- `qty_per_trade` = volume / trades, 2 decimals (empty when trades is 0 or
+  blank). `deliv_pct` = `deliv_qty` / volume, computed, because NSE's own
+  column is mostly `-`.
+- `-` becomes an empty cell, never 0, and an empty day is left out of the
+  means. In the trade-to-trade series (BE, BZ) every share is delivered, so
+  `deliv_qty` is the full volume.
+- The UDiFF and legacy bhavcopies have no delivery fields, so a day served by
+  them keeps volume and trades and leaves the delivery cells empty, and the
+  date goes into `pending.json`. Every later run retries pending days; a
+  date still missing after 5 days is dropped with a warning.
+
+`delivery SYM...` prints, for the latest day, against the mean of the last 30
+sessions that have data (the latest day included; `--window N` changes it):
+
+| number | formula |
+| --- | --- |
+| DQ | `deliv_qty` / mean `deliv_qty` |
+| TQ | `qty_per_trade` / mean `qty_per_trade` |
+| VOL | `volume` / mean `volume` |
+| band (on DQ) | 2 or more strong, 1.5 or more high, above 1 above normal, else normal |
+| institutional money | DQ above 1.2 and TQ above 1.2, on a non-trade-to-trade series |
+
+Fewer than 5 delivery values in the window prints "not enough delivery data".
+Heavy delivery in big tickets is a proxy for institutional buying, a hint to
+look closer and not a signal to trade. `--no-fetch` works from the cache and
+asks NSE for nothing. Exit 1 if any symbol had no usable data.
 
 ## The NSE calendar (`calendar`, `calendar.json`)
 

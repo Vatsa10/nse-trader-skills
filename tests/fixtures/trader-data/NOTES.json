@@ -8,6 +8,7 @@
   "sec_list.csv bands (illustrative)",
   "circuit limits (previous close +/- 10%)",
   "instrument tokens and _id fields",
-  "nse-holiday-master.json and nse-circulars-cmtr.json (hand-made 2027 samples in the documented shapes)"
+  "nse-holiday-master.json and nse-circulars-cmtr.json (hand-made 2027 samples in the documented shapes)",
+  "sec_bhavdata_full_delivery_cases.csv (hand-made delivery edge cases: dashes, BE, zero trades, rights)"
  ]
 }
