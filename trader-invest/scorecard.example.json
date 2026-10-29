@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "about": "trader-invest long-term scorecard. Copy to trader/scorecard.json and edit: it is deep-merged over this file. Each metric scores 0 at 'bad' and 100 at 'good', linear in between and clamped (good below bad means lower is better). Pillar score = weighted mean of its metrics; overall = weighted mean of pillars. A missing metric is scored at missing_score, never as good.",
+  "gsec_10y_pct": 6.5,
+  "missing_score": 25,
+  "pillars": {
+    "valuation": {
+      "weight": 25,
+      "metrics": {
+        "pe": {"weight": 3, "good": 10, "bad": 35, "label": "PE (mid-cycle for cyclicals)"},
+        "pb": {"weight": 1, "good": 1, "bad": 8, "label": "price/book"},
+        "div_yield_pct": {"weight": 2, "good": 4, "bad": 0, "label": "dividend yield %"},
+        "earnings_yield_gap": {"weight": 2, "good": 4, "bad": -4, "label": "earnings yield minus 10y G-sec, points"}
+      }
+    },
+    "quality": {
+      "weight": 30,
+      "metrics": {
+        "roe_pct": {"weight": 3, "good": 20, "bad": 8, "label": "ROE %"},
+        "roce_pct": {"weight": 3, "good": 20, "bad": 8, "label": "ROCE %"},
+        "debt_to_equity": {"weight": 2, "good": 0.1, "bad": 1.5, "label": "debt/equity"},
+        "promoter_pct": {"weight": 1, "good": 55, "bad": 25, "label": "promoter holding %"},
+        "promoter_pledge_pct": {"weight": 2, "good": 0, "bad": 20, "label": "promoter pledge %"}
+      }
+    },
+    "growth": {
+      "weight": 25,
+      "metrics": {
+        "revenue_cagr_5y": {"weight": 2, "good": 15, "bad": 0, "label": "revenue CAGR 5y %"},
+        "revenue_cagr_3y": {"weight": 1, "good": 15, "bad": 0, "label": "revenue CAGR 3y %"},
+        "profit_cagr_5y": {"weight": 2, "good": 15, "bad": 0, "label": "profit CAGR 5y %"},
+        "profit_cagr_3y": {"weight": 1, "good": 15, "bad": 0, "label": "profit CAGR 3y %"},
+        "loss_years": {"weight": 2, "good": 0, "bad": 3, "label": "loss years (last 10)"}
+      }
+    },
+    "stability": {
+      "weight": 10,
+      "metrics": {
+        "profit_volatility": {"weight": 2, "good": 10, "bad": 60, "label": "annual profit volatility % of average"},
+        "latest_quarter_profit_yoy": {"weight": 1, "good": 10, "bad": -30, "label": "latest quarter profit y/y %"}
+      }
+    },
+    "technicals": {
+      "weight": 10,
+      "metrics": {
+        "dist_200dma_pct": {"weight": 2, "good": 5, "bad": -20, "label": "distance from 200-DMA %"},
+        "off_52w_high_pct": {"weight": 1, "good": 5, "bad": 40, "label": "below 52w high %"},
+        "price_cagr_5y": {"weight": 2, "good": 15, "bad": -5, "label": "price CAGR 5y %"},
+        "max_drawdown_pct": {"weight": 1, "good": 20, "bad": 60, "label": "max drawdown %"},
+        "volatility_pct": {"weight": 1, "good": 18, "bad": 45, "label": "annual volatility %"}
+      }
+    }
+  },
+  "bands": [
+    {"min": 70, "verdict": "Strong long-term candidate"},
+    {"min": 55, "verdict": "Reasonable, size small"},
+    {"min": 40, "verdict": "Value trap risk / wait"},
+    {"min": 0, "verdict": "Avoid for long term"}
+  ],
+  "caps": {
+    "pledge_pct": 20,
+    "loss_years": 2,
+    "min_coverage_pct": 60,
+    "cyclical_max": true
+  }
+}
