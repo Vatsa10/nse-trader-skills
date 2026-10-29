@@ -18,15 +18,17 @@ description: >-
   money flag), reads NSE corporate actions (`actions`: splits, consolidations,
   bonus issues, dividends in rupees per share) and rebuilds the split and
   bonus adjusted `.adj.csv` exactly from them (`adjust`), keeps index levels
-  with the Nifty 50 P/E, P/B, dividend yield and India VIX (`index`), and
+  with the Nifty 50 P/E, P/B, dividend yield and India VIX (`index`), summarises
+  an index option chain (`chain`: put-call ratio, open interest walls, max
+  pain, at-the-money strike), and
   records real data as test fixtures. Use when the user says "get me
   RELIANCE history", "update my data", "download prices", "Yahoo is not
   working", "NSE blocked me", "what is the price band / circuit limit",
   "import this CSV", "is my data fresh", "corporate actions", "split",
   "bonus", "adjust for the split", "ex-date", "nifty pe", "is the market
-  expensive", "vix", or before a backtest, an
-  investment check or a scan that needs daily bars.
-argument-hint: "[daily|intraday|bands|calendar|delivery|actions|adjust|index|doctor|status] [symbol]"
+  expensive", "vix", "option chain", "pcr", "max pain", or before a backtest,
+  an investment check or a scan that needs daily bars.
+argument-hint: "[daily|intraday|bands|calendar|delivery|actions|adjust|index|chain|doctor|status] [symbol]"
 ---
 
 # trader-data
@@ -59,6 +61,8 @@ python3 "${CLAUDE_SKILL_DIR}/data.py" adjust RELIANCE --force              # als
 python3 "${CLAUDE_SKILL_DIR}/data.py" index                                # NIFTY 50, NIFTY BANK, NIFTY 500, India VIX + Nifty 50 P/E
 python3 "${CLAUDE_SKILL_DIR}/data.py" index "NIFTY IT" --days 260         # another index; 260 snapshot files for the P/E percentile
 python3 "${CLAUDE_SKILL_DIR}/data.py" index --years 2                      # also backfill index levels (no P/E) from NSE history
+python3 "${CLAUDE_SKILL_DIR}/data.py" chain NIFTY                          # option chain: PCR, OI walls, max pain -> chain-NIFTY.json
+python3 "${CLAUDE_SKILL_DIR}/data.py" chain BANKNIFTY --expiry 29-Oct-2026
 python3 "${CLAUDE_SKILL_DIR}/data.py" status                              # cached, fresh, gaps
 python3 "${CLAUDE_SKILL_DIR}/data.py" record RELIANCE --date 2026-10-23   # real data -> test fixtures
 ```
@@ -80,6 +84,7 @@ Every command takes `--data DIR` (default `trader/data`) and `--now
 | `trader/data/delivery/pending.json` | `{"pending": ["2026-10-22"]}`: days whose delivery file was not published yet | data.py only |
 | `trader/data/actions.json` | corporate actions per symbol: splits, bonus, dividends (contract below) | invest, portfolio, entry, backtest, `adjust` |
 | `trader/data/index/<slug>.csv` | `date,open,high,low,close,volume,pe,pb,div_yield` per index (contract below) | invest, scanner, risk, entry |
+| `trader/data/chain-<SYMBOL>.json` | option chain summary for one expiry (contract below), intraday | entry, risk |
 | `trader/data/nse_cookies.txt` | the NSE cookie jar (Mozilla format), reused between runs | data.py only |
 | `trader/data/calendar.json` | NSE holidays and special sessions (contract below) | data, alerts, and the skills that load alerts |
 
@@ -336,6 +341,46 @@ cells in and never wipes a value that is already there.
 - Say it plainly when presenting this: valuation tells how rich the market is,
   not when to buy or sell, and can stay high or low for years.
 
+## Option chain (`chain`, `chain-<SYMBOL>.json`)
+
+Intraday context for an index (or an F&O stock): `chain NIFTY [--expiry
+DD-Mon-YYYY]` asks `GET /api/option-chain-contract-info?symbol=NIFTY` for the
+expiry dates (nearest first; an empty or missing list is an error), then
+`GET /api/option-chain-v3?type=Indices&symbol=NIFTY&expiry=29-Oct-2026`
+(`type=Equity` for stocks; NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY and
+NIFTYNXT50 are indices). The nearest expiry is remembered in the output file
+and reused (no contract-info call) until it has passed; an expiry you name with
+`--expiry` is used as given and not remembered.
+
+```json
+{"symbol": "NIFTY", "type": "Indices", "underlying": 25060.4, "timestamp": "23-Oct-2026 15:30:00",
+ "expiry": "2026-10-29", "expiry_pick": "nearest", "fetched_at": "2026-10-23T10:30:00Z",
+ "source": "nse-option-chain", "pcr_oi": 0.6429, "pcr_change_oi": 2.0,
+ "total_call_oi": 7000, "total_put_oi": 4500, "total_call_oi_change": 350, "total_put_oi_change": 700,
+ "max_call_oi_strike": 25200.0, "max_call_oi": 4000, "max_put_oi_strike": 25000.0, "max_put_oi": 3000,
+ "atm": 25100, "strike_gap": 100.0, "max_pain": 25100.0, "strikes": 3,
+ "vix": "India VIX 12.95 on 2026-10-23 (-3.4% on the day), 1.0x its 20-session average (about normal)"}
+```
+
+- `pcr_oi` = total put OI / total call OI; `pcr_change_oi` = the same on the
+  day's change in OI (the more telling one intraday). Either is `null` when
+  the call side is 0.
+- `max_call_oi_strike` and `max_put_oi_strike` are the strikes with the most
+  call and put open interest (the usual resistance and support talk). `atm` is
+  the underlying rounded to the strike gap. `max_pain` is the strike where the
+  summed payout to option buyers is smallest, over every strike (the lowest on
+  a tie).
+- A strike with only a CE or only a PE counts the missing side as 0. Rows are
+  matched to the chosen expiry under either key NSE has used (`expiryDate` or
+  `expiryDates`); rows of another expiry are left out.
+- An empty object back (stale cookies, a bot wall) primes a fresh session and
+  asks once more; still empty gives a clear message and no file is written.
+- `vix` appears only when `index` has already written `index/india-vix.csv`.
+- Present PCR as a sentiment hint, never a signal: above about 1.2 leans
+  supportive, below about 0.7 leans weak, in between balanced. OI walls and
+  max pain are levels where positions sit, not guarantees that price stops
+  there.
+
 ## The NSE calendar (`calendar`, `calendar.json`)
 
 The built-in holiday tables stop at 2026. `data.py calendar` keeps a cache,
@@ -385,7 +430,7 @@ trader-alerts the skills that load it by path.
 ## doctor
 
 Probes Yahoo query1 and query2, the NSE home page and quote API, the NSE
-holiday-master, circulars, corporate-actions and daily-reports endpoints (a changed shape
+holiday-master, circulars, corporate-actions, daily-reports and option-chain contract-info endpoints (a changed shape
 is reported, not silently empty), the index snapshot archive
 (`ind_close_all_DDMMYYYY.csv`), the nsearchives bhavcopy, the niftyindices
 Nifty 500 list, Google News RSS and the Kite MCP endpoint, each with a timeout, prints a table (ok / FAIL,

@@ -14,6 +14,7 @@ saved yourself (Kite MCP JSON, Kite Console / NSE website CSV).
     python3 data.py calendar [--refresh]
     python3 data.py actions RELIANCE TCS [--years 3] [--refresh]
     python3 data.py adjust RELIANCE TCS [--force]
+    python3 data.py chain NIFTY [--expiry 29-Oct-2026]
     python3 data.py index ["NIFTY 50" "NIFTY BANK" ...] [--days 30] [--years 1] [--pe-expensive 25 --pe-cheap 20]
     python3 data.py delivery RELIANCE TCS [--window 30] [--no-fetch]
     python3 data.py doctor
@@ -31,6 +32,7 @@ Writes (shared contracts, see PORT_V4_SPEC.md):
   trader/data/delivery/<SYM>.csv     date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series (blank = unknown)
   trader/data/delivery/pending.json  {"pending": [dates whose delivery file is not published yet]}
   trader/data/actions.json           {"fetched_at","symbols":{SYM:{"from","fetched_through","actions":[...]}}}
+  trader/data/chain-<SYMBOL>.json    option chain summary: underlying, expiry, PCR, OI walls, ATM, max pain
   trader/data/index/<slug>.csv       date,open,high,low,close,volume,pe,pb,div_yield (nifty-50, nifty-bank, india-vix)
 
 NSE requests (www.nseindia.com, nsearchives) retry up to 5 times on a 429, 502, 503, 504
@@ -133,6 +135,11 @@ PE_EXPENSIVE = 25.0           # Nifty 50 P/E at or above this is flagged expensi
 PE_CHEAP = 20.0               # at or below this, cheap
 PE_MIN_ROWS = 250             # P/E rows needed before a percentile means anything
 REPORTS_REFERER = NSE + "/all-reports"
+CHAIN_REFERER = NSE + "/option-chain"
+INDEX_SYMBOLS = ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50")   # option-chain type=Indices
+PCR_HIGH, PCR_LOW = 1.2, 0.7  # PCR above / below these reads supportive / weak (a hint, not a signal)
+VIX_ELEVATED, VIX_CALM = 1.15, 0.85   # India VIX against its recent average
+VIX_AVG_ROWS = 20
 REPORT_KEYS = {"sec_bhavdata_full": "CM-BHAVDATA-FULL", "BhavCopy_NSE_CM": "CM-UDIFF-BHAVCOPY-CSV"}
 
 # ---------------------------------------------------------------- NSE trading calendar
@@ -2863,6 +2870,207 @@ def cmd_index(a):
     return rc
 
 
+# ---------------------------------------------------------------- index option chain
+
+def expiry_text(d):
+    """date -> 29-Oct-2026, the form the option-chain endpoints use."""
+    return "%02d-%s-%d" % (d.day, MONTH_UP[d.month - 1].title(), d.year)
+
+
+def chain_path(data_dir, sym):
+    return os.path.join(data_dir, "chain-%s.json" % sym)
+
+
+def expiry_dates(info):
+    """option-chain-contract-info answer -> expiry dates, nearest first. None or empty is an error."""
+    raw = info.get("expiryDates") if isinstance(info, dict) else None
+    out = []
+    for x in raw if isinstance(raw, list) else []:
+        try:
+            out.append(parse_date(x))
+        except DataError:
+            continue
+    if not out:
+        raise DataError("NSE listed no expiry dates (an empty contract-info answer: stale cookies, a bot wall, or "
+                        "no option chain for this symbol)")
+    return sorted(set(out))
+
+
+def chain_records(doc):
+    """The records object of an option-chain answer, {} when it is empty."""
+    if not isinstance(doc, dict):
+        return {}
+    rec = doc.get("records")
+    rec = rec if isinstance(rec, dict) else doc
+    return rec if isinstance(rec.get("data"), list) and rec["data"] else {}
+
+
+def row_expiry(r):
+    """A strike row's expiry under either key NSE has used (expiryDate, expiryDates, expiry), or None."""
+    for key in ("expiryDate", "expiryDates", "expiry"):
+        v = r.get(key)
+        v = v[0] if isinstance(v, list) and v else v
+        if v:
+            try:
+                return parse_date(v)
+            except DataError:
+                return None
+    return None
+
+
+def chain_strikes(rec, expiry):
+    """records.data -> {strike: {"ce_oi", "ce_chg", "pe_oi", "pe_chg"}} for one expiry. A strike with no CE or
+    no PE side counts that side as zero; rows of another expiry are left out."""
+    out, other = {}, set()
+    for r in rec.get("data") or []:
+        if not isinstance(r, dict):
+            continue
+        strike = num(r.get("strikePrice"))
+        if strike is None:
+            continue
+        ex = row_expiry(r)
+        if ex is not None and ex != expiry:
+            other.add(ex)
+            continue
+        s = out.setdefault(strike, {"ce_oi": 0.0, "ce_chg": 0.0, "pe_oi": 0.0, "pe_chg": 0.0})
+        for side, tag in (("CE", "ce"), ("PE", "pe")):
+            leg = r.get(side)
+            if isinstance(leg, dict):
+                s[tag + "_oi"] = num(leg.get("openInterest")) or s[tag + "_oi"]
+                s[tag + "_chg"] = num(leg.get("changeinOpenInterest")) or s[tag + "_chg"]
+    if not out:
+        raise DataError("no strikes for the %s expiry%s" % (
+            expiry_text(expiry), " (the chain holds %s)" % ", ".join(expiry_text(x) for x in sorted(other))
+            if other else ""))
+    return out
+
+
+def max_pain(strikes):
+    """The strike where the payout to option buyers is smallest, over every strike (lowest on a tie)."""
+    def payout(k):
+        return sum(s["ce_oi"] * max(0.0, k - x) + s["pe_oi"] * max(0.0, x - k) for x, s in strikes.items())
+    return min(sorted(strikes), key=payout)
+
+
+def chain_stats(strikes, underlying):
+    """PCR on total OI and on the change in OI, the largest call and put OI strikes, ATM, max pain."""
+    call_oi = sum(s["ce_oi"] for s in strikes.values())
+    put_oi = sum(s["pe_oi"] for s in strikes.values())
+    call_chg = sum(s["ce_chg"] for s in strikes.values())
+    put_chg = sum(s["pe_chg"] for s in strikes.values())
+    ks = sorted(strikes)
+    gaps = [b - a for a, b in zip(ks, ks[1:]) if b > a]
+    gap = min(gaps) if gaps else None
+    atm = None
+    if underlying is not None and gap:
+        atm = int(underlying / gap + 0.5) * gap
+        atm = int(atm) if atm == int(atm) else atm
+    top_call = max(ks, key=lambda k: strikes[k]["ce_oi"])
+    top_put = max(ks, key=lambda k: strikes[k]["pe_oi"])
+    ratio = lambda a, b: round(a / b, 4) if b else None  # noqa: E731
+    return {"pcr_oi": ratio(put_oi, call_oi), "pcr_change_oi": ratio(put_chg, call_chg),
+            "total_call_oi": int(call_oi), "total_put_oi": int(put_oi),
+            "total_call_oi_change": int(call_chg), "total_put_oi_change": int(put_chg),
+            "max_call_oi_strike": top_call, "max_call_oi": int(strikes[top_call]["ce_oi"]),
+            "max_put_oi_strike": top_put, "max_put_oi": int(strikes[top_put]["pe_oi"]),
+            "atm": atm, "strike_gap": gap, "max_pain": max_pain(strikes), "strikes": len(ks)}
+
+
+def fetch_chain(sess, sym, kind, expiry):
+    """The option-chain answer for one expiry. An empty object usually means stale cookies, so it primes
+    again once; still empty is a clear error."""
+    path = "/api/option-chain-v3?type=%s&symbol=%s&expiry=%s" % (kind, urllib.parse.quote(sym), expiry_text(expiry))
+    for attempt in (0, 1):
+        doc = nse_api(sess, path, CHAIN_REFERER)
+        if chain_records(doc):
+            return doc
+        if attempt == 0:
+            nse_prime(sess, force=True)
+    raise DataError("NSE returned an empty option chain for %s %s (stale cookies or a bot wall, or the chain is not "
+                    "served at this hour); a fresh session was tried once. Try again in a minute." % (
+                        sym, expiry_text(expiry)))
+
+
+def vix_context(data_dir):
+    """One line about India VIX from index/india-vix.csv, or None when the file is missing or empty."""
+    rows = read_index(index_path(data_dir, VIX_NAME))
+    if not rows:
+        return None
+    last = rows[-1]
+    line = "India VIX %s on %s" % (fmt(last["close"]), last["date"])
+    if len(rows) > 1 and rows[-2]["close"]:
+        line += " (%+.1f%% on the day)" % ((last["close"] / rows[-2]["close"] - 1) * 100)
+    recent = [r["close"] for r in rows[-VIX_AVG_ROWS:] if r["close"] is not None]
+    if len(recent) >= 5:
+        mean = sum(recent) / len(recent)
+        line += ", %.1fx its %d-session average (%s)" % (
+            last["close"] / mean, len(recent),
+            "elevated" if last["close"] >= mean * VIX_ELEVATED else "calm" if last["close"] <= mean * VIX_CALM
+            else "about normal")
+    return line
+
+
+def pcr_hint(pcr):
+    if pcr is None:
+        return "no call open interest"
+    if pcr > PCR_HIGH:
+        return "more puts than calls, leans supportive"
+    if pcr < PCR_LOW:
+        return "more calls than puts, leans weak"
+    return "balanced"
+
+
+def cmd_chain(a):
+    now = parse_now(a.now)
+    today = now.date()
+    sym = norm_symbol(a.symbol)
+    kind = "Indices" if sym in INDEX_SYMBOLS else "Equity"
+    path = chain_path(a.data, sym)
+    old = _read_json(path, {})
+    old = old if isinstance(old, dict) else {}
+    sess = Session(a.data)
+    pick = "user" if a.expiry else "nearest"
+    if a.expiry:
+        expiry = parse_date(a.expiry)
+    else:
+        expiry = None
+        if old.get("expiry_pick") == "nearest":     # the nearest expiry is kept until it passes
+            try:
+                kept = parse_date(old.get("expiry"))
+                expiry = kept if kept >= today else None
+            except DataError:
+                pass
+        if expiry is None:
+            dates = expiry_dates(nse_api(sess, "/api/option-chain-contract-info?symbol=%s" % urllib.parse.quote(sym),
+                                         CHAIN_REFERER))
+            expiry = next((d for d in dates if d >= today), dates[0])
+    rec = chain_records(fetch_chain(sess, sym, kind, expiry))
+    strikes = chain_strikes(rec, expiry)
+    underlying = num(rec.get("underlyingValue"))
+    stats = chain_stats(strikes, underlying)
+    doc = {"symbol": sym, "type": kind, "underlying": underlying, "timestamp": rec.get("timestamp"),
+           "expiry": expiry.isoformat(), "expiry_pick": pick, "fetched_at": stamp(now), "source": "nse-option-chain"}
+    doc.update(stats)
+    vix = vix_context(a.data)
+    if vix:
+        doc["vix"] = vix
+    _write_json(path, doc)
+    print("%s option chain, expiry %s (%d strikes), underlying %s at %s" % (
+        sym, expiry_text(expiry), stats["strikes"], fmt(underlying) or "?", rec.get("timestamp") or "an unknown time"))
+    print("  PCR on open interest %s (%s)" % (fmt(stats["pcr_oi"]) or "n/a", pcr_hint(stats["pcr_oi"])))
+    print("  PCR on today's change in OI %s (puts %+d, calls %+d)" % (
+        fmt(stats["pcr_change_oi"]) or "n/a", stats["total_put_oi_change"], stats["total_call_oi_change"]))
+    print("  largest call OI at %s (%s contracts), a possible resistance; largest put OI at %s (%s), a possible "
+          "support" % (fmt(stats["max_call_oi_strike"]), format(stats["max_call_oi"], ","),
+                       fmt(stats["max_put_oi_strike"]), format(stats["max_put_oi"], ",")))
+    print("  ATM %s, max pain %s" % (fmt(stats["atm"]) or "?", fmt(stats["max_pain"])))
+    if vix:
+        print("  " + vix)
+    print("PCR is a sentiment hint, never a signal; OI walls and max pain are levels where positions sit, not "
+          "guarantees. Wrote %s." % path)
+    return 0
+
+
 # ---------------------------------------------------------------- doctor
 
 def probes(now_ist):
@@ -2880,6 +3088,7 @@ def probes(now_ist):
          "&from_date=%s&to_date=%s" % ((now_ist.date() - datetime.timedelta(days=365)).strftime("%d-%m-%Y"),
                                        now_ist.strftime("%d-%m-%Y")), "actions"),
         ("nse-index", "index", index_url(bd), "index"),
+        ("nse-chain", "cal", NSE + "/api/option-chain-contract-info?symbol=NIFTY", "chain"),
         ("nse-reports", "cal", NSE + "/api/daily-reports?key=CM", "reports"),
         ("nsearchives", "price", bhav_urls(bd)[0], "bhav"),
         ("niftyindices", "list", NIFTY_LIST, "csv"),
@@ -2904,9 +3113,11 @@ def check_body(kind, code, body):
             return "priceInfo" in json.loads(body), ""
         except ValueError:
             return False, "not JSON (bot wall)"
-    if kind in ("holidays", "circulars", "actions", "reports"):
+    if kind in ("holidays", "circulars", "actions", "reports", "chain"):
         try:
             doc = json.loads(body)
+            if kind == "chain":
+                return bool(doc.get("expiryDates")), "no expiryDates in the answer (stale cookies or a changed feed)"
             if kind == "reports":
                 return isinstance(doc.get("CurrentDay"), list), "no CurrentDay file list in the answer"
             if kind == "actions":
@@ -2941,8 +3152,9 @@ def cmd_doctor(a):
                 hdr["Range"] = "bytes=0-2047"
             if name == "nse-api":
                 hdr.update({"Accept": "application/json", "Referer": NSE + "/get-quotes/equity?symbol=RELIANCE"})
-            if check in ("holidays", "circulars", "actions", "reports"):
-                ref = {"actions": ACTIONS_REFERER, "reports": REPORTS_REFERER}.get(check, CAL_REFERER)
+            if check in ("holidays", "circulars", "actions", "reports", "chain"):
+                ref = {"actions": ACTIONS_REFERER, "reports": REPORTS_REFERER, "chain": CHAIN_REFERER}.get(
+                    check, CAL_REFERER)
                 hdr.update({"Accept": "application/json", "Referer": ref, "X-Requested-With": "XMLHttpRequest"})
             code, body = sess.get(url, hdr, timeout=a.timeout, gap=0, retries=0)   # a probe reports the first answer
             ok, why = check_body(check, code, body)
@@ -3168,6 +3380,10 @@ def main(argv=None):
     p.add_argument("--years", type=float, default=0, help="also backfill N years of index levels (no P/E)")
     p.add_argument("--pe-expensive", type=float, default=PE_EXPENSIVE, help="P/E flagged expensive (default 25)")
     p.add_argument("--pe-cheap", type=float, default=PE_CHEAP, help="P/E flagged cheap (default 20)")
+    p = sub.add_parser("chain", help="option chain summary (PCR, OI walls, max pain) into chain-<SYMBOL>.json")
+    common(p)
+    p.add_argument("symbol", help="NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50 or an F&O stock")
+    p.add_argument("--expiry", help="expiry like 29-Oct-2026 (default: the nearest one)")
     p = sub.add_parser("doctor", help="probe every source")
     common(p)
     p.add_argument("--timeout", type=float, default=10)
@@ -3189,8 +3405,8 @@ def main(argv=None):
     try:
         return {"daily": cmd_daily, "intraday": cmd_intraday, "bands": cmd_bands, "import-kite": cmd_import_kite,
                 "import-csv": cmd_import_csv, "calendar": cmd_calendar, "delivery": cmd_delivery,
-                "actions": cmd_actions, "adjust": cmd_adjust, "index": cmd_index, "doctor": cmd_doctor,
-                "record": cmd_record, "status": cmd_status}[a.cmd](a)
+                "actions": cmd_actions, "adjust": cmd_adjust, "index": cmd_index, "chain": cmd_chain,
+                "doctor": cmd_doctor, "record": cmd_record, "status": cmd_status}[a.cmd](a)
     except DataError as e:
         print("data.py: %s" % e, file=sys.stderr)
         return 1

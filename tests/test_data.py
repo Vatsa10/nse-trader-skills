@@ -2225,6 +2225,227 @@ class Readiness(Net):
         self.assertIn("no CurrentDay", s["nse-reports"]["error"])
 
 
+# ---------------------------------------------------------------- index option chain
+
+class ChainMaths(unittest.TestCase):
+    def rec(self):
+        return json.loads(fx("nse-option-chain-NIFTY.json"))["records"]
+
+    def test_stats_for_one_expiry(self):
+        D = datetime.date
+        strikes = data.chain_strikes(self.rec(), D(2026, 10, 29))
+        self.assertEqual(sorted(strikes), [25000.0, 25100.0, 25200.0])           # the 5 Nov row is another expiry
+        self.assertEqual(strikes[25200.0], {"ce_oi": 4000.0, "ce_chg": 300.0, "pe_oi": 0.0, "pe_chg": 0.0})   # CE only
+        s = data.chain_stats(strikes, 25060.4)
+        self.assertEqual((s["total_call_oi"], s["total_put_oi"]), (7000, 4500))
+        self.assertEqual(s["pcr_oi"], 0.6429)                                    # 4500 / 7000
+        self.assertEqual((s["total_call_oi_change"], s["total_put_oi_change"]), (350, 700))
+        self.assertEqual(s["pcr_change_oi"], 2.0)
+        self.assertEqual((s["max_call_oi_strike"], s["max_call_oi"]), (25200.0, 4000))
+        self.assertEqual((s["max_put_oi_strike"], s["max_put_oi"]), (25000.0, 3000))
+        self.assertEqual((s["atm"], s["strike_gap"]), (25100, 100.0))
+        self.assertEqual(s["max_pain"], 25100.0)             # payouts 150000 / 100000 / 400000 at 25000 / 25100 / 25200
+        self.assertEqual(s["strikes"], 3)
+
+    def test_the_other_expiry(self):
+        s = data.chain_stats(data.chain_strikes(self.rec(), datetime.date(2026, 11, 5)), 25060.4)
+        self.assertEqual((s["pcr_oi"], s["max_pain"], s["atm"], s["strike_gap"]), (1.0, 25300.0, None, None))
+        self.assertEqual(s["max_call_oi_strike"], 25300.0)
+
+    def test_either_expiry_key_is_read(self):
+        text = fx("nse-option-chain-NIFTY.json").decode()
+        for variant in (text.replace('"expiryDate"', '"expiryDates"'),
+                        text.replace('"expiryDate": "29-Oct-2026"', '"expiryDates": ["29-Oct-2026"]')
+                            .replace('"expiryDate": "05-Nov-2026"', '"expiryDates": ["05-Nov-2026"]'),
+                        text.replace('"expiryDate"', '"expiry"')):
+            strikes = data.chain_strikes(json.loads(variant)["records"], datetime.date(2026, 10, 29))
+            self.assertEqual(sorted(strikes), [25000.0, 25100.0, 25200.0])
+        with self.assertRaises(data.DataError) as cm:
+            data.chain_strikes(self.rec(), datetime.date(2026, 12, 31))
+        self.assertIn("no strikes for the 31-Dec-2026 expiry (the chain holds 29-Oct-2026, 05-Nov-2026)", str(cm.exception))
+
+    def test_a_missing_side_is_zero_and_odd_inputs(self):
+        strikes = data.chain_strikes({"data": [{"strikePrice": "100", "PE": {"openInterest": "50"}},
+                                               {"strikePrice": 200, "CE": {"openInterest": 10, "changeinOpenInterest": None}},
+                                               {"strikePrice": None, "CE": {"openInterest": 1}}, "junk"]},
+                                     datetime.date(2026, 10, 29))
+        self.assertEqual(strikes, {100.0: {"ce_oi": 0.0, "ce_chg": 0.0, "pe_oi": 50.0, "pe_chg": 0.0},
+                                   200.0: {"ce_oi": 10.0, "ce_chg": 0.0, "pe_oi": 0.0, "pe_chg": 0.0}})
+        s = data.chain_stats(strikes, None)
+        self.assertEqual((s["pcr_oi"], s["atm"], s["pcr_change_oi"]), (5.0, None, None))   # no underlying, no change in OI
+        calls_only = data.chain_stats({100.0: strikes[200.0]}, 100)
+        self.assertEqual((calls_only["pcr_oi"], calls_only["strike_gap"], calls_only["max_pain"]), (0.0, None, 100.0))
+        no_calls = {1.0: {"ce_oi": 0.0, "ce_chg": 0.0, "pe_oi": 5.0, "pe_chg": 0.0}}
+        self.assertIsNone(data.chain_stats(no_calls, 1)["pcr_oi"])                          # no call OI: no ratio
+
+    def test_max_pain_tie_takes_the_lowest_strike(self):
+        flat = dict((k, {"ce_oi": 0.0, "ce_chg": 0.0, "pe_oi": 0.0, "pe_chg": 0.0}) for k in (100.0, 200.0, 300.0))
+        self.assertEqual(data.max_pain(flat), 100.0)
+
+    def test_expiry_dates_and_text(self):
+        D = datetime.date
+        self.assertEqual(data.expiry_text(D(2026, 10, 29)), "29-Oct-2026")
+        self.assertEqual(data.expiry_text(D(2026, 11, 5)), "05-Nov-2026")
+        self.assertEqual(data.expiry_dates({"expiryDates": ["05-Nov-2026", "29-Oct-2026", "junk"]}),
+                         [D(2026, 10, 29), D(2026, 11, 5)])
+        for bad in ({}, {"expiryDates": []}, {"expiryDates": None}, [], None):
+            with self.assertRaises(data.DataError):
+                data.expiry_dates(bad)
+
+    def test_pcr_is_a_hint(self):
+        self.assertEqual(data.pcr_hint(1.3), "more puts than calls, leans supportive")
+        self.assertEqual(data.pcr_hint(0.69), "more calls than puts, leans weak")
+        self.assertEqual(data.pcr_hint(1.2), "balanced")
+        self.assertEqual(data.pcr_hint(0.7), "balanced")
+        self.assertEqual(data.pcr_hint(None), "no call open interest")
+
+
+class ChainCommand(Net):
+    NOW = "2026-10-23 16:00"
+    INFO = json.dumps({"expiryDates": ["22-Oct-2026", "29-Oct-2026", "05-Nov-2026"], "strikePrice": [25000]}).encode()
+
+    def feed(self, chain=None, info=None):
+        return self.net([("option-chain-contract-info", 200, info if info is not None else self.INFO),
+                         ("option-chain-v3", 200, chain if chain is not None else fx("nse-option-chain-NIFTY.json")),
+                         ("www.nseindia.com/", 200, b"home")])
+
+    def saved(self, sym="NIFTY"):
+        return json.loads(rd(os.path.join(self.dd, "chain-%s.json" % sym)))
+
+    def test_writes_the_contract(self):
+        f = self.feed()
+        code, out, err = self.run_d("chain", "NIFTY", "--now", self.NOW)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(f.urls("contract-info")[0].split("nseindia.com")[1], "/api/option-chain-contract-info?symbol=NIFTY")
+        self.assertEqual(f.urls("option-chain-v3")[0].split("nseindia.com")[1],
+                         "/api/option-chain-v3?type=Indices&symbol=NIFTY&expiry=29-Oct-2026")    # the nearest one not passed
+        hdr = [h for u, h in f.calls if "option-chain-v3" in u][0]
+        self.assertEqual(hdr["Referer"], "https://www.nseindia.com/option-chain")
+        doc = self.saved()
+        self.assertEqual(doc, {
+            "symbol": "NIFTY", "type": "Indices", "underlying": 25060.4, "timestamp": "23-Oct-2026 15:30:00",
+            "expiry": "2026-10-29", "expiry_pick": "nearest", "fetched_at": "2026-10-23T10:30:00Z",
+            "source": "nse-option-chain", "pcr_oi": 0.6429, "pcr_change_oi": 2.0, "total_call_oi": 7000,
+            "total_put_oi": 4500, "total_call_oi_change": 350, "total_put_oi_change": 700,
+            "max_call_oi_strike": 25200.0, "max_call_oi": 4000, "max_put_oi_strike": 25000.0, "max_put_oi": 3000,
+            "atm": 25100, "strike_gap": 100.0, "max_pain": 25100.0, "strikes": 3})
+        self.assertIn("NIFTY option chain, expiry 29-Oct-2026 (3 strikes), underlying 25060.4 at 23-Oct-2026 15:30:00", out)
+        self.assertIn("PCR on open interest 0.6429 (more calls than puts, leans weak)", out)
+        self.assertIn("PCR on today's change in OI 2 (puts +700, calls +350)", out)
+        self.assertIn("largest call OI at 25200 (4,000 contracts), a possible resistance; largest put OI at 25000", out)
+        self.assertIn("ATM 25100, max pain 25100", out)
+        self.assertIn("sentiment hint, never a signal", out)
+        self.assertNotIn("India VIX", out)                    # no india-vix.csv yet
+        self.assertNotIn("vix", doc)
+
+    def test_the_nearest_expiry_is_kept_until_it_passes(self):
+        self.feed()
+        self.run_d("chain", "NIFTY", "--now", self.NOW)
+        f = self.feed()
+        code, out, _ = self.run_d("chain", "NIFTY", "--now", "2026-10-29 11:00")           # expiry day itself
+        self.assertEqual(code, 0, out)
+        self.assertEqual(f.urls("contract-info"), [])
+        self.assertIn("expiry=29-Oct-2026", f.urls("option-chain-v3")[0])
+        f = self.feed()
+        self.run_d("chain", "NIFTY", "--now", "2026-10-30 11:00")                          # it has passed: ask again
+        self.assertEqual(len(f.urls("contract-info")), 1)
+        self.assertIn("expiry=05-Nov-2026", f.urls("option-chain-v3")[0])
+        self.assertEqual(self.saved()["expiry"], "2026-11-05")
+
+    def test_an_expiry_you_choose(self):
+        f = self.feed()
+        code, out, _ = self.run_d("chain", "NIFTY", "--expiry", "05-Nov-2026", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(f.urls("contract-info"), [])
+        self.assertIn("expiry=05-Nov-2026", f.urls("option-chain-v3")[0])
+        doc = self.saved()
+        self.assertEqual((doc["expiry"], doc["expiry_pick"], doc["pcr_oi"], doc["max_pain"]),
+                         ("2026-11-05", "user", 1.0, 25300.0))
+        f = self.feed()
+        self.run_d("chain", "NIFTY", "--now", self.NOW)                                    # a chosen expiry is not "the nearest"
+        self.assertEqual(len(f.urls("contract-info")), 1)
+        self.assertEqual(self.saved()["expiry"], "2026-10-29")
+
+    def test_an_empty_object_primes_again_once_then_says_so(self):
+        f = self.net([("option-chain-contract-info", 200, self.INFO), ("option-chain-v3", 200, b"{}"),
+                      ("www.nseindia.com/", 200, b"home")])
+        code, _, err = self.run_d("chain", "NIFTY", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertIn("empty option chain for NIFTY 29-Oct-2026", err)
+        self.assertIn("a fresh session was tried once", err)
+        self.assertEqual(len(f.urls("option-chain-v3")), 2)                                # once more, not forever
+        self.assertEqual(len([u for u, _ in f.calls if u == "https://www.nseindia.com/"]), 2)   # prime, then re-prime
+        self.assertFalse(os.path.exists(os.path.join(self.dd, "chain-NIFTY.json")))
+        # {"records": {}} and a records object with no data are empty too
+        for body in (b'{"records": {}}', b'{"records": {"data": []}}', b"[]"):
+            self.net([("option-chain-contract-info", 200, self.INFO), ("option-chain-v3", 200, body),
+                      ("www.nseindia.com/", 200, b"home")])
+            self.assertEqual(self.run_d("chain", "NIFTY", "--now", self.NOW)[0], 1, body)
+
+    def test_the_second_try_after_a_fresh_prime_can_succeed(self):
+        f = self.net([("option-chain-contract-info", 200, self.INFO),
+                      ("option-chain-v3", None, script((200, b"{}"), (200, fx("nse-option-chain-NIFTY.json")))),
+                      ("www.nseindia.com/", 200, b"home")])
+        code, out, _ = self.run_d("chain", "NIFTY", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.saved()["pcr_oi"], 0.6429)
+
+    def test_no_expiry_dates_is_an_error(self):
+        for info in (b"{}", b'{"expiryDates": []}', b"<html>wall</html>"):
+            self.feed(info=info)
+            code, _, err = self.run_d("chain", "NIFTY", "--now", self.NOW)
+            self.assertEqual(code, 1, info)
+            self.assertTrue("no expiry dates" in err or "did not return JSON" in err, err)
+
+    def test_a_block_is_explained(self):
+        self.net([("", 403, b"Access Denied")])
+        code, _, err = self.run_d("chain", "NIFTY", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertIn("403", err)
+
+    def test_a_stock_uses_the_equity_type(self):
+        f = self.feed()
+        self.run_d("chain", "reliance", "--expiry", "29-Oct-2026", "--now", self.NOW)
+        self.assertIn("/api/option-chain-v3?type=Equity&symbol=RELIANCE&expiry=29-Oct-2026", f.urls("option-chain-v3")[0])
+        self.assertEqual(self.saved("RELIANCE")["type"], "Equity")
+
+    def test_a_vix_line_when_the_index_file_exists(self):
+        closes = [13.0, 13.0, 13.0, 13.0, 13.0, 16.0]
+        days = data.index_days(datetime.date(2026, 10, 23), 6)
+        data.write_index(self.dd, "India VIX", [data.index_row(d, c, c, c, c, None, None, None, None)
+                                                for d, c in zip(days, closes)])
+        self.feed()
+        code, out, _ = self.run_d("chain", "NIFTY", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        line = "India VIX 16 on 2026-10-23 (+23.1% on the day), 1.2x its 6-session average (elevated)"
+        self.assertIn("  " + line, out)
+        self.assertEqual(self.saved()["vix"], line)
+        self.assertEqual(data.vix_context(self.tmp), None)                                 # no file there, no line
+
+    def test_vix_wording(self):
+        def line(closes):
+            days = data.index_days(datetime.date(2026, 10, 23), len(closes))
+            data.write_index(self.dd, "India VIX", [data.index_row(d, c, c, c, c, None, None, None, None)
+                                                    for d, c in zip(days, closes)])
+            return data.vix_context(self.dd)
+        self.assertIn("(calm)", line([20, 20, 20, 20, 20, 16]))
+        shutil.rmtree(os.path.join(self.dd, "index"))
+        self.assertIn("(about normal)", line([13, 13, 13, 13, 13, 13.5]))
+        shutil.rmtree(os.path.join(self.dd, "index"))
+        self.assertEqual(line([13, 14]), "India VIX 14 on 2026-10-23 (+7.7% on the day)")   # too few rows for an average
+
+    def test_doctor_probes_the_chain_endpoint(self):
+        self.net([("option-chain-contract-info", 200, self.INFO), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertTrue(s["nse-chain"]["ok"])
+        self.net([("option-chain-contract-info", 200, b"{}"), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertFalse(s["nse-chain"]["ok"])
+        self.assertIn("no expiryDates", s["nse-chain"]["error"])
+
+
 class Style(unittest.TestCase):
     def test_no_em_dash_and_skill_frontmatter(self):
         for f in ("data.py", "SKILL.md"):
