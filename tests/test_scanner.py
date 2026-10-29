@@ -1210,6 +1210,326 @@ class DailySwing(unittest.TestCase):
             shutil.rmtree(d)
 
 
+def prows(closes, volumes=None, start=D(2026, 1, 1)):
+    """The spec's test convention: high = close + 0.5, low = close - 0.5 (so U = 1.0)."""
+    return [(start + datetime.timedelta(days=i), c, c + 0.5, c - 0.5, c, volumes[i] if volumes else 1000.0)
+            for i, c in enumerate(closes)]
+
+
+def ramp(points):
+    """[(index, value), ...] -> closes by straight lines between the points."""
+    out = []
+    for (i0, v0), (i1, v1) in zip(points, points[1:]):
+        out.extend(round(v0 + (v1 - v0) * (i - i0) / float(i1 - i0), 2) for i in range(i0, i1))
+    return out + [points[-1][1]]
+
+
+P2 = {"min_bars": 0, "L": 2, "R": 2}      # the spec's test convention: pivots of 2 bars each side, gates relaxed
+VCP_UP = [100, 110, 120, 130, 140, 150, 140, 130, 120, 130, 140, 148, 142, 136, 141, 146]
+DBL = [130, 125, 120, 115, 110, 105, 100, 106, 112, 108, 104, 100, 103, 107, 110]
+FLAG = [102, 101, 100, 101, 102, 102, 102, 102, 102, 102, 106, 110, 114, 118, 122, 126, 123, 121, 122, 120, 122]
+TRI = [100, 106, 112, 107, 101, 107, 112, 108, 104, 108, 112, 109, 110]
+IHS = [120, 110, 100, 108, 115, 105, 95, 90, 97, 105, 115, 108, 102, 106, 110]
+SUPPORT = [108, 104, 100, 105, 110, 112, 110, 108, 106, 110, 114, 116, 115, 113, 112, 114, 117, 118, 116]
+
+
+class Patterns(unittest.TestCase):
+    """Chart patterns on hand-made series (stock-pattern.md section 5): L = R = 2, high = close + 0.5."""
+
+    def one(self, closes, name, **kw):
+        hits = scan.find_patterns(prows(closes), dict(P2, **kw), [name])
+        self.assertLessEqual(len(hits), 1)
+        return hits[0] if hits else None
+
+    def test_pivots_and_zigzag(self):
+        # the earlier of two equal highs is the pivot; a pivot needs `right` bars after it
+        ph, pl = scan.find_pivots([1, 2, 5, 5, 2, 1, 1], [0, 0, 0, 0, 0, 0, 0], 2, 2)
+        self.assertEqual(ph, [(2, 5)])
+        self.assertEqual(pl, [])
+        # an outside bar (a high and a low at once) is ignored
+        ph, pl = scan.find_pivots([10, 10, 15, 10, 10], [9, 9, 5, 9, 9], 2, 2)
+        self.assertEqual((ph, pl), ([], []))
+        # no look-ahead: nothing in the last `right` bars is a pivot
+        closes = VCP_UP
+        ph, pl = scan.find_pivots([c + .5 for c in closes], [c - .5 for c in closes], 2, 2)
+        self.assertTrue(all(i <= len(closes) - 3 for i, _ in ph + pl))
+        self.assertEqual([i for i, _ in ph], [5, 11])
+        self.assertEqual([i for i, _ in pl], [8, 13])
+        # neighbours of one type collapse to the more extreme, the earlier on a tie
+        zz = scan.zigzag([(2, 10), (5, 12), (12, 9)], [(7, 3), (9, 2), (14, 4)])
+        self.assertEqual(zz, [(5, "H", 12), (9, "L", 2), (12, "H", 9), (14, "L", 4)])
+        self.assertEqual(scan.zigzag([(2, 10), (5, 10)], []), [(2, "H", 10)])
+        self.assertEqual(scan.median([3, 1, 2]), 2)
+        self.assertEqual(scan.median([1, 2, 3, 4]), 2.5)
+
+    def test_states(self):
+        self.assertEqual(scan.pat_state([1, 2, 3, 4], 0, 5), "coiled")
+        self.assertEqual(scan.pat_state([1, 2, 3, 5.1], 0, 5), "breakout")
+        self.assertIsNone(scan.pat_state([1, 2, 5.1, 5.2], 0, 5))          # not the first close over
+        self.assertIsNone(scan.pat_state([1, 2, 3, 5.3], 0, 5))             # more than 5 % over
+        self.assertIsNone(scan.pat_state([1, 6, 3, 4], 0, 5))               # an earlier close beyond
+        self.assertEqual(scan.pat_state([1, 6, 3, 4], 1, 5), "coiled")      # ... before the pattern began
+        self.assertEqual(scan.pat_state([1, 2, 3, 5], 0, 5, inclusive=True), "breakout")
+        self.assertIsNone(scan.pat_state([1, 2, 3, 5], 0, 5))
+
+    def test_vcp(self):
+        kw = dict(vcp_trend_gate=False, vcp_base_age=10, vcp_min_bars=0)
+        h = self.one(VCP_UP, "vcp", **kw)
+        self.assertEqual((h["pattern"], h["state"], h["setups"]), ("vcp", "coiled", ["vcp"]))
+        self.assertEqual((h["level"], h["stop"], h["target"]), (148.55, 135.45, None))
+        self.assertEqual(h["pivots"], [["2026-01-06", 150.5], ["2026-01-09", 119.5], ["2026-01-12", 148.5],
+                                       ["2026-01-14", 135.5]])
+        self.assertEqual((h["anchor_date"], h["price"], h["close_date"]), ("2026-01-06", 146, "2026-01-16"))
+        self.assertEqual(h["risk_pct"], round((148.55 - 135.45) / 148.55 * 100, 2))
+        # the second low undercuts the first: nothing fires
+        neg = list(VCP_UP)
+        neg[13] = 118
+        self.assertIsNone(self.one(neg, "vcp", **kw))
+        # a first pullback of 5 % is too shallow, a base high only 5 bars old is too young
+        young = dict(kw, vcp_base_age=5)
+        self.assertIsNotNone(self.one(VCP_UP, "vcp", **young))
+        self.assertIsNone(self.one([100, 110, 120, 130, 140, 150, 146, 143, 146, 148, 146, 144, 146, 147], "vcp", **young))
+        self.assertIsNone(self.one(VCP_UP, "vcp", vcp_trend_gate=False, vcp_min_bars=0, vcp_base_age=11))
+        # the stop must be close: a risk over 12 % drops the hit
+        self.assertIsNone(self.one(VCP_UP, "vcp", vcp_max_risk_pct=8.0, **kw))
+        # not coiled any more: the last close is over the trigger, the first one (a breakout) ...
+        up = VCP_UP[:-1] + [149]
+        self.assertEqual(self.one(up, "vcp", **kw)["state"], "breakout")
+        # ... but the second close over is not
+        self.assertIsNone(self.one(up + [150], "vcp", **kw))
+
+    def test_vcp_trend_gate_on_a_year_of_bars(self):
+        closes = ramp([(0, 50), (199, 140), (205, 150), (218, 128), (230, 148), (240, 138), (259, 145)])
+        rows = prows(closes, [200000.0] * 260, D(2025, 1, 1))
+        hits = scan.find_patterns(rows, only=["vcp"])           # the defaults: 5-bar pivots, every gate on
+        self.assertEqual(len(hits), 1)
+        h = hits[0]
+        self.assertEqual((h["state"], h["level"], h["stop"], h["anchor_date"]),
+                         ("coiled", 148.55, 137.45, "2025-07-25"))
+        self.assertEqual(h["vol_dry"], False)
+        self.assertEqual(h["vol_x"], 1.0)
+        # under 200 bars, or a 200-day average that is falling, or far under the high: no VCP
+        self.assertEqual(scan.find_patterns(rows[-199:], only=["vcp"]), [])
+        down = ramp([(0, 300), (199, 140), (205, 150), (218, 128), (230, 148), (240, 138), (259, 145)])
+        self.assertEqual(scan.find_patterns(prows(down, [200000.0] * 260, D(2025, 1, 1)), only=["vcp"]), [])
+
+    def test_double_bottom(self):
+        kw = dict(db_gap=(5, 80), db_prior_bars=5)
+        h = self.one(DBL, "double_bottom", **kw)
+        self.assertEqual((h["state"], h["level"], h["stop"], h["target"]), ("coiled", 112.55, 99.0, 125.5))
+        self.assertEqual(h["pivots"], [["2026-01-07", 99.5], ["2026-01-12", 99.5]])
+        self.assertEqual(h["anchor_date"], "2026-01-07")
+        # last close 113 is over B: not coiled; it is the first close over, so a breakout
+        up = DBL[:-1] + [113]
+        self.assertEqual(self.one(up, "double_bottom", **kw)["state"], "breakout")
+        self.assertIsNone(self.one(DBL[:-1] + [120], "double_bottom", **kw))          # more than 5 % over
+        # under the midpoint of the two lows and the top: not yet
+        self.assertIsNone(self.one(DBL[:-1] + [104], "double_bottom", **kw))
+        # the lows 2 U apart are not a double bottom
+        uneven = list(DBL)
+        uneven[11] = 97
+        self.assertIsNone(self.one(uneven, "double_bottom", **kw))
+        # the two lows closer than the minimum gap, no prior decline
+        self.assertIsNone(self.one(DBL, "double_bottom", db_gap=(6, 80), db_prior_bars=5))
+        self.assertIsNone(self.one(DBL, "double_bottom", db_gap=(5, 80), db_prior_bars=5, db_prior_drop=1.5))
+        # volume is advisory: the second low on less volume
+        vols = [1000.0] * len(DBL)
+        vols[6], vols[11] = 2000.0, 1000.0
+        hits = scan.find_patterns(prows(DBL, vols), dict(P2, **kw), ["double_bottom"])
+        self.assertIs(hits[0]["vol_dry"], True)
+        vols[11] = 3000.0
+        self.assertIs(scan.find_patterns(prows(DBL, vols), dict(P2, **kw), ["double_bottom"])[0]["vol_dry"], False)
+
+    def test_flag(self):
+        h = self.one(FLAG, "flag", flag_min_bars=0)
+        self.assertEqual((h["state"], h["level"], h["stop"], h["target"]), ("coiled", 126.55, 119.45, 153.5))
+        self.assertEqual(h["pivots"], [["2026-01-03", 99.5], ["2026-01-16", 126.5]])       # the base, the pole top
+        self.assertEqual(h["anchor_date"], "2026-01-03")
+        # the flag sags under the midpoint of the pole (113): nothing fires
+        sag = FLAG[:16] + [118, 112, 114, 111, 113]
+        self.assertIsNone(self.one(sag, "flag", flag_min_bars=0))
+        # the pole top must be 4 to 6 bars back
+        self.assertIsNotNone(self.one(FLAG[:-1], "flag", flag_min_bars=0))          # 4 bars back
+        self.assertIsNone(self.one(FLAG[:-2], "flag", flag_min_bars=0))             # 3 bars back
+        self.assertIsNotNone(self.one(FLAG + [121], "flag", flag_min_bars=0))       # 6 bars back
+        self.assertIsNone(self.one(FLAG + [121, 121], "flag", flag_min_bars=0))     # 7 bars back
+        # a gain of 11 % is no pole
+        self.assertIsNone(self.one([100, 99, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 106, 105, 106, 105, 106],
+                                   "flag", flag_min_bars=0))
+        # the default 50-bar gate
+        self.assertEqual(scan.find_patterns(prows(FLAG), {"L": 2, "R": 2}, ["flag"]), [])
+
+    def test_ascending_triangle(self):
+        h = self.one(TRI, "ascending_triangle", tri_span=(0, 999))
+        self.assertEqual((h["state"], h["level"], h["stop"]), ("coiled", 112.55, 103.0))
+        self.assertEqual([p[1] for p in h["pivots"]], [112.5, 100.5, 112.5, 103.5, 112.5])
+        self.assertEqual(h["target"], 124.5)                  # the top plus the height from the first low
+        self.assertIsNone(self.one(TRI, "ascending_triangle"))                       # span 8 bars: under the 20 minimum
+        flat = TRI[:8] + [100, 108, 112, 109, 110]       # the second low is lower than the first
+        self.assertIsNone(self.one(flat, "ascending_triangle", tri_span=(0, 999)))   # the lows no longer rise
+
+    def test_inverse_head_and_shoulders(self):
+        h = self.one(IHS, "inverse_head_shoulders")
+        self.assertEqual((h["state"], h["level"], h["stop"], h["target"]), ("coiled", 115.55, 101.0, 141.5))
+        self.assertEqual([p[1] for p in h["pivots"]], [99.5, 115.5, 89.5, 115.5, 101.5])
+        self.assertIsNone(self.one(IHS[:-1] + [100], "inverse_head_shoulders"))     # under the midpoint
+        self.assertEqual(self.one(IHS[:-1] + [117], "inverse_head_shoulders")["state"], "breakout")
+        uneven = list(IHS)
+        uneven[10] = 118                                                             # the necklines 3 U apart
+        self.assertIsNone(self.one(uneven, "inverse_head_shoulders"))
+
+    def test_rising_support(self):
+        h = self.one(SUPPORT, "rising_support")
+        self.assertEqual((h["state"], h["level"], h["stop"], h["target"]), ("coiled", 116.55, 114.5, None))
+        self.assertEqual([p[1] for p in h["pivots"]], [99.5, 105.5, 111.5])           # three touches, 1 a bar
+        self.assertEqual(h["anchor_date"], "2026-01-03")
+        self.assertIsNone(self.one(SUPPORT[:-1] + [121], "rising_support"))          # more than 3 % over the line
+        self.assertIsNone(self.one(SUPPORT[:-1] + [114], "rising_support"))          # under the line
+        self.assertIsNone(self.one(SUPPORT[:6] + [100] + SUPPORT[7:], "rising_support"))   # a close through it before
+
+    def test_vcp_and_triangle_merge_into_one_hit(self):
+        real = scan.DETECTORS
+        rows = prows(VCP_UP)
+
+        def fake(name, level, anchor):
+            return lambda x: {"pattern": name, "state": "coiled", "level": level, "stop": level - 5, "target": None,
+                              "anchor": anchor, "pivots": [(anchor, 100.0)], "vol_dry": None}
+        scan.DETECTORS = [("vcp", fake("vcp", 150.0, 3)), ("ascending_triangle", fake("ascending_triangle", 151.0, 1)),
+                          ("flag", fake("flag", 152.0, 2))]
+        try:
+            hits = scan.find_patterns(rows, P2)
+        finally:
+            scan.DETECTORS = real
+        self.assertEqual([h["pattern"] for h in hits], ["vcp", "flag"])
+        self.assertEqual(hits[0]["setups"], ["vcp", "ascending_triangle"])
+        self.assertEqual(hits[0]["level"], 150.0)
+        self.assertEqual(hits[0]["also"][0]["pattern"], "ascending_triangle")
+        self.assertEqual(hits[0]["also"][0]["level"], 151.0)
+
+    def test_the_hit_shape_and_a_stop_over_the_level(self):
+        h = self.one(DBL, "double_bottom", db_gap=(5, 80), db_prior_bars=5)
+        self.assertEqual(sorted(h), sorted(["setups", "price", "close_date", "pattern", "state", "level", "stop",
+                                            "risk_pct", "target", "anchor_date", "pivots", "vol_x", "vol_dry"]))
+        self.assertIsNone(h["vol_x"])                      # 15 bars: no 50-bar volume mean
+        rows = prows(DBL + [110] * 40, [1000.0] * 55)
+        self.assertEqual(scan.pattern_hit(scan.pat_context(rows, P2), {
+            "pattern": "x", "state": "coiled", "level": 10.0, "stop": 11.0, "target": None, "anchor": 0,
+            "pivots": [], "vol_dry": None}), None)
+
+    def test_scan_patterns_dedups_filters_and_carries_first_seen(self):
+        rows = {"FLG": prows(FLAG, start=D(2026, 1, 1)), "DBL": prows(DBL, start=D(2026, 1, 1))}
+        params = dict(P2, flag_min_bars=0, db_gap=(5, 80), db_prior_bars=5)
+        hits, counts, last = scan.scan_patterns(rows, ["FLG", "DBL", "NONE"], 0, 0, params=params)
+        self.assertEqual(sorted((h["symbol"], h["pattern"]) for h in hits), [("DBL", "double_bottom"), ("FLG", "flag")])
+        self.assertEqual((counts["requested"], counts["cached"], counts["scanned"], counts["hits"]), (3, 2, 2, 2))
+        self.assertEqual(last, D(2026, 1, 21))
+        hits, _, _ = scan.scan_patterns(rows, ["FLG", "DBL"], 0, 0, only=["flag"], params=params)
+        self.assertEqual([h["symbol"] for h in hits], ["FLG"])
+        hits, _, _ = scan.scan_patterns(rows, ["FLG", "DBL"], 0, 0, state="breakout", params=params)
+        self.assertEqual(hits, [])
+        hits, counts, _ = scan.scan_patterns(rows, ["FLG", "DBL"], 500, 0, params=params)       # a price floor
+        self.assertEqual((hits, counts["illiquid"]), ([], 2))
+        hits, counts, _ = scan.scan_patterns(rows, ["FLG"], 0, 0)                                # 21 rows: under min_bars 50
+        self.assertEqual((hits, counts["short"]), ([], 1))
+        # first_seen: carried when the same (symbol, pattern, anchor date) was in the previous watchlist
+        hits, _, _ = scan.scan_patterns(rows, ["FLG", "DBL"], 0, 0, params=params)
+        prev = {"mode": "patterns", "hits": [{"symbol": "FLG", "pattern": "flag", "anchor_date": "2026-01-03",
+                                              "first_seen": "2025-12-01"},
+                                             {"symbol": "DBL", "pattern": "double_bottom", "anchor_date": "2000-01-01",
+                                              "first_seen": "2025-12-02"}]}
+        scan.carry_first_seen(hits, prev)
+        seen = {h["symbol"]: h["first_seen"] for h in hits}
+        self.assertEqual(seen, {"FLG": "2025-12-01", "DBL": "2026-01-15"})      # DBL's anchor moved: it is new
+        scan.carry_first_seen(hits, {"mode": "daily", "hits": prev["hits"]})     # another mode's file: ignored
+        self.assertEqual({h["symbol"]: h["first_seen"] for h in hits}, {"FLG": "2026-01-21", "DBL": "2026-01-15"})
+
+    def test_500_symbols_by_260_bars_is_fast(self):
+        import random
+        import time
+        rnd = random.Random(7)
+        by = {}
+        for s in range(500):
+            c, rows = 100.0, []
+            drift = rnd.uniform(-0.001, 0.002)
+            for i in range(260):
+                c *= 1 + rnd.gauss(drift, 0.02)
+                rows.append((D(2025, 1, 1) + datetime.timedelta(days=i), c, c * (1 + abs(rnd.gauss(0, 0.01))),
+                             c * (1 - abs(rnd.gauss(0, 0.01))), c, 200000.0))
+            by["S%d" % s] = rows
+        t0 = time.time()
+        hits, counts, _ = scan.scan_patterns(by, sorted(by), 0, 0)
+        self.assertLess(time.time() - t0, 10.0)
+        self.assertEqual(counts["scanned"], 500)
+        for h in hits:                      # every hit is well-formed
+            self.assertLess(h["stop"], h["level"])
+            self.assertIn(h["state"], ("coiled", "breakout"))
+            self.assertIn(h["pattern"], scan.PAT_LABEL)
+
+
+class PatternsCli(unittest.TestCase):
+    """patterns on a made-up trader-data cache: a pole and flag, a flat line, a short history."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        os.chdir(self.d)
+        os.makedirs(os.path.join("trader", "data", "daily"))
+        flag = ramp([(0, 100), (59, 100), (61, 97), (74, 125), (75, 124), (76, 123), (77, 122), (78, 123), (79, 122)])
+        self.csv("FLG", flag)
+        self.csv("FLAT", [100.0] * 80)
+        self.csv("SHORT", [100.0] * 20)
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def csv(self, sym, closes):
+        with open(os.path.join("trader", "data", "daily", "%s.csv" % sym), "w") as fh:
+            fh.write("date,open,high,low,close,volume\n")
+            for r in prows(closes, start=D(2025, 1, 1)):
+                fh.write("%s,%s,%s,%s,%s,200000\n" % (r[0].isoformat(), r[1], r[2], r[3], r[4]))
+
+    def test_the_command_end_to_end(self):
+        out = os.path.join("trader", "watchlist.json")
+        code, text, err = run(["patterns", "--now", "2026-12-01 08:30"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Pattern scan, closes through 2025-03-21", text)
+        self.assertIn("pole and flag", text)
+        self.assertIn("(new)", text)
+        self.assertIn("a turn in the last 5 sessions is not visible yet", text)
+        self.assertIn("Not financial advice", text)
+        self.assertNotIn("\u2014", text)
+        with open(out, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        self.assertEqual(doc["mode"], "patterns")
+        self.assertEqual((doc["scanned"], doc["universe"], doc["created_by"]), (2, 3, "trader-scanner"))
+        self.assertEqual(len(doc["hits"]), 1)
+        h = doc["hits"][0]
+        self.assertEqual((h["symbol"], h["pattern"], h["state"], h["level"], h["stop"], h["target"], h["first_seen"]),
+                         ("FLG", "flag", "coiled", 125.55, 121.45, 154.5, "2025-03-21"))
+        self.assertEqual(h["close_date"], "2025-03-21")
+        # a second run keeps first_seen from the file it finds, and the entry skill's key is there
+        h["first_seen"] = "2025-03-10"
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        code, text, _ = run(["patterns", "--now", "2026-12-01 08:30", "--json"])
+        again = json.loads(text)
+        self.assertEqual(again["hits"][0]["first_seen"], "2025-03-10")
+        self.assertIsInstance(again["hits"][0]["level"], float)
+        self.assertEqual(again["counts"]["short"], 1)
+        # filters
+        code, text, _ = run(["patterns", "--pattern", "vcp", "--no-write"])
+        self.assertEqual(code, 1)
+        self.assertIn("Nothing matched", text)
+        code, text, _ = run(["patterns", "--state", "breakout", "--no-write"])
+        self.assertEqual(code, 1)
+        code, text, _ = run(["patterns", "--symbols", "flg", "--pattern", "flag", "--state", "coiled", "--no-write"])
+        self.assertEqual(code, 0)
+        code, _, err = run(["patterns", "--symbols", "GONE", "--no-write"])
+        self.assertEqual(code, 1)
+        self.assertIn("trader-data/data.py daily", err)
+
+
 CAL = os.path.join(SDIR, "calendar-2027.json")
 
 

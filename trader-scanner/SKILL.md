@@ -11,6 +11,9 @@ description: >-
   from the 09:15 IST open, optionally dropping names whose daily swing trend
   is down (--trend-filter), then writes
   trader/watchlist.json for trader-news and trader-entry. Also a long-term
+  chart-pattern scan of the daily cache (VCP, double bottom, pole and flag,
+  ascending triangle, inverse head and shoulders, rising-support retest, each
+  with a trigger level, a stop and a target), and a long-term
   screen of the trader-data daily cache (above the 200-day average, near the
   52-week high, near the 52-week low as a value screen, RSI, and market
   structure: swing up with a change-of-character stop level, or a swing
@@ -22,9 +25,11 @@ description: >-
   "build my watchlist", "what should I look at today", "stocks above the
   200 DMA", "near 52-week high", "52-week low value stocks", "stocks in a
   swing uptrend", "swing reversal", "pullback in an uptrend", "change of
-  character level", "only breakouts in an uptrend", or at the start of a
+  character level", "only breakouts in an uptrend", "find VCP setups",
+  "double bottoms", "chart patterns", "pole and flag", "inverse head and
+  shoulders", "stocks coiling under resistance", or at the start of a
   trading day before /trader-news.
-argument-hint: "[universe | daily | orb | longterm] [--at HH:MM] [--cache] [--trend-filter]"
+argument-hint: "[universe | daily | orb | longterm | patterns] [--at HH:MM] [--cache] [--trend-filter]"
 ---
 
 # trader-scanner
@@ -51,6 +56,8 @@ python3 "${CLAUDE_SKILL_DIR}/scan.py" daily --cache                  # closes fr
 python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --cache                    # bars from trader/data/intraday, no Yahoo
 python3 "${CLAUDE_SKILL_DIR}/scan.py" longterm                       # long-term screen -> trader/longterm.json
 python3 "${CLAUDE_SKILL_DIR}/scan.py" longterm --screen near_52w_low --near-low 10
+python3 "${CLAUDE_SKILL_DIR}/scan.py" patterns                       # chart patterns -> trader/watchlist.json
+python3 "${CLAUDE_SKILL_DIR}/scan.py" patterns --pattern vcp --state coiled
 ```
 
 Flags: `--min-price 50` (rupees) and `--min-volume` (daily 500,000, orb 0),
@@ -76,6 +83,7 @@ scanner asks Yahoo for `SYMBOL.NS` (with `&` sent as `%26`) and drops a
 | `trader/data/universe.csv` | read by `universe` when niftyindices.com refuses (written by trader-data) |
 | `trader/data/calendar.json` | read for the trading calendar when it exists (written by trader-data): `years`, `holidays`, `special_sessions`. Missing or unreadable means the built-in 2026 table |
 | `nifty500-snapshot.csv` (+ `.json`) | bundled with this skill: the Nifty 500 list as of 2026-07-13, the last fallback |
+| `trader/watchlist.json` (patterns) | written by `patterns`: `mode: "patterns"`, per hit `pattern`, `state`, `level`, `stop`, `risk_pct`, `target`, `anchor_date`, `pivots`, `vol_x`, `vol_dry`, `first_seen`. It replaces the file the other scans wrote |
 | `trader/longterm.json` | written by `longterm`: same shape as the watchlist, `mode: "longterm"`, per hit the 200-day average, 52-week high and low and the distance from each, and the swing fields (`swing_trend`, `swing_coc`, `swing_event`, `swing_bars_since`) |
 
 ## The universe
@@ -190,6 +198,50 @@ used and warns when the newest close is more than 5 days old. A screen is a
 starting list for reading annual reports and filings, not a list of stocks
 to buy. Not financial advice.
 
+## The chart-pattern scan (no network)
+
+`patterns` reads the same daily cache as `longterm` (the `.adj.csv` when
+there is one), the last 260 sessions of each stock with at least 50, and the
+same liquidity filters (`--min-price` 20, `--min-volume` 1,00,000). It needs
+the real highs and lows, so it never uses Yahoo's closes-only spark.
+
+Pivots are the raw material. A bar is a pivot high when its high is
+strictly above the 5 highs before it and not below the 5 after it (the
+earlier of equal highs wins); a pivot low mirrors that; a bar that is both is
+ignored. A pivot therefore shows up 5 sessions after it formed, and a turn in
+the last 5 sessions is invisible: the scan says so. A detector reads only
+bars up to the last one, so the same call replays on history. The zigzag
+merges neighbouring pivots of one type into the more extreme. `U` below is
+the median bar range (high minus low) over the pattern, and a tick is ₹0.05.
+
+| pattern | the rule (all must hold) | level / stop / target |
+| --- | --- | --- |
+| `vcp` | 200+ sessions; close over the 50-day over the 200-day average, the 200-day rising, close within 25 % of the 252-bar high. The base high is the highest pivot high of the last 120 bars, at least 15 old. From it, 2 to 5 pullbacks: the first 8 to 35 % deep, each at most 0.85 of the one before, each low above the last, the last at most 10 %, every later high within 5 % of the base high. Coiled: the close is within 5 % under the trigger (the high the last pullback fell from) and over its low | trigger + tick / last low - tick / none; hits with over 12 % risk are dropped |
+| `double_bottom` | two pivot lows 10 to 80 bars apart, within 0.5 U of each other; a pivot high between them, a rebound of at least max(3 U, 5 % of the low); the 60 bars before the first low reached 1.15 times it; no close under the lows minus 0.5 U, no close over the middle high after the second low. Coiled: the close is at or over the midpoint of the second low and the middle high | middle high + tick / lows - 0.5 U / middle high + (middle high - low) |
+| `flag` | the highest high of the last 7 bars is the highest of the last 90 and 4 to 6 bars old; the latest pivot low before it is at most 20 bars earlier and the pole gain is at least 15 %; the lowest low since the top holds the midpoint of the pole | top + tick / flag low - tick / top + pole height |
+| `ascending_triangle` | high, low, high, low, high spanning 20 to 90 bars; the three highs within 1 U; the second low at least 0.5 U over the first. Coiled at or over the midpoint of the last low and the top | top + tick / last low - 0.5 U / top + (top - first low) |
+| `inverse_head_shoulders` | low, high, low, high, low: the head at least 0.6 U under both shoulders and the lowest of 60 bars; both necklines over both shoulders and within 1 U of each other; the shoulders within half the head depth of each other. Coiled at or over the midpoint of the right shoulder and the neckline | neckline + tick / right shoulder - 0.5 U / neckline + (neckline - head) |
+| `rising_support` | over the last 120 bars, a rising line through two pivot lows 5+ bars apart with 3 or more pivot lows within 0.5 U of it, no close under it since the first; the last close at most 3 % over it (most touches wins) | last high + tick / line - 1 U / none |
+
+State is `coiled` (formed, no close over its trigger yet) or `breakout` (the
+last close is the first one over the trigger and at most 5 % over it). A
+`vcp` and an `ascending_triangle` on one chart merge into one hit with both
+tags and the triangle's numbers under `also`. `vol_dry` (the last 10 days'
+average volume under the 50 before, or the second low on less volume than
+the first) and `vol_x` (the last volume over its 50-day mean) are advisory,
+not gates. A hit is deduplicated by symbol, pattern and anchor date, and
+`first_seen` carries over from the previous `trader/watchlist.json` when that
+file was also written by `patterns`.
+
+`level` is the key `entry.py watchlist --setup level` reads: it fires on the
+first completed 5-minute bar that closes over it, inside the entry window.
+`stop` goes to trader-exit as `--stop price:X`. These are daily patterns held
+for days, not intraday trades: the stop can be far under price and trader-exit's
+intraday plan will flat the position by the close. Opening-range scanning
+(below) stays the intraday tool; intraday double-bottom and flag detection is
+not built. The detectors' thresholds are constants in `scan.py` (`PAT`),
+marked repo or ours.
+
 ## The opening-range breakout scan (during the session)
 
 The NSE session runs 09:15 to 15:30 IST: 75 five-minute bars. The opening
@@ -267,7 +319,11 @@ cache, under 41 daily bars, or no trend yet stays in the list, marked
    the session, call `get_historical_data` (or `get_ohlc`), save the raw JSON
    and run `python3 trader-data/data.py import-kite FILE --kind historical --symbol SYMBOL`; otherwise run
    `python3 trader-data/data.py doctor`. Then re-run the scan with `--cache`.
-6. For long-term ideas (no day trade): `scan.py longterm` after a
+6. For chart patterns: `scan.py patterns` after a `trader-data daily` refresh.
+   Give the counts, the dates of the closes, and the hits with state, level,
+   stop and risk. A pattern is a shape on a chart, not a forecast; say when a
+   hit is a `breakout` that has already moved. Never say "buy".
+7. For long-term ideas (no day trade): `scan.py longterm` after a
    `trader-data daily` refresh. Give the counts, the dates of the closes, and
    the hits with their distance from the 52-week high and low; never call a
    52-week-low stock "cheap enough to buy".
