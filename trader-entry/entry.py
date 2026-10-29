@@ -479,7 +479,7 @@ def offline_file(path, sym):
 
 
 def intraday_cache_path(sym):
-    return os.path.join(DATA_DIR, "intraday", "%s-5m.json" % sym)
+    return os.path.join(DATA_DIR, "intraday", "%s-5m.json" % sym).replace(os.sep, "/")   # same text on every OS
 
 
 def cache_when(text, path):
