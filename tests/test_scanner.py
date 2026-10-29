@@ -715,7 +715,7 @@ class Cli(unittest.TestCase):
         self.assertEqual(sorted(h["symbol"] for h in doc["hits"]), ["HDFCBANK", "ITC", "RELIANCE", "TCS"])
         self.assertIn({"symbol": "ITC", "setups": ["breakout_20d"], "price": 93.9, "close_date": "2026-10-16",
                        "rsi": 75.3, "volume": 3680307, "level": 93.9, "coc": 85.65, "swing_trend": "up",
-                       "swing_basis": "closes"}, doc["hits"])
+                       "swing_basis": "closes", "dq": None, "dq_date": None}, doc["hits"])
         self.assertEqual(doc["as_of"], "2026-10-16 close")
 
         # the 10:00 IST scan
@@ -1776,6 +1776,186 @@ class Breadth(unittest.TestCase):
                              "--no-write"])
         self.assertIn("relative strength over the Nifty positive and rising", text)
         self.assertNotIn("Note: no benchmark", text)
+
+
+DELIV_SPIKE = os.path.join(SDIR, "delivery-SPIKE.csv")      # 30 sessions at 100 delivered, the last at 300
+DELIV_BE = os.path.join(SDIR, "delivery-BE.csv")            # the same on the BE (trade-to-trade) series
+DELIV_MISSING = os.path.join(SDIR, "delivery-MISSING.csv")  # every third delivery figure empty
+
+
+def drows(qty, qpt, series="EQ", end=D(2026, 10, 16)):
+    """Delivery rows (as read_delivery_csv returns them) from two lists, the last for `end`."""
+    n = len(qty)
+    return [{"date": end - datetime.timedelta(days=n - 1 - i), "deliv_qty": qty[i], "qty_per_trade": qpt[i],
+             "series": series} for i in range(n)]
+
+
+class Delivery(unittest.TestCase):
+    """The delivery_spike tag and dq (eod2.md idea 2): fixtures are made-up numbers in trader-data's layout."""
+
+    def test_the_spike_fixture(self):
+        rows = scan.read_delivery_csv(DELIV_SPIKE)
+        self.assertEqual((len(rows), rows[0]["date"], rows[-1]["date"]), (31, D(2026, 9, 16), D(2026, 10, 16)))
+        r = scan.delivery_reading(rows, D(2026, 10, 16))
+        # the window is the last 30 sessions: 29 at 100 and the latest at 300, mean 106.67
+        self.assertAlmostEqual(r["dq"], 300 / (3200 / 30.0), places=6)
+        self.assertAlmostEqual(r["dq"], 2.8125, places=4)
+        self.assertAlmostEqual(r["tq"], 2.8125, places=4)         # volume 3000 over 20 trades: 150 a trade, mean 53.33
+        self.assertEqual((r["spike"], r["series"], r["date"]), (True, "EQ", "2026-10-16"))
+        r = scan.delivery_reading(rows, D(2026, 10, 15))           # the price data is for another day: no tag
+        self.assertFalse(r["spike"])
+        self.assertAlmostEqual(r["dq"], 2.8125, places=4)
+        self.assertTrue(scan.delivery_reading(rows)["spike"])
+
+    def test_trade_to_trade_series_never_tag(self):
+        rows = scan.read_delivery_csv(DELIV_BE)
+        r = scan.delivery_reading(rows, D(2026, 10, 16))
+        self.assertEqual(r["series"], "BE")
+        self.assertFalse(r["spike"])
+        self.assertAlmostEqual(r["dq"], 2.8125, places=4)           # the ratio is still reported
+        self.assertFalse(scan.delivery_reading(drows([100] * 29 + [300], [50] * 29 + [150], "BZ"))["spike"])
+        self.assertTrue(scan.delivery_reading(drows([100] * 29 + [300], [50] * 29 + [150], ""))["spike"])
+
+    def test_missing_figures_are_left_out_of_the_mean(self):
+        rows = scan.read_delivery_csv(DELIV_MISSING)
+        self.assertIsNone(rows[1]["deliv_qty"])                      # empty, not zero
+        self.assertEqual(rows[1]["qty_per_trade"], 50.0)
+        r = scan.delivery_reading(rows, D(2026, 10, 16))
+        # the last 30 sessions have 10 empty days: 19 at 100 and the latest 300, mean 110
+        self.assertAlmostEqual(r["dq"], 300 / 110.0, places=6)
+        self.assertTrue(r["spike"])
+
+    def test_not_enough_values_no_reading(self):
+        self.assertIsNone(scan.delivery_reading([]))
+        self.assertIsNone(scan.delivery_reading(None))
+        few = drows([100, 100, 100, 300], [50, 50, 50, 150])                   # 4 values
+        r = scan.delivery_reading(few)
+        self.assertEqual((r["dq"], r["tq"], r["spike"]), (None, None, False))
+        five = drows([100, 100, 100, 100, 300], [50, 50, 50, 50, 150])
+        self.assertTrue(scan.delivery_reading(five)["spike"])                  # 5 is enough
+        gaps = drows([100, None, 100, None, 100, None, 100, 300], [50] * 7 + [150])
+        r = scan.delivery_reading(gaps)                                        # 5 quantities, 8 trade sizes
+        self.assertTrue(r["spike"])
+        late = drows([100] * 9 + [None], [50] * 9 + [150])                     # the latest day has no figure
+        r = scan.delivery_reading(late)
+        self.assertEqual((r["dq"], r["spike"]), (None, False))
+        self.assertAlmostEqual(r["tq"], 150 / ((9 * 50 + 150) / 10.0), places=6)
+
+    def test_both_ratios_must_clear_1_2(self):
+        self.assertEqual(scan.DELIVERY_RATIO, 1.2)
+        self.assertEqual((scan.DELIVERY_BARS, scan.DELIVERY_MIN), (30, 5))
+        # delivery quantity up but the average trade size flat: no tag
+        self.assertFalse(scan.delivery_reading(drows([100] * 4 + [300], [50] * 5))["spike"])
+        self.assertFalse(scan.delivery_reading(drows([100] * 5, [50] * 4 + [150]))["spike"])
+        # 1.2 x the base is 1.15 x the mean here: under 1.2, then 1.4 x the base is 1.30: over
+        self.assertFalse(scan.delivery_reading(drows([100] * 4 + [120], [50] * 4 + [60]))["spike"])
+        self.assertTrue(scan.delivery_reading(drows([100] * 4 + [140], [50] * 4 + [70]))["spike"])
+
+    def test_only_the_last_30_sessions_count(self):
+        qty = [10000] * 10 + [100] * 29 + [300]
+        r = scan.delivery_reading(drows(qty, [50] * 39 + [150]))
+        self.assertAlmostEqual(r["dq"], 2.8125, places=4)
+
+    def test_reading_the_file(self):
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "X.csv")
+            with open(path, "w") as fh:
+                fh.write("date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series\n"
+                         "2026-10-14,1000,20,100,10,50,eq\n"
+                         "not-a-date,1,1,1,1,1,EQ\n"
+                         "2026-10-15,1000,20,-,,abc,EQ\n"
+                         "2026-10-14,1000,20,120,12,50,EQ\n"                  # a later row for a date wins
+                         "2026-10-16,1000,0,150,15,,\n")
+            rows = scan.read_delivery_csv(path)
+            self.assertEqual([r["date"] for r in rows], [D(2026, 10, 14), D(2026, 10, 15), D(2026, 10, 16)])
+            self.assertEqual([r["deliv_qty"] for r in rows], [120.0, None, 150.0])
+            self.assertEqual([r["qty_per_trade"] for r in rows], [50.0, None, None])
+            self.assertEqual([r["series"] for r in rows], ["EQ", "EQ", ""])
+            with open(path, "w") as fh:
+                fh.write("date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series\n")
+            self.assertEqual(scan.read_delivery_csv(path), [])
+            self.assertEqual(scan.load_delivery(["X", "GONE"], d), {})              # no delivery/ folder: nothing
+            os.makedirs(os.path.join(d, "delivery"))
+            shutil.copy(DELIV_SPIKE, os.path.join(d, "delivery", "X.csv"))
+            self.assertEqual(list(scan.load_delivery(["X", "GONE"], d)), ["X"])
+        finally:
+            shutil.rmtree(d)
+
+    def flat_rows(self, n=260, volume=200000, end=D(2026, 10, 16)):
+        start = end - datetime.timedelta(days=n - 1)
+        return [(start + datetime.timedelta(days=i), 100.0, 100.5, 99.5, 100.0, float(volume)) for i in range(n)]
+
+    def test_scan_daily_tag_and_dq(self):
+        rows = self.flat_rows(60)
+        series = scan.series_from_daily(rows)
+        deliv = {"SPK": scan.read_delivery_csv(DELIV_SPIKE), "OLD": scan.read_delivery_csv(DELIV_SPIKE)[:-1],
+                 "QUIET": drows([100] * 30, [50] * 30), "BE": scan.read_delivery_csv(DELIV_BE)}
+        data = {s: series for s in ("SPK", "OLD", "QUIET", "BE", "NONE")}
+        hits, counts, last = scan.scan_daily(data, ["SPK", "OLD", "QUIET", "BE", "NONE"],
+                                             scan.parse_now("2026-10-19 08:45"), 0, 0, deliv)
+        self.assertEqual([h["symbol"] for h in hits], ["SPK"])                  # the only one with a tag
+        h = hits[0]
+        self.assertEqual(h["setups"], ["delivery_spike"])
+        self.assertAlmostEqual(h["dq"], 2.81, places=2)
+        self.assertEqual(h["dq_date"], "2026-10-16")
+        hits, _, _ = scan.scan_daily(data, ["SPK", "NONE"], scan.parse_now("2026-10-19 08:45"), 0, 0)
+        self.assertEqual(hits, [])                                              # no delivery data: no tag
+        self.assertIn("delivery_spike", scan.LABEL)
+
+    def test_scan_longterm_tag_and_dq(self):
+        rows = self.flat_rows(260)
+        deliv = {"SPK": scan.read_delivery_csv(DELIV_SPIKE), "BE": scan.read_delivery_csv(DELIV_BE)}
+        hits, _, _ = scan.scan_longterm({"SPK": rows, "BE": rows, "NONE": rows}, ["SPK", "BE", "NONE"],
+                                        screen="delivery_spike", delivery=deliv)
+        self.assertEqual([h["symbol"] for h in hits], ["SPK"])
+        self.assertEqual(hits[0]["setups"], ["delivery_spike"])
+        self.assertAlmostEqual(hits[0]["dq"], 2.81, places=2)
+        hits, _, _ = scan.scan_longterm({"BE": rows, "NONE": rows}, ["BE", "NONE"], delivery=deliv)
+        by = {h["symbol"]: h for h in hits}
+        self.assertAlmostEqual(by["BE"]["dq"], 2.81, places=2)                   # reported, not tagged
+        self.assertNotIn("delivery_spike", by["BE"]["setups"])
+        self.assertIsNone(by["NONE"]["dq"])
+        self.assertIn("delivery_spike", scan.LT_LABEL)
+
+    def test_the_commands_read_trader_data_delivery(self):
+        d = tempfile.mkdtemp()
+        cwd = os.getcwd()
+        os.chdir(d)
+        try:
+            os.makedirs(os.path.join("trader", "data", "daily"))
+            os.makedirs(os.path.join("trader", "data", "delivery"))
+            with open(os.path.join("trader", "data", "daily", "SPK.csv"), "w") as fh:
+                fh.write("date,open,high,low,close,volume\n")
+                for r in self.flat_rows(260):
+                    fh.write("%s,%s,%s,%s,%s,%d\n" % (r[0].isoformat(), r[1], r[2], r[3], r[4], r[5]))
+            shutil.copy(DELIV_SPIKE, os.path.join("trader", "data", "delivery", "SPK.csv"))
+            argv = ["--symbols", "SPK", "--no-write", "--min-price", "0", "--min-volume", "0"]
+            code, text, err = run(["daily", "--cache", "--now", "2026-10-19 08:45", "--json"] + argv)
+            self.assertEqual(code, 0, err)
+            doc = json.loads(text)
+            self.assertEqual(doc["hits"][0]["setups"], ["delivery_spike"])
+            self.assertAlmostEqual(doc["hits"][0]["dq"], 2.81, places=2)
+            self.assertEqual(doc["delivery_symbols"], 1)
+            code, text, _ = run(["daily", "--cache", "--now", "2026-10-19 08:45"] + argv)
+            self.assertIn("delivery spike (institutional-size trades, high delivery) (dq 2.8)", text)
+            self.assertIn("Delivery data (trader/data/delivery) for 1 of the symbols", text)
+            code, text, _ = run(["longterm", "--screen", "delivery_spike", "--now", "2026-10-19 08:45", "--json",
+                                 "--symbols", "SPK", "--no-write", "--min-volume", "0"])
+            doc = json.loads(text)
+            self.assertEqual([h["setups"] for h in doc["hits"]], [["delivery_spike"]])
+            self.assertEqual(doc["hits"][0]["dq_date"], "2026-10-16")
+            os.remove(os.path.join("trader", "data", "delivery", "SPK.csv"))        # the track that writes it is absent
+            code, text, _ = run(["longterm", "--now", "2026-10-19 08:45", "--json", "--symbols", "SPK", "--no-write"])
+            doc = json.loads(text)
+            self.assertIsNone(doc["hits"][0]["dq"])
+            self.assertNotIn("delivery_symbols", doc)
+            code, text, _ = run(["daily", "--cache", "--now", "2026-10-19 08:45"] + argv)
+            self.assertEqual(code, 1)
+            self.assertNotIn("Delivery data", text)
+        finally:
+            os.chdir(cwd)
+            shutil.rmtree(d)
 
 
 CAL = os.path.join(SDIR, "calendar-2027.json")

@@ -20,7 +20,9 @@ description: >-
   reversal up; relative strength over the Nifty, Mansfield), and a market
   breadth reading from the same cache (percent of stocks above their 50- and
   200-day averages, net new highs, advance-decline line, McClellan oscillator)
-  that adds a one-line regime note to every scan. Free Yahoo data
+  that adds a one-line regime note to every scan, and a delivery spike tag
+  (institutional-size trades with high delivery) from the delivery files
+  trader-data keeps. Free Yahoo data
   (SYMBOL.NS), bar by bar, with the trader-data cache as the fallback when
   Yahoo or NSE block the download. Use when the user says "scan the market", "find
   me setups", "what is breaking out on NSE", "opening range breakouts", "scan
@@ -31,7 +33,8 @@ description: >-
   character level", "only breakouts in an uptrend", "find VCP setups",
   "double bottoms", "chart patterns", "pole and flag", "inverse head and
   shoulders", "stocks coiling under resistance", "market breadth", "is the
-  market healthy", "McClellan", "relative strength vs Nifty", or at the start
+  market healthy", "McClellan", "relative strength vs Nifty", "delivery
+  spike", "high delivery volume", "institutional buying", or at the start
   of a trading day before /trader-news.
 argument-hint: "[universe | daily | orb | longterm | patterns | breadth] [--at HH:MM] [--cache] [--trend-filter]"
 ---
@@ -87,6 +90,7 @@ scanner asks Yahoo for `SYMBOL.NS` (with `&` sent as `%26`) and drops a
 | `trader/data/intraday/<SYMBOL>-5m.json` | read by `orb --cache` and `orb` when Yahoo fails (written by trader-data, Yahoo v8 shape) |
 | `trader/data/universe.csv` | read by `universe` when niftyindices.com refuses (written by trader-data) |
 | `trader/data/index/nifty-50.csv` | read by `longterm` as the relative-strength benchmark when it exists (written by trader-data: `date,open,high,low,close,volume,pe,pb,div_yield`); else `trader/data/daily/NIFTYBEES.adj.csv`, else `NIFTYBEES.csv`; none means `mansfield_rs` is null, with a note |
+| `trader/data/delivery/<SYMBOL>.csv` | read by `daily --cache` and `longterm` when it exists (written by trader-data): `date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series`, an empty field is missing. No file means no `delivery_spike` tag and `dq` null |
 | `trader/data/breadth.csv` | written by `breadth`: `date,pct_50,pct_200,net_new_highs,ad_line,mcclellan_osc,net_adv_ratio,fast_ema,slow_ema`. When it exists every scan prints one regime line from its newest row (and puts it in the file as `regime`) |
 | `trader/data/calendar.json` | read for the trading calendar when it exists (written by trader-data): `years`, `holidays`, `special_sessions`. Missing or unreadable means the built-in 2026 table |
 | `nifty500-snapshot.csv` (+ `.json`) | bundled with this skill: the Nifty 500 list as of 2026-07-13, the last fallback |
@@ -141,6 +145,7 @@ The setups are computed from daily closes only (spark has no highs or lows):
 | `oversold_bounce` | RSI 14 was under 30 yesterday and today closed up |
 | `swing_pullback` | the swing engine (see the long-term screen) says up and stable, a swing high is pending, the close is over the change-of-character level, and the swing high formed 3 to 15 bars ago (`SWING_PULLBACK_MIN`, `SWING_PULLBACK_MAX`) |
 | `swing_reversal_up` | the swing trend turned up on the last bar |
+| `delivery_spike` | with `--cache` only: the same delivery reading as in the long-term screen (below), on the latest day |
 
 A closing-high breakout fires more often than an intraday-high one. Hits are
 listed most traded first (price times volume, in rupees).
@@ -171,6 +176,7 @@ is no universe file. A stock needs at least 200 sessions. Per stock:
 | over the low | last close / 52-week low - 1, in percent |
 | RSI 14 | Wilder, on the last 120 closes |
 | swing trend, `swing_coc` | a market-structure engine (below) over the last 252 sessions |
+| `dq` | the latest delivery quantity over its mean of the last 30 sessions in the delivery file (the latest included); null without a file or under 5 values |
 | `mansfield_rs` | Mansfield relative strength over the Nifty: (RS / its 22-session average - 1) x 100, with RS = stock close / index close x 100 on the dates both have; null without a benchmark |
 
 | screen | the rule |
@@ -182,6 +188,7 @@ is no universe file. A stock needs at least 200 sessions. Per stock:
 | `swing_up` | the swing trend is up and stable (more than 40 bars fed) |
 | `swing_reversal_up` | the swing trend turned up on the last bar |
 | `rs_positive` | `mansfield_rs` is above zero and above what it was 5 sessions ago (`MANSFIELD_RISE_BARS`): outperforming and still gaining on the index |
+| `delivery_spike` | `dq` over 1.2 and the quantity per trade over 1.2 times its own 30-session mean, on a series that is not BE or BZ, and the delivery row is for the same day as the last close |
 
 The swing engine is a one-pass, bar-by-bar market-structure tracker on
 highs, lows and closes. In an uptrend the first bar that fails to make a new
@@ -206,6 +213,29 @@ written to `trader/longterm.json`. The cache is as fresh as the last
 used and warns when the newest close is more than 5 days old. A screen is a
 starting list for reading annual reports and filings, not a list of stocks
 to buy. Not financial advice.
+
+## Delivery (the cache only)
+
+NSE publishes how much of each day's volume was actually delivered, and the
+size of the average trade. A day with both well above normal reads as
+institutional money. `daily --cache` and `longterm` read
+`trader/data/delivery/<SYMBOL>.csv` (trader-data writes it; the scanner
+works without it). Over the last 30 sessions in the file, the latest
+included and an empty figure left out of the mean:
+
+- `dq` = the latest delivery quantity / the mean delivery quantity.
+- `tq` = the latest quantity per trade / its mean (not written to the
+  hit, used for the tag).
+- `delivery_spike` when `dq` and `tq` are both over 1.2 (`DELIVERY_RATIO`),
+  the series is not BE or BZ (trade-to-trade, where the whole volume is
+  delivered and the ratio says nothing), and the delivery date is the last
+  close's date. A file lagging the price data by a day gives `dq` and
+  `dq_date` but no tag.
+- Under 5 values in the window: no reading, no tag (`DELIVERY_MIN`).
+
+Rough bands for `dq` when you describe it: 2 or more is strong, 1.5 or more
+high, over 1 above normal. A spike is a day of heavy buying or heavy selling
+by big hands: delivery does not say which. Say so.
 
 ## Market breadth and the regime line (no network)
 

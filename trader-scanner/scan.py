@@ -43,6 +43,8 @@ daily     Pre-market scan of daily CLOSES (Yahoo spark: 20 symbols a request,
                              high is pending, the close is over the change-of-character
                              level and the swing high formed 3 to 15 bars ago
             swing_reversal_up  the swing trend turned up on the last bar
+            delivery_spike delivery quantity and quantity per trade both over 1.2 x their
+                           30-session average on the latest day (daily --cache only)
           The swing engine runs on closes alone with Yahoo spark (high = low =
           close, a closing-basis structure) and on real highs and lows with
           --cache. Each hit carries level (the pending swing high, what
@@ -70,7 +72,11 @@ longterm  Long-term screen of the trader-data daily cache
           index close x 100 on the common dates. Benchmark: trader/data/index/
           nifty-50.csv, else trader/data/daily/NIFTYBEES.adj.csv, else NIFTYBEES.csv;
           none = mansfield_rs null and a note.
-          Each hit carries swing_trend, swing_coc (a closing-basis structural stop),
+            delivery_spike the daily scan's delivery reading, from
+                           trader/data/delivery/<SYMBOL>.csv (trader-data; absent = no
+                           tag, dq null)
+          Each hit carries dq (the latest delivery quantity over its 30-session
+          mean), swing_trend, swing_coc (a closing-basis structural stop),
           swing_event and swing_bars_since.
           --screen NAME keeps only that screen (default: any). Liquidity:
           --min-price (20) and 20-day average volume >= --min-volume (1,00,000).
@@ -192,6 +198,10 @@ BREADTH_STRONG, BREADTH_WEAK = 60.0, 40.0   # percent above the 200-day: broad s
 BREADTH_COLUMNS = ["date", "pct_50", "pct_200", "net_new_highs", "ad_line", "mcclellan_osc", "net_adv_ratio",
                    "fast_ema", "slow_ema"]
 BREADTH_CAVEAT = "current constituents only, so the history is survivorship-biased"
+DELIVERY_BARS = 30       # sessions in the delivery average, the latest one included
+DELIVERY_MIN = 5         # fewer delivery values than this in the window: no reading, no tag
+DELIVERY_RATIO = 1.2     # delivery_spike: delivery quantity and quantity per trade both over 1.2 x their average
+DELIVERY_T2T = ("BE", "BZ")   # trade-to-trade series: delivery is the whole volume, so it says nothing
 NIFTY500_FILE = "ind_nifty500list.csv"
 NIFTY500_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 EQUITY_FILE = "EQUITY_L.csv"
@@ -241,6 +251,7 @@ SETUPS = [
     ("reclaim_ma20", "reclaimed the 20-day average"),
     ("oversold", "oversold (RSI under 30)"),
     ("oversold_bounce", "oversold bounce"),
+    ("delivery_spike", "delivery spike (institutional-size trades, high delivery)"),
     ("swing_pullback", "swing pullback (uptrend, pending swing high)"),
     ("swing_reversal_up", "swing trend just reversed up"),
 ]
@@ -842,8 +853,9 @@ def find_swing(bars, retrace=SWING_RETRACE, min_bars=SWING_MIN_BARS):
                   "coc": sw["coc"] if up else None}
 
 
-def scan_daily(data, symbols, now_utc, min_price, min_volume):
-    """Pure. data = {SYM: series}. Returns (hits, counts, last_date)."""
+def scan_daily(data, symbols, now_utc, min_price, min_volume, delivery=None):
+    """Pure. data = {SYM: series}; delivery = {SYM: delivery rows} for the dq number and the delivery_spike tag.
+    Returns (hits, counts, last_date)."""
     hits, dates = [], {}
     counts = {"requested": len(symbols), "fetched": 0, "illiquid": 0, "short": 0, "scanned": 0}
     for sym in symbols:
@@ -871,6 +883,9 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume):
         tags, nums = find_setups(closes)
         stags, sw = find_swing([b[1:] for b in hlc])   # highs and lows when the series has them, else closes
         tags = tags + stags
+        dr = delivery_reading((delivery or {}).get(sym), d_last)
+        if dr and dr["spike"]:
+            tags.append("delivery_spike")
         if tags:
             hits.append({"symbol": sym, "setups": tags, "price": round(closes[-1], 2),
                          "close_date": d_last.isoformat(), "rsi": round(nums["rsi"], 1),
@@ -878,7 +893,9 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume):
                          "level": round(sw["level"], 2) if sw["level"] is not None else None,
                          "coc": round(sw["coc"], 2) if sw["coc"] is not None else None,
                          "swing_trend": sw["trend"],
-                         "swing_basis": "highs_lows" if s.get("h") and s.get("l") else "closes"})
+                         "swing_basis": "highs_lows" if s.get("h") and s.get("l") else "closes",
+                         "dq": round(dr["dq"], 2) if dr and dr["dq"] is not None else None,
+                         "dq_date": dr["date"] if dr and dr["dq"] is not None else None})
     hits.sort(key=lambda h: (-(h["price"] * (h["volume"] or 0)), h["symbol"]))  # most rupees traded first
     last_date = max(dates, key=lambda d: (dates[d], d)) if dates else None
     counts["hits"] = len(hits)
@@ -1755,6 +1772,71 @@ def fallback_list(why=None):
     raise ScanError("%sno trader/data/universe.csv and no bundled snapshot. Next: %s" % (lead, DATA_HINT))
 
 
+# ---------------------------------------------------------------- delivery
+
+def delivery_path(sym, data_dir=None):
+    return os.path.join(data_dir or DATA_DIR, "delivery", "%s.csv" % sym)
+
+
+def read_delivery_csv(path):
+    """trader-data's trader/data/delivery/<SYM>.csv (date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series; an
+    empty field is missing) -> [{"date", "deliv_qty", "qty_per_trade", "series"}] ascending. Rows with a bad date are
+    skipped, a later row for a date wins, a field that is not a number is missing."""
+    def num(v):
+        try:
+            return float(v) if (v or "").strip() else None
+        except ValueError:
+            return None
+    out = {}
+    with open(path, encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            try:
+                d = datetime.date.fromisoformat((r.get("date") or "").strip())
+            except ValueError:
+                continue
+            out[d] = {"date": d, "deliv_qty": num(r.get("deliv_qty")), "qty_per_trade": num(r.get("qty_per_trade")),
+                      "series": (r.get("series") or "").strip().upper()}
+    return [out[d] for d in sorted(out)]
+
+
+def load_delivery(symbols, data_dir=None):
+    """-> {SYM: delivery rows} for the symbols that have a file; a file that cannot be read is left out."""
+    out = {}
+    for sym in symbols:
+        path = delivery_path(sym, data_dir)
+        if os.path.exists(path):
+            try:
+                rows = read_delivery_csv(path)
+            except OSError:
+                continue
+            if rows:
+                out[sym] = rows
+    return out
+
+
+def delivery_reading(rows, close_date=None):
+    """Delivery rows (ascending) -> {"date", "dq", "tq", "series", "spike"} or None for no rows. DQ = the latest
+    delivery quantity over its mean, TQ = the latest quantity per trade over its mean, both over the last
+    DELIVERY_BARS sessions in the file (the latest included, a missing value left out). A ratio needs the latest
+    value and at least DELIVERY_MIN values in the window, else it is None. `spike`: DQ and TQ both over
+    DELIVERY_RATIO, a series that is not BE or BZ, and (when close_date is given) the reading is for that day."""
+    if not rows:
+        return None
+    window = rows[-DELIVERY_BARS:]
+    last = window[-1]
+
+    def ratio(key):
+        vals = [r[key] for r in window if r[key] is not None]
+        if last[key] is None or len(vals) < DELIVERY_MIN:
+            return None
+        mean = sum(vals) / len(vals)
+        return last[key] / mean if mean > 0 else None
+    dq, tq = ratio("deliv_qty"), ratio("qty_per_trade")
+    spike = (dq is not None and tq is not None and dq > DELIVERY_RATIO and tq > DELIVERY_RATIO
+             and last["series"] not in DELIVERY_T2T and (close_date is None or last["date"] == close_date))
+    return {"date": last["date"].isoformat(), "dq": dq, "tq": tq, "series": last["series"], "spike": spike}
+
+
 # ---------------------------------------------------------------- relative strength
 
 def mansfield_series(stock, bench, n=MANSFIELD_DAILY):
@@ -1905,13 +1987,14 @@ LT_SCREENS = [
     ("swing_up", "swing structure up (change-of-character level holding)"),
     ("swing_reversal_up", "swing trend just reversed up"),
     ("rs_positive", "relative strength over the Nifty positive and rising (Mansfield)"),
+    ("delivery_spike", "delivery spike (institutional-size trades, high delivery)"),
 ]
 LT_LABEL = dict(LT_SCREENS)
 
 
-def longterm_metrics(rows, bench=None):
+def longterm_metrics(rows, bench=None, delivery=None):
     """Daily rows (ascending, >= LT_BARS) -> the numbers the long-term screen reads. `bench` is {date: close} of
-    the relative-strength benchmark (None or empty = mansfield_rs is None)."""
+    the relative-strength benchmark (None or empty = mansfield_rs is None); `delivery` this stock's delivery rows."""
     c = [r[4] for r in rows]
     yr = rows[-YEAR_BARS:]
     last = c[-1]
@@ -1924,7 +2007,10 @@ def longterm_metrics(rows, bench=None):
     sw = swing_info([(x[2], x[3], x[4]) for x in rows[-SWING_FEED:]])
     ms = [x[2] for x in mansfield_series([(x[0], x[4]) for x in rows[-SWING_FEED:]], bench)] if bench else []
     ms = [v for v in ms if v is not None]
+    dr = delivery_reading(delivery, rows[-1][0])
     return {"close": last, "mansfield_rs": ms[-1] if ms else None,
+            "dq": dr["dq"] if dr else None, "dq_date": dr["date"] if dr and dr["dq"] is not None else None,
+            "delivery_spike": bool(dr and dr["spike"]),
             "mansfield_prev": ms[-1 - MANSFIELD_RISE_BARS] if len(ms) > MANSFIELD_RISE_BARS else None, "dma50": dma50, "dma200": dma200, "vs_200dma_pct": (last / dma200 - 1) * 100,
             "high52": hi, "low52": lo, "from_high_pct": (last / hi - 1) * 100,
             "above_low_pct": (last / lo - 1) * 100 if lo > 0 else None, "rsi": r, "avg_volume20": vol20,
@@ -1947,13 +2033,15 @@ def longterm_tags(m, near_high=5.0, near_low=10.0):
     if m["mansfield_rs"] is not None and m["mansfield_prev"] is not None and 0 < m["mansfield_rs"] and \
             m["mansfield_rs"] > m["mansfield_prev"]:
         tags.append("rs_positive")
+    if m["delivery_spike"]:
+        tags.append("delivery_spike")
     return tags
 
 
 def scan_longterm(rows_by_sym, symbols, min_price=20.0, min_volume=100000, screen=None, near_high=5.0,
-                  near_low=10.0, benchmark=None):
-    """Pure. rows_by_sym = {SYM: daily rows}; benchmark = {date: close} for the relative-strength columns.
-    Returns (hits, counts, last_date)."""
+                  near_low=10.0, benchmark=None, delivery=None):
+    """Pure. rows_by_sym = {SYM: daily rows}; benchmark = {date: close} for the relative-strength columns;
+    delivery = {SYM: delivery rows} for dq and the delivery_spike screen. Returns (hits, counts, last_date)."""
     counts = {"requested": len(symbols), "cached": 0, "short": 0, "illiquid": 0, "scanned": 0}
     hits, dates = [], {}
     for sym in symbols:
@@ -1964,7 +2052,7 @@ def scan_longterm(rows_by_sym, symbols, min_price=20.0, min_volume=100000, scree
         if len(rows) < LT_BARS:
             counts["short"] += 1
             continue
-        m = longterm_metrics(rows, benchmark)
+        m = longterm_metrics(rows, benchmark, (delivery or {}).get(sym))
         if m["close"] < min_price or m["avg_volume20"] < min_volume:
             counts["illiquid"] += 1
             continue
@@ -1987,7 +2075,8 @@ def scan_longterm(rows_by_sym, symbols, min_price=20.0, min_volume=100000, scree
                      "swing_trend": m["swing_trend"],
                      "swing_coc": round(m["swing_coc"], 2) if m["swing_coc"] is not None else None,
                      "swing_event": m["swing_event"], "swing_bars_since": m["swing_bars_since"],
-                     "mansfield_rs": round(m["mansfield_rs"], 2) if m["mansfield_rs"] is not None else None})
+                     "mansfield_rs": round(m["mansfield_rs"], 2) if m["mansfield_rs"] is not None else None,
+                     "dq": round(m["dq"], 2) if m["dq"] is not None else None, "dq_date": m["dq_date"]})
     if screen == "near_52w_low":
         hits.sort(key=lambda h: (h["above_low_pct"], h["symbol"]))
     else:
@@ -2103,7 +2192,8 @@ def cmd_daily(a):
         why = next(iter(failed.values()), "no data") if failed else "no data"
         raise ScanError("no daily closes for any symbol (%s) and no trader/data/daily cache. Next: %s"
                         % (why, DATA_HINT))
-    hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume)
+    delivery = load_delivery(symbols) if a.cache else {}
+    hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume, delivery)
     nfailed = len(symbols) - counts["fetched"]
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily",
@@ -2112,6 +2202,8 @@ def cmd_daily(a):
            "note": NOTE, "hits": hits}
     if cnote:
         doc["cache_note"] = cnote
+    if delivery:
+        doc["delivery_symbols"] = len(delivery)
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
     regime = regime_note(DATA_DIR)
@@ -2139,6 +2231,9 @@ def cmd_daily(a):
                            indian(counts["scanned"])))
     if calendar_note(local.date()):
         print(calendar_note(local.date()) + ".")
+    if delivery:
+        print("Delivery data (trader/data/delivery) for %s of the symbols: dq is today's delivery quantity over its "
+              "30-session average." % indian(len(delivery)))
     if hits:
         per = [(k, sum(1 for h in hits if k in h["setups"])) for k, _ in SETUPS]
         print("%d chart%s matched a setup: %s." % (len(hits), "" if len(hits) == 1 else "s",
@@ -2148,7 +2243,8 @@ def cmd_daily(a):
         print("No setups.")
     for h in hits[:a.show]:
         print("  %-10s %14s  RSI %5.1f  %s%s" % (h["symbol"], money(h["price"]), h["rsi"],
-                                                ", ".join(LABEL[t] for t in h["setups"]),
+                                                ", ".join(LABEL[t] + (" (dq %.1f)" % h["dq"] if t == "delivery_spike"
+                                                                      else "") for t in h["setups"]),
                                                 ("  [level %s, coc %s]" % (_p(h["level"]), _p(h["coc"])))
                                                 if h["level"] is not None and h["coc"] is not None
                                                 and any(t.startswith("swing_") for t in h["setups"]) else ""))
@@ -2360,8 +2456,9 @@ def cmd_longterm(a):
         raise ScanError("no daily cache in %s for these symbols. Next: run `python3 trader-data/data.py daily "
                         "SYMBOL [SYMBOL ...]`, or %s" % (daily_dir, DATA_HINT))
     bench, bench_name, bench_note = read_benchmark(data_dir)
+    delivery = load_delivery(sorted(rows), data_dir)
     hits, counts, last_date = scan_longterm(rows, symbols, a.min_price, a.min_volume, a.screen, a.near_high,
-                                            a.near_low, bench)
+                                            a.near_low, bench, delivery)
     lasts = [r[-1][0] for r in rows.values() if r]
     cnote = cache_note("daily", len(rows), lasts)
     stale = last_date and (to_ist(now).date() - last_date).days > 5
@@ -2374,6 +2471,8 @@ def cmd_longterm(a):
            "note": NOTE + " Not financial advice.", "hits": hits}
     if bench_note:
         doc["benchmark_note"] = bench_note
+    if delivery:
+        doc["delivery_symbols"] = len(delivery)
     regime = regime_note(data_dir)
     if regime:
         doc["regime"] = regime
