@@ -1648,17 +1648,29 @@ class Breadth(unittest.TestCase):
             os.makedirs(os.path.join(d, "daily"))
             os.makedirs(os.path.join(d, "index"))
 
-            def put(path, close):
+            days = [D(2026, 1, 1) + datetime.timedelta(days=i) for i in range(30)]
+
+            def put(path, close, n=30):
                 with open(os.path.join(d, path), "w") as fh:
-                    fh.write("date,open,high,low,close,volume,pe,pb,div_yield\n2026-01-05,1,1,1,%s,0,,,\n" % close)
+                    fh.write("date,open,high,low,close,volume,pe,pb,div_yield\n")
+                    for day in days[:n]:
+                        fh.write("%s,1,1,1,%s,0,,,\n" % (day.isoformat(), close))
             put(os.path.join("daily", "NIFTYBEES.csv"), 1)
-            self.assertEqual(scan.read_benchmark(d)[0], {D(2026, 1, 5): 1.0})
+            self.assertEqual(scan.read_benchmark(d)[0][days[0]], 1.0)
             self.assertEqual(scan.read_benchmark(d)[1], "NIFTYBEES")
             put(os.path.join("daily", "NIFTYBEES.adj.csv"), 2)
-            self.assertEqual(scan.read_benchmark(d)[0], {D(2026, 1, 5): 2.0})        # .adj.csv wins
+            self.assertEqual(scan.read_benchmark(d)[0][days[0]], 2.0)        # .adj.csv wins
+            put(os.path.join("index", "nifty-50.csv"), 3, n=3)
+            self.assertEqual(scan.read_benchmark(d)[1], "NIFTYBEES")          # 3 index rows: too short for Mansfield
             put(os.path.join("index", "nifty-50.csv"), 3)
             bench, name, note = scan.read_benchmark(d)
-            self.assertEqual((bench, name, note), ({D(2026, 1, 5): 3.0}, "Nifty 50 index", ""))   # the index wins
+            self.assertEqual((bench[days[0]], name, note), (3.0, "Nifty 50 index", ""))   # the index wins
+            os.remove(os.path.join(d, "daily", "NIFTYBEES.csv"))
+            os.remove(os.path.join(d, "daily", "NIFTYBEES.adj.csv"))
+            put(os.path.join("index", "nifty-50.csv"), 3, n=3)
+            bench, name, note = scan.read_benchmark(d)
+            self.assertEqual((len(bench), name), (3, "Nifty 50 index"))       # short is still better than none
+            self.assertIn("only 3 sessions", note)
         finally:
             shutil.rmtree(d)
 

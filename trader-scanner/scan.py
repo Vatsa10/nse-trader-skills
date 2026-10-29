@@ -1858,6 +1858,7 @@ def read_benchmark(data_dir=None):
     """The relative-strength benchmark's closes -> ({date: close}, name, note). trader/data/index/nifty-50.csv
     (trader-data), else NIFTYBEES (.adj.csv first) in trader/data/daily, else none and a note saying so."""
     base = data_dir or DATA_DIR
+    short = None   # a benchmark too short for Mansfield (index --days 3 writes 3 rows): only if nothing is longer
     for name, path in (("Nifty 50 index", os.path.join(base, "index", "nifty-50.csv")),
                        ("NIFTYBEES", daily_cache_path("NIFTYBEES", base))):
         if not os.path.exists(path):
@@ -1866,8 +1867,12 @@ def read_benchmark(data_dir=None):
             rows = read_daily_csv(path)
         except OSError:
             continue
-        if rows:
+        if len(rows) > MANSFIELD_DAILY + MANSFIELD_RISE_BARS:
             return {r[0]: r[4] for r in rows}, name, ""
+        if rows and short is None:
+            short = ({r[0]: r[4] for r in rows}, name, "benchmark %s has only %d sessions" % (name, len(rows)))
+    if short:
+        return short
     return {}, None, ("no benchmark (neither %s nor NIFTYBEES in %s): mansfield_rs is null and rs_positive is off"
                       % (os.path.join(base, "index", "nifty-50.csv"), os.path.join(base, "daily")))
 
