@@ -392,6 +392,208 @@ class Plan(Base):
         self.assertIn("Not financial advice", out)
 
 
+# Series A / B of the swing spec as (date, high, low, close), the dates are filler
+A_HLC = [(10, 8, 9), (11, 9, 10.5), (12, 10, 11.8), (11.5, 10.5, 11), (11.2, 10.2, 10.4), (12.6, 11, 12.4),
+         (12.4, 11.6, 11.8), (11.9, 9.8, 10.0)]
+
+
+def dated(hlc):
+    d0 = datetime.date(2026, 1, 1)
+    return [(d0 + datetime.timedelta(days=i), h, l, c) for i, (h, l, c) in enumerate(hlc)]
+
+
+class Swing(Base):
+    def test_cushion_uptrend_and_downtrend_by_hand(self):
+        up = inv.swing_numbers(dated(A_HLC[:6]), min_bars=0)
+        self.assertEqual((up["swing_trend"], up["swing_coc"]), ("up", 10.2))
+        self.assertAlmostEqual(up["swing_cushion_pct"], 17.74, places=2)
+        spec = {"good": 15, "bad": -10}
+        self.assertEqual(inv.score_metric(up["swing_cushion_pct"], spec), 100.0)
+        down = inv.swing_numbers(dated(A_HLC), min_bars=0)
+        self.assertEqual((down["swing_trend"], down["swing_coc"]), ("down", 12.6))
+        self.assertAlmostEqual(down["swing_cushion_pct"], -26.0, places=2)
+        self.assertEqual(inv.score_metric(down["swing_cushion_pct"], spec), 0.0)
+
+    def test_too_few_bars_is_missing_not_good(self):
+        got = inv.swing_numbers(dated(A_HLC))      # default: more than 40 bars wanted
+        self.assertFalse(got["swing_stable"])
+        self.assertIsNone(got["swing_cushion_pct"])
+        self.assertIsNone(inv.swing_numbers([]))
+
+    def test_bars_without_high_or_low_are_skipped(self):
+        bars = dated(A_HLC[:6])
+        bars.insert(3, (datetime.date(2026, 6, 1), None, None, 50.0))
+        self.assertEqual(inv.swing_numbers(bars, min_bars=0)["swing_coc"], 10.2)
+
+    def test_reader_keeps_read_daily_shape(self):
+        write_daily(self.td, "IOC")
+        rows, path, adj = inv.read_daily(self.td, "IOC")
+        self.assertEqual(len(rows[0]), 2)
+        bars, path2, adj2 = inv.read_daily_bars(self.td, "IOC")
+        self.assertEqual((path, adj), (path2, adj2))
+        self.assertEqual(len(bars), len(rows))
+        d, h, l, c = bars[-1]
+        self.assertEqual((d, c), rows[-1])
+        self.assertAlmostEqual(h, round(c * 1.01, 2), places=2)
+        self.assertAlmostEqual(l, round(c * 0.99, 2), places=2)
+
+    def test_scorecard_has_the_metric_and_analyse_scores_it(self):
+        card = inv.load_scorecard(self.td)
+        spec = card["pillars"]["technicals"]["metrics"]["swing_cushion_pct"]
+        self.assertEqual((spec["weight"], spec["good"], spec["bad"]), (1, 15, -10))
+        self.fetch("IOC", "--nse-json", os.path.join(D, "nse-quote-IOC.json"))
+        write_daily(self.td, "IOC")
+        a = self.analyse("IOC")
+        t = a["technicals"]
+        self.assertIn(t["swing_trend"], ("up", "down"))
+        self.assertTrue(t["swing_stable"])
+        self.assertAlmostEqual(a["metrics"]["swing_cushion_pct"], round((t["last_close"] - t["swing_coc"]) / t["last_close"] * 100, 2), places=2)
+        lines = {m["metric"]: m for m in a["pillars"]["technicals"]["metrics"]}
+        self.assertFalse(lines["swing_cushion_pct"].get("missing"))
+        code, out, _ = run(["--trader-dir", self.td, "--today", TODAY, "analyse", "IOC"])
+        self.assertIn("Swing: ", out)
+        self.assertIn("cushion", out)
+
+    def test_no_daily_bars_scores_the_swing_metric_missing(self):
+        self.fetch("IOC", "--nse-json", os.path.join(D, "nse-quote-IOC.json"))
+        a = self.analyse("IOC")
+        self.assertIn("technicals.swing_cushion_pct", a["missing_metrics"])
+        self.assertIsNone(a["metrics"]["swing_cushion_pct"])
+
+
+def write_index(td, rows):
+    path = os.path.join(td, "data", "index", "nifty-50.csv")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write("date,open,high,low,close,volume,pe,pb,div_yield\n")
+        for r in rows:
+            fh.write(",".join(str(x) for x in r) + "\n")
+
+
+def idx_row(day, pe):
+    return (day, 25000, 25100, 24900, 25050, 0, pe, 3.4, 1.3)
+
+
+class MarketLine(Base):
+    def setUp(self):
+        super().setUp()
+        self.fetch("IOC", "--nse-json", os.path.join(D, "nse-quote-IOC.json"))
+        write_daily(self.td, "IOC")
+
+    def test_no_file_no_line(self):
+        self.assertIsNone(inv.read_market_valuation(self.td))
+        code, out, _ = run(["--trader-dir", self.td, "--today", TODAY, "analyse", "IOC"])
+        self.assertNotIn("Market:", out)
+        self.assertIsNone(self.analyse("IOC")["market_valuation"])
+
+    def test_thresholds_are_named_constants_and_inclusive(self):
+        self.assertEqual((inv.NIFTY_PE_EXPENSIVE, inv.NIFTY_PE_CHEAP), (25.0, 20.0))
+        for pe, label in ((27.3, "expensive"), (25.0, "expensive"), (24.9, "neutral"), (20.1, "neutral"),
+                          (20.0, "cheap"), (18.4, "cheap")):
+            write_index(self.td, [idx_row("2026-10-28", pe)])
+            self.assertEqual(inv.read_market_valuation(self.td)["label"], label, pe)
+
+    def test_latest_dated_row_with_a_pe_wins(self):
+        write_index(self.td, [idx_row("2026-10-27", 21.0), idx_row("2026-10-28", 26.0), idx_row("2026-10-29", "")])
+        got = inv.read_market_valuation(self.td)
+        self.assertEqual((got["date"], got["pe"]), ("2026-10-28", 26.0))
+        write_index(self.td, [idx_row("2026-10-29", "")])
+        self.assertIsNone(inv.read_market_valuation(self.td))
+
+    def test_analyse_prints_the_line_with_the_rule_of_thumb(self):
+        write_index(self.td, [idx_row("2026-10-28", 27.3)])
+        code, out, _ = run(["--trader-dir", self.td, "--today", TODAY, "analyse", "IOC"])
+        self.assertIn("Market: Nifty 50 P/E 27.30 on 2026-10-28 is expensive", out)
+        self.assertIn("25 or more expensive, 20 or less cheap", out)
+        self.assertEqual(self.analyse("IOC")["market_valuation"]["label"], "expensive")
+
+    def test_valuation_is_not_scored(self):
+        before = self.analyse("IOC")["score"]
+        write_index(self.td, [idx_row("2026-10-28", 31.0)])
+        self.assertEqual(self.analyse("IOC")["score"], before)
+
+    def plan(self, *extra):
+        code, out, err = run(["--trader-dir", self.td, "--today", TODAY, "--json", "plan", "IOC"] + list(extra))
+        self.assertEqual(code, 0, out + err)
+        return json.loads(out)
+
+    def test_plan_suggests_slower_pacing_only_above_the_expensive_mark(self):
+        write_index(self.td, [idx_row("2026-10-28", 27.3)])
+        p = self.plan("--amount", "5000", "--tranches", "3", "--every", "30")
+        self.assertEqual(p["pace_hint"], {"tranches": 5, "every_days": 45})
+        self.assertTrue(any("Nifty 50 P/E is 27.30" in n and "5 tranches 45 days apart" in n for n in p["notes"]))
+        self.assertEqual(len(p["tranches"]), 3)       # the plan itself is unchanged, the pacing is a suggestion
+        write_index(self.td, [idx_row("2026-10-28", 22.0)])
+        p = self.plan("--amount", "5000")
+        self.assertIsNone(p["pace_hint"])
+        self.assertFalse(any("Nifty 50" in n for n in p["notes"]))
+
+
+def write_delivery(td, sym, rows):
+    path = os.path.join(td, "data", "delivery", sym + ".csv")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write("date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series\n")
+        for r in rows:
+            fh.write(",".join(str(x) for x in r) + "\n")
+
+
+def deliv_rows(n, spike_at=None, series="EQ", spike_series="EQ"):
+    out = []
+    for i in range(n):
+        d = (datetime.date(2026, 9, 1) + datetime.timedelta(days=i)).isoformat()
+        hot = i in (spike_at or ())
+        out.append((d, 1000, 10, 900 if hot else 100, 50, 90 if hot else 10, spike_series if hot else series))
+    return out
+
+
+class DeliveryHint(Base):
+    def test_spec_series_one_spike_among_thirty(self):
+        write_delivery(self.td, "IOC", deliv_rows(30, spike_at=(29,)))
+        got = inv.delivery_im_days(inv.read_delivery(self.td, "IOC"))
+        self.assertTrue(got["enough_data"])
+        self.assertEqual((got["sessions"], got["im_days"]), (30, 1))
+        self.assertEqual(got["last_im_date"], "2026-09-30")
+        self.assertIn("1 institutional-money day(s) in the last 30 sessions (latest 2026-09-30)", got["text"])
+
+    def test_only_the_last_thirty_sessions_count(self):
+        write_delivery(self.td, "IOC", deliv_rows(45, spike_at=(2, 40)))
+        got = inv.delivery_im_days(inv.read_delivery(self.td, "IOC"))
+        self.assertEqual((got["sessions"], got["im_days"]), (30, 1))
+
+    def test_trade_to_trade_series_never_counts(self):
+        write_delivery(self.td, "IOC", deliv_rows(30, spike_at=(10, 29), spike_series="BE"))
+        self.assertEqual(inv.delivery_im_days(inv.read_delivery(self.td, "IOC"))["im_days"], 0)
+
+    def test_needs_both_dq_and_tq(self):
+        rows = deliv_rows(30, spike_at=(29,))
+        rows[29] = rows[29][:5] + (10,) + rows[29][6:]      # delivery spike, but ordinary trade size
+        write_delivery(self.td, "IOC", rows)
+        self.assertEqual(inv.delivery_im_days(inv.read_delivery(self.td, "IOC"))["im_days"], 0)
+
+    def test_empty_cells_are_missing_and_under_five_is_not_enough(self):
+        rows = deliv_rows(12, spike_at=(11,))
+        rows = [r[:3] + ("", "", "") + r[6:] if i < 8 else r for i, r in enumerate(rows)]    # 4 values left
+        write_delivery(self.td, "IOC", rows)
+        got = inv.delivery_im_days(inv.read_delivery(self.td, "IOC"))
+        self.assertFalse(got["enough_data"])
+        self.assertIsNone(got["im_days"])
+        self.assertIn("not enough delivery data", got["text"])
+        self.assertIsNone(inv.delivery_im_days(None))
+
+    def test_analyse_shows_the_hint_and_it_is_not_scored(self):
+        self.fetch("IOC", "--nse-json", os.path.join(D, "nse-quote-IOC.json"))
+        write_daily(self.td, "IOC")
+        before = self.analyse("IOC")
+        self.assertIsNone(before["delivery"])
+        write_delivery(self.td, "IOC", deliv_rows(30, spike_at=(5, 29)))
+        after = self.analyse("IOC")
+        self.assertEqual(after["delivery"]["im_days"], 2)
+        self.assertEqual(after["score"], before["score"])
+        code, out, _ = run(["--trader-dir", self.td, "--today", TODAY, "analyse", "IOC"])
+        self.assertIn("Delivery: 2 institutional-money day(s) in the last 30 sessions", out)
+
+
 class SkillDoc(unittest.TestCase):
     def test_skill_md(self):
         with open(os.path.join(ROOT, "trader-invest", "SKILL.md"), encoding="utf-8") as fh:

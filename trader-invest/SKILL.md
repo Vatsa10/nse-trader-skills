@@ -9,8 +9,10 @@ description: >-
   PB, dividend yield, earnings yield vs the 10y G-sec), quality (ROE, ROCE,
   debt/equity, promoter holding and pledge), growth (3y/5y revenue and
   profit CAGR, loss years), stability and long-term technicals (200-DMA,
-  52-week range, 1/3/5y CAGR, drawdown, volatility) on a transparent,
-  editable weighted scorecard. Flags cyclicals (judge on mid-cycle earnings)
+  52-week range, 1/3/5y CAGR, drawdown, volatility, swing-structure cushion
+  above the change-of-character level) on a transparent, editable weighted
+  scorecard, with hints (not scored) for the Nifty 50 P/E and for
+  institutional-money delivery days. Flags cyclicals (judge on mid-cycle earnings)
   and PSUs (policy risk). Prints a 0-100 score per pillar and overall, a
   verdict band, the reasons, the data age and every missing field. Writes a
   staggered CNC (delivery) buy plan in whole shares with Zerodha charges,
@@ -61,6 +63,32 @@ python3 "${CLAUDE_SKILL_DIR}/invest.py" --json analyse IOC             # --json 
    Add `--orders trader/orders.json` to write tranche 1 as a CNC limit order.
 5. **Broker**: trader-risk checks the order, then trader-broker shows the CNC
    ticket. Nothing is placed until the user types an explicit yes.
+
+## Hints that are not scored
+
+- **Swing cushion** (scored, technicals pillar, weight 1): the daily bars run
+  through a market-structure tracker (pullbacks under 5% ignored). The
+  change-of-character level (CoCh) is the structural stop; the cushion is
+  `(last close - CoCh) / last close`, in percent. It is negative in a
+  downtrend (the close is on the wrong side). Needs more than 40 bars, else
+  it is scored as missing. `analyse` prints a `Swing:` line with the trend.
+  Reads `high` and `low` from the same daily file (`.adj.csv` first).
+- **Market valuation**: if `trader/data/index/nifty-50.csv` exists
+  (`date,open,high,low,close,volume,pe,pb,div_yield`, written by
+  trader-data), `analyse` prints a `Market:` line with the latest Nifty 50
+  P/E and the rule of thumb: 25 or more is expensive, 20 or less is cheap
+  (`NIFTY_PE_EXPENSIVE`, `NIFTY_PE_CHEAP` in invest.py). It is context, not a
+  timing signal, and does not change the score. In `plan`, an expensive
+  market adds a note and a `pace_hint` (two more tranches, 1.5 times the gap,
+  for example 5 tranches 45 days apart instead of 3 every 30). The plan
+  itself is unchanged: the pacing is the user's call.
+- **Delivery**: if `trader/data/delivery/<SYM>.csv` exists (header
+  `date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series`, an empty
+  cell is missing), `analyse` prints how many of the last 30 sessions were
+  institutional-money days: delivery quantity and quantity per trade both
+  above 1.2 times their 30-session mean, on a series other than BE or BZ.
+  Under 5 values it says there is not enough data. A hint only: it never
+  changes the score.
 
 ## Sources and their failure modes
 
@@ -123,7 +151,7 @@ each file's provenance; daily bars in the tests are synthetic):
 ```
 IOC  ₹130.41   score 68/100   REASONABLE, SIZE SMALL
   Oil, Gas & Consumable Fuels | mcap 1,84,154 cr | source: screener.in (standalone) + nse quote api | data coverage 95%
-  valuation 100, quality 62, growth 75, stability 4, technicals 50
+  valuation 100, quality 62, growth 75, stability 4, technicals 56
   Valuation: PE 5.44 (mid-cycle 7.56), PB 0.81, yield 6.36%; earnings yield vs 10y G-sec 6.50%: 6.73 points
   Latest quarter Q1FY27: revenue 2,75,972 cr, net profit -2,661 cr (-146.8% y/y)
   Flags: cyclical (judge on mid-cycle earnings); PSU (policy risk); 3y profit CAGR 65% starts from a weak year

@@ -36,9 +36,14 @@ How the replays work (the reel's sim.py, same algorithm, same random draws):
      replays (pct(a, q) = sorted a at index int(q * n)). The fan chart uses a
      second run of 2,000 paths with the same seed. The histogram has 24 bins
      between the 1st and 99th percentile.
-  6. History: the plan's own rule (an opening-range breakout with the same
-     opening range, stop rule and target R) re-run on every one of those past
-     full sessions, first close beyond the range = entry, same stop-first rule.
+  6. History: the plan's own rule re-run on every one of those past full
+     sessions, same stop-first rule. An opening-range breakout (orb) keeps its
+     opening range, stop rule and target R: first close beyond the range = entry.
+     A level plan (setup level, with the level in plan.json) keeps the level as a
+     distance from the day's open: first close above open x (1 + that distance),
+     between 09:30 and 15:00, stop by its percent of the entry. A swing stop is
+     recomputed per session from the session's bars up to the entry bar (the
+     way trader-exit does it); sessions where it would be refused are skipped.
 
 The verdict line looks at the replays that hit one side (target or stop) and
 compares the target's share of them, target / (target + stop), with the share
@@ -110,6 +115,9 @@ SESSION_BARS = 75    # 09:15 to 15:30 IST in 5-minute bars
 OPEN_MIN = 555      # 09:15
 CLOSE_MIN = 930     # 15:30
 FLAT_BY_MIN = 915   # 15:15: default --until, before the MIS auto square-off (about 15:20)
+LEVEL_FIRST_SLOT = 2    # a level entry may close from 09:30 (trader-entry's no_entries_before default)
+LEVEL_LAST_SLOT = 68    # ... up to the bar closing at 15:00 (its no_entries_after default)
+MIN_RISK_PCT = 0.05     # a swing stop under 0.05 % of the price away is refused, as trader-exit refuses it
 DEFAULT_QTY_RUPEES = 100000.0   # costs are estimated for about Rs 1 lakh of shares
 MIN_SESSIONS = 20
 SAMPLE_PATHS = 160
@@ -547,6 +555,96 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
     }
 
 
+# --- swing engine: keep byte-identical in scan.py, backtest.py, invest.py and exit.py (tests/test_repo.py checks) ---
+# Market structure, one bar at a time, closing basis. In an uptrend the first bar that fails to make a new high
+# freezes that high as the pending swing high (pivot); a close above it is a break of structure (bos) and the
+# lowest low of the pullback becomes the change-of-character level (coc), a structural trailing stop. A close
+# beyond coc reverses the trend. Pullbacks shallower than `retrace` percent of the pivot do not move coc.
+# Downtrends are the mirror image. Causal: no future bars, so it is safe to replay in a backtest.
+
+def swing_new(retrace=5.0, sideways=20, min_bars=40):
+    return {"trend": None, "hi": None, "lo": None, "pivot": None, "coc": None, "bars_since": 0, "total": 0,
+            "legs": 0, "last_bos": None, "retrace": retrace or 0.0, "sideways_n": sideways, "min_bars": min_bars}
+
+
+def _swing_shallow(s, depth, pivot):
+    # depth / pivot < retrace %, cross-multiplied so an exact tie (3 / 30 vs 10 %) confirms
+    return s["retrace"] > 0 and depth * 100 < s["retrace"] * pivot
+
+
+def swing_step(s, h, l, c):
+    """Feed one bar (high, low, close). Returns the bar's event: start_up, start_down, bos, reversal or None."""
+    if h is None or l is None or c is None:
+        return None
+    s["total"] += 1
+    if s["trend"] is None:
+        if s["hi"] is None:
+            s["hi"], s["lo"] = h, l
+            return None
+        ev = None
+        if c > s["hi"]:
+            s["trend"], s["coc"], s["hi"], ev = "up", s["lo"], h, "start_up"
+        elif c < s["lo"]:
+            s["trend"], s["coc"], s["lo"], ev = "down", s["hi"], l, "start_down"
+        s["hi"], s["lo"] = max(s["hi"], h), min(s["lo"], l)
+        return ev
+    s["bars_since"] += 1
+    if s["trend"] == "up":
+        if s["pivot"] is not None:
+            if h > s["hi"]:
+                s["hi"], s["bars_since"] = h, 0
+            s["lo"] = min(s["lo"], l)
+        elif h > s["hi"]:
+            s["hi"], s["lo"], s["bars_since"] = h, l, 0
+        else:
+            s["pivot"], s["lo"], s["bars_since"] = s["hi"], l, 1
+        if c < s["coc"]:   # checked on every bar, a new-high bar included
+            s.update(trend="down", coc=s["hi"], hi=None, pivot=None, lo=l, bars_since=0, legs=0)
+            return "reversal"
+        if s["pivot"] is not None and c > s["pivot"]:
+            pivot, s["pivot"], s["bars_since"] = s["pivot"], None, 0
+            if _swing_shallow(s, pivot - s["lo"], pivot):
+                return None
+            s["coc"], s["last_bos"] = s["lo"], pivot
+            s["legs"] += 1
+            return "bos"
+        return None
+    if s["pivot"] is not None:
+        if l < s["lo"]:
+            s["lo"], s["bars_since"] = l, 0
+        s["hi"] = max(s["hi"], h)
+    elif l < s["lo"]:
+        s["lo"], s["hi"], s["bars_since"] = l, h, 0
+    else:
+        s["pivot"], s["hi"], s["bars_since"] = s["lo"], h, 1
+    if c > s["coc"]:
+        s.update(trend="up", coc=s["lo"], lo=None, pivot=None, hi=h, bars_since=0, legs=0)
+        return "reversal"
+    if s["pivot"] is not None and c < s["pivot"]:
+        pivot, s["pivot"], s["bars_since"] = s["pivot"], None, 0
+        if _swing_shallow(s, s["hi"] - pivot, pivot):
+            return None
+        s["coc"], s["last_bos"] = s["hi"], pivot
+        s["legs"] += 1
+        return "bos"
+    return None
+
+
+def swing_snapshot(s):
+    out = {k: s[k] for k in ("trend", "coc", "pivot", "last_bos", "hi", "lo", "bars_since", "legs")}
+    out["sideways"] = s["trend"] is not None and s["bars_since"] > s["sideways_n"]
+    out["stable"] = s["total"] > s["min_bars"]
+    return out
+
+
+def swing_run(bars, retrace=5.0, sideways=20, min_bars=40):
+    """bars: (high, low, close) oldest first. Returns (final snapshot, one event per bar)."""
+    s = swing_new(retrace, sideways, min_bars)
+    events = [swing_step(s, h, l, c) for h, l, c in bars]
+    return swing_snapshot(s), events
+# --- end swing engine ---
+
+
 # ---------------------------------------------------------------- stop rules and the history replay
 
 def cents_away(x, long):
@@ -561,8 +659,29 @@ def opening_range(D, n):
     return max(b["h"] for b in rows), min(b["l"] for b in rows)
 
 
-def rule_stop(rule, oh, ol, entry, long):
+def swing_level(bars, long):
+    """The change-of-character level of a session's bars (no pullback filter), as trader-exit's swing
+    stop reads it: the trend must run the plan's way (up for a buy). None when it does not."""
+    st = swing_new(0.0, min_bars=0)
+    for b in bars:
+        swing_step(st, b["h"], b["l"], b["c"])
+    if st["trend"] != ("up" if long else "down") or st["coc"] is None:
+        return None
+    return st["coc"]
+
+
+def rule_stop(rule, oh, ol, entry, long, bars=None):
+    """The rule's stop for one past session. bars: that session's bars up to and including the entry bar
+    (the swing rule reads them). None when the rule would refuse (a swing stop on the wrong side, or too tight)."""
     r = rule["stop_rule"]
+    if r == "swing":
+        lvl = swing_level(bars or [], long)
+        if lvl is None:
+            return None
+        x = cents_away(lvl, long)
+        if (x >= entry if long else x <= entry) or abs(entry - x) < entry * MIN_RISK_PCT / 100.0:
+            return None
+        return x
     if r == "or_mid":
         return cents_away((oh + ol) / 2, long)
     if r in ("or_low", "or_high"):
@@ -573,18 +692,30 @@ def rule_stop(rule, oh, ol, entry, long):
 
 def history_replay(sessions, rule, last, side="buy"):
     """The plan's rule on every past full session: entry = the first bar after the
-    opening range to close beyond it (up to the --until bar), then stop first, then
-    target, bar by bar, else the close at --until."""
+    opening range to close beyond it (orb), or the first bar to close beyond the
+    level (a level plan; the level is a distance from that session's open), up to
+    the --until bar, then stop first, then target, bar by bar, else the close at
+    --until."""
     long = side == "buy"
-    n = rule["or_minutes"] // 5
-    trades = []
+    level = rule["setup"] == "level"
+    n = 0 if level else rule["or_minutes"] // 5
+    trades, no_stop = [], 0
     for d, D in sessions:
-        oh, ol = opening_range(D, n)
-        kk = next((i for i in range(n, last + 1) if (D[i]["c"] > oh if long else D[i]["c"] < ol)), None)
+        if level:
+            oh = ol = None
+            lvl = D[0]["o"] * (1 + rule["level_pct"] / 100.0)
+            kk = next((i for i in range(LEVEL_FIRST_SLOT, min(last, LEVEL_LAST_SLOT) + 1)
+                       if (D[i]["c"] > lvl if long else D[i]["c"] < lvl)), None)
+        else:
+            oh, ol = opening_range(D, n)
+            kk = next((i for i in range(n, last + 1) if (D[i]["c"] > oh if long else D[i]["c"] < ol)), None)
         if kk is None:
             continue
         e = round(D[kk]["c"], 2)
-        s = rule_stop(rule, oh, ol, e, long)
+        s = rule_stop(rule, oh, ol, e, long, D[:kk + 1])
+        if s is None:
+            no_stop += 1
+            continue
         risk = (e - s) if long else (s - e)
         if risk <= 0:
             continue
@@ -610,6 +741,7 @@ def history_replay(sessions, rule, last, side="buy"):
         "green": sum(1 for x in trades if x["R"] > 0),
         "avg_R": round(statistics.mean(x["R"] for x in trades), 3) if trades else None,
         "rule": rule, "trades": trades,
+        **({"skipped_no_stop": no_stop} if rule["stop_rule"] == "swing" else {}),
     }
 
 
@@ -634,7 +766,7 @@ def load_plan(a, now_utc):
         raw = {"symbol": a.symbol, "side": a.side, "date": a.date or to_ist(now_utc).date().isoformat(),
                "entry": a.entry, "stop": a.stop, "target": a.target, "entry_time": a.entry_time,
                "setup": a.setup, "opening_range": {"minutes": a.or_minutes}, "stop_rule": a.stop_rule,
-               "interval": "5m"}
+               "interval": "5m", "level": getattr(a, "level", None), "product": getattr(a, "product", None)}
         src = "flags"
     else:
         if not os.path.exists(a.plan):
@@ -705,7 +837,11 @@ def normalize_plan(raw, src="flags"):
     if or_min < 5 or or_min % 5 or or_min >= 375:
         raise TMError("opening_range.minutes must be a multiple of 5 (got %s)" % or_min)
     risk = (entry - stop) if long else (stop - entry)
-    return {
+    product = str(raw.get("product") or "MIS").strip().upper()
+    if product not in ("MIS", "CNC"):
+        raise TMError("product must be MIS or CNC, got %r" % raw.get("product"))
+    level = None if raw.get("level") is None else _num(raw["level"], "level")
+    out = {
         "symbol": sym, "side": side, "date": date, "setup": str(raw.get("setup") or "orb"),
         "entry": entry, "entry_time": clock12(OPEN_MIN + 5 * (k + 1)), "entry_bar": k,
         "stop": stop, "target": target, "risk_per_share": round(risk, 2),
@@ -714,22 +850,42 @@ def normalize_plan(raw, src="flags"):
         "stop_rule": str(raw.get("stop_rule") or "auto"), "interval": "5m",
         "flat_by": raw.get("flat_by"), "from": src,
     }
+    if level is not None:
+        out["level"] = level
+    if product == "CNC":
+        out["product"] = product
+    return out
 
 
 def resolve_rule(plan, entry_day):
     """The rule the history replay uses: orb, the plan's opening range, its stop rule
-    (or_mid, or_low / or_high, or 'pct' = the plan's stop distance as a percent of
-    the entry), and the plan's target R. 'auto' works the stop rule out from the
-    plan day's own opening range. None when the setup is not orb."""
-    if plan["setup"].lower() != "orb":
+    (or_mid, or_low / or_high, swing, or 'pct' = the plan's stop distance as a percent
+    of the entry), and the plan's target R. 'auto' works the stop rule out from the
+    plan day's own opening range. A level plan (setup level) uses the level as a
+    distance from the plan day's open (level_pct) and the stop rule swing or pct.
+    None when the setup is neither, or a level plan has no level (or no first bar)."""
+    setup = plan["setup"].lower()
+    if setup not in ("orb", "level"):
         return None
     long = plan["side"] == "buy"
+    if setup == "level":
+        first = entry_day.get(0)
+        if plan.get("level") is None or first is None:
+            return None
+        rule = {"setup": "level", "level_pct": round(100.0 * (plan["level"] / first["o"] - 1), 4),
+                "stop_rule": "swing" if plan["stop_rule"] == "swing" else "pct", "target_r": plan["target_r"],
+                "stop_pct": round(100.0 * plan["risk_per_share"] / plan["entry"], 4)}
+        if rule["stop_rule"] != "pct":
+            del rule["stop_pct"]
+        return rule
     n = plan["opening_range"]["minutes"] // 5
     rule = {"setup": "orb", "or_minutes": plan["opening_range"]["minutes"], "stop_rule": plan["stop_rule"],
             "target_r": plan["target_r"],
             "stop_pct": round(100.0 * plan["risk_per_share"] / plan["entry"], 4)}
     far = "or_low" if long else "or_high"
-    if rule["stop_rule"] == "auto":
+    if rule["stop_rule"] == "swing":
+        pass
+    elif rule["stop_rule"] == "auto":
         rule["stop_rule"] = "pct"
         if all(i in entry_day for i in range(n)):
             oh, ol = opening_range(entry_day, n)
@@ -857,25 +1013,30 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     long = plan["side"] == "buy"
     risk_rs = plan["risk_per_share"] * q
     model = charges if charges is not None else load_charges()
+    cnc = plan.get("product") == "CNC"
+    if cnc:
+        warn.append("a delivery (CNC) plan is held overnight: this replays the plan's day only, so the stop or the "
+                    "target can also be reached on later days, and a gap can fill past the stop")
 
     def cost_r(exit_px):
         b, s_ = (plan["entry"], exit_px) if long else (exit_px, plan["entry"])
-        return costs(b, s_, q, model=model) / risk_rs if risk_rs > 0 else 0.0
+        return costs(b, s_, q, not cnc, model) / risk_rs if risk_rs > 0 else 0.0
     c_stop, c_target = cost_r(plan["stop"]), cost_r(plan["target"])
     c_mid = cost_r(plan["entry"])
     net = mc["avg_R"] - (mc["p_target"] * c_target + mc["p_stop"] * c_stop + mc["p_neither"] * c_mid)
     mc = dict(mc, costs={"qty": q, "rupees_at_stop": round(c_stop * risk_rs, 2),
                          "rupees_at_target": round(c_target * risk_rs, 2), "R_at_stop": round(c_stop, 3),
                          "R_at_target": round(c_target, 3),
-                         "label": "%s intraday (MIS) charges, %s" % (
-                             str(model.get("broker") or "zerodha").capitalize(), charges_label(model)),
-                         "estimate": charges_label(model),
+                         "label": "%s %s charges, %s" % (
+                             str(model.get("broker") or "zerodha").capitalize(),
+                             "delivery (CNC)" if cnc else "intraday (MIS)", charges_label(model)),
+                         "segment": "delivery" if cnc else "intraday", "estimate": charges_label(model),
                          "calibration_factor": float(((model.get("calibration") or {}).get("factor")) or 1.0)},
               avg_R_after_costs=round(net, 3) + 0.0)
     mc = dict(mc, until=clock24(until_min), pool_sessions=len(sessions), pool_from=sessions[0][0],
               pool_to=sessions[-1][0],
               band_times=[clock24(OPEN_MIN + 5 * (j + 1)) for j in range(k, last + 1)])
-    rule = resolve_rule(plan, entry_day)
+    rule = None if cnc else resolve_rule(plan, entry_day)
     plan_out = {kk: v for kk, v in plan.items() if v is not None}
     if rule:
         plan_out["stop_rule"] = rule["stop_rule"]
@@ -886,12 +1047,19 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
                 rk = abs(t["entry"] - t["stop"]) * q
                 px = t["target"] if t["outcome"] == "target" else t["stop"] if t["outcome"] == "stop" else t["entry"]
                 b, s_ = (t["entry"], px) if long else (px, t["entry"])
-                nets.append(t["R"] - (costs(b, s_, q, model=model) / rk if rk > 0 else 0.0))
+                nets.append(t["R"] - (costs(b, s_, q, not cnc, model) / rk if rk > 0 else 0.0))
             history["avg_R_after_costs"] = round(statistics.mean(nets), 3) + 0.0
     else:
-        history = {"sessions": len(sessions), "triggered": 0, "rule": None, "trades": [],
-                   "note": "skipped: the history replay knows the opening-range breakout (orb) only, "
-                           "this plan's setup is %r" % plan["setup"]}
+        if cnc:
+            why = ("a delivery (CNC) plan is held overnight, and the history replay covers one intraday session "
+                   "from the entry to the flat-by")
+        elif plan["setup"].lower() == "level" and plan.get("level") is None:
+            why = ("a level plan needs its level price and plan.json has none (exit.py --level, an entry.json that "
+                   "carries it, or timemachine.py --level)")
+        else:
+            why = ("the history replay knows the opening-range breakout (orb) and level setups only, "
+                   "this plan's setup is %r" % plan["setup"])
+        history = {"sessions": len(sessions), "triggered": 0, "rule": None, "trades": [], "note": "skipped: " + why}
     last_bar = bars[-1]
     return {
         "created_by": "trader-timemachine",
@@ -945,22 +1113,30 @@ def report(doc):
     ]
     if m.get("costs"):
         cs = m["costs"]
-        lines.append("  After intraday charges, %s (%d shares: about %s at the stop, %s at the target): "
-                     "average R %+.3f." % (cs.get("estimate") or "estimate", cs["qty"], inr(cs["rupees_at_stop"]),
-                                           inr(cs["rupees_at_target"]), m["avg_R_after_costs"]))
+        lines.append("  After %s charges, %s (%d shares: about %s at the stop, %s at the target): "
+                     "average R %+.3f." % (cs.get("segment") or "intraday", cs.get("estimate") or "estimate",
+                                           cs["qty"], inr(cs["rupees_at_stop"]), inr(cs["rupees_at_target"]),
+                                           m["avg_R_after_costs"]))
     lines.append("")
     if h.get("rule"):
         ru = h["rule"]
         stop_words = {"or_mid": "opening-range midpoint", "or_low": "opening-range low",
-                      "or_high": "opening-range high"}.get(ru["stop_rule"],
-                                                           "%.2f %% from the entry" % ru.get("stop_pct", 0))
+                      "or_high": "opening-range high", "swing": "swing change-of-character level"}.get(
+            ru["stop_rule"], "%.2f %% from the entry" % ru.get("stop_pct", 0))
+        if ru["setup"] == "level":
+            what = "first close %s %.2f %% %s the day's open" % (
+                "above" if long else "below", abs(ru["level_pct"]), "above" if ru["level_pct"] >= 0 else "below")
+        else:
+            what = "%d-min opening range" % ru["or_minutes"]
         if h["triggered"]:
-            lines.append("History: the same rule (%d-min opening range, stop at the %s, %gR target) on each of "
+            lines.append("History: the same rule (%s, stop at the %s, %gR target) on each of "
                          "those %d real sessions fired %d times: %d target, %d stop, %d neither. Average R %+.3f."
-                         % (ru["or_minutes"], stop_words, ru["target_r"], h["sessions"], h["triggered"],
+                         % (what, stop_words, ru["target_r"], h["sessions"], h["triggered"],
                             h["target"], h["stop"], h["close"], h["avg_R"])
                          + (" After costs %+.3f." % h["avg_R_after_costs"] if h.get("avg_R_after_costs") is not None
-                            else ""))
+                            else "")
+                         + (" %d session(s) skipped: the swing stop would have been refused." % h["skipped_no_stop"]
+                            if h.get("skipped_no_stop") else ""))
         else:
             lines.append("History: the same rule never fired in those %d sessions." % h["sessions"])
     else:
@@ -1101,7 +1277,9 @@ def main(argv=None):
         p.add_argument("--entry-time", help='the entry bar\'s close, e.g. "10:00 AM"')
         p.add_argument("--setup", default="orb")
         p.add_argument("--or-minutes", type=int, default=15)
-        p.add_argument("--stop-rule", default="auto", choices=["auto", "or_mid", "or_low", "or_high", "pct"])
+        p.add_argument("--stop-rule", default="auto", choices=["auto", "or_mid", "or_low", "or_high", "pct", "swing"])
+        p.add_argument("--level", type=float, help="with --setup level: the price the entry closed above")
+        p.add_argument("--product", type=str.upper, choices=["MIS", "CNC"], help="MIS (default) or CNC (delivery)")
         p.add_argument("--replays", type=int, default=10000)
         p.add_argument("--seed", type=int, default=19)
         p.add_argument("--window", type=int, default=2, help="draw from the same time of day +- this many bars")

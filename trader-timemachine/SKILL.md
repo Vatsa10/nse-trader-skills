@@ -5,7 +5,8 @@ description: >-
   you risk a rupee: 10,000 simulated sessions plus every past time the setup fired.
   Takes the plan from trader-exit (entry, stop, target), rebuilds the rest of
   the day 10,000 times from the stock's own 5-minute bars over the last 60
-  days, and re-runs the same rule on every past session. Prints the odds of
+  days, and re-runs the same rule on every past session (an opening-range
+  breakout, or a level plan from a pattern scan, with a percent or swing stop). Prints the odds of
   target first, stop first, or neither by the 15:15 IST flat-by, where the price
   sits then, the average R before and after approximate Indian intraday costs, the history, and one honest verdict, then hands
   off to /trader-budget. Use when the user says "run the time machine",
@@ -39,7 +40,9 @@ python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --symbol RELIANCE --date 2026-1
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" chart --from           # ASCII fan chart of the saved run
 ```
 
-Other flags: `--replays N`, `--seed N` (default 19), `--window N` (default 2
+For a pattern or level plan, `--setup level --level PRICE` (and
+`--stop-rule pct|swing`) give the same history; `--product CNC` prices a
+delivery plan with delivery charges. Other flags: `--replays N`, `--seed N` (default 19), `--window N` (default 2
 bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
 `--qty N` (shares for the cost estimate, default about ₹1,00,000 worth),
 `--now "2026-10-19 10:00"` (IST, UTC+05:30) to pin the clock. Symbols are NSE
@@ -49,7 +52,7 @@ symbols; the tool asks Yahoo for `SYMBOL.NS`.
 
 | file | what |
 | --- | --- |
-| `trader/plan.json` | the plan from trader-exit: symbol, date, entry, entry_time / entry_bar, stop, stop_rule, target, target_r, opening range |
+| `trader/plan.json` | the plan from trader-exit: symbol, date, entry, entry_time / entry_bar, stop, stop_rule, target, target_r, opening range, and for a level setup its `level` (a CNC delivery plan also says `"product": "CNC"`) |
 | Yahoo chart API | one request: 60 days of 5-minute bars for `SYMBOL.NS` (`range=60d&interval=5m`), free and unofficial, can lag. query1 first, then query2 |
 | `trader/data/intraday/<SYMBOL>-5m.json` | the trader-data cache, same Yahoo shape: read with `--cache`, or when Yahoo fails, with a note of the data's time (`"source": "cache"`) |
 | `trader/charges.json` | optional charges override and calibration factor (`--charges PATH`), see Costs below |
@@ -93,9 +96,30 @@ JSON and run `python3 trader-data/data.py import-kite FILE --kind historical --s
    replays and for the history. `trader/charges.json` is deep-merged over
    those numbers and its `calibration.factor` scales the total; the report
    says "estimate", or "estimate (calibrated from N contract notes)".
-4. **The history.** The plan's own rule (the same opening range, stop rule
-   and target R) runs again on every one of those past sessions. That is
-   what really happened, not a simulation.
+4. **The history.** The plan's own rule runs again on every one of those past
+   sessions. That is what really happened, not a simulation.
+   - **Opening-range breakout:** the same opening range, stop rule and target R;
+     the first close beyond the range is the entry.
+   - **Level plan** (`setup: level`, a pattern hit's level): a price level from
+     today cannot be reused on a session where the stock traded elsewhere, so
+     the level is kept as a distance from the plan day's open. On each past
+     session the entry is the first bar closing above the open times that
+     distance, between 09:30 and 15:00 (trader-entry's default window). The
+     stop is the plan's stop distance as a percent of the entry (the
+     fallback), or the swing level below; the target is the plan's R.
+   - **Swing stop** (`stop_rule: swing`, trader-exit `--stop swing`): on each
+     past session the change-of-character level is worked out from that
+     session's bars up to the entry bar, the way trader-exit does it. A session
+     where trader-exit would have refused the stop (the swing trend not up, the
+     level at or above the entry, or under 0.05% away) is skipped and counted
+     (`skipped_no_stop`), and the report says so.
+   - A level plan with no `level` in plan.json, a CNC plan (held overnight, so
+     one intraday session is the wrong yardstick), or any other setup, skips
+     the history and says why.
+   - **Delivery plans** (`"product": "CNC"`): the replays still cover the plan's
+     day only, but costs use the delivery charges (STT both sides, stamp, DP on
+     the sell) and the report warns that a gap or a later day can change the
+     outcome.
 5. **The verdict** is one line from the numbers. It looks only at the
    replays that hit one side, and asks how often the target came first. A
    bigger target needs to win less often to break even: 1 in (1 + R). That

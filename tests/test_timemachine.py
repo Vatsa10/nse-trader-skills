@@ -676,5 +676,206 @@ class Cli(unittest.TestCase):
         self.assertEqual(again, text)
 
 
+def flat_session(moves, n=75, base=100.0):
+    """A hand-made session of n bars: every bar opens at the previous close and closes at base, or at
+    moves[slot] where given; high and low pad the open and the close by 0.05."""
+    out, prev = [], base
+    for i in range(n):
+        c = moves.get(i, prev)
+        out.append({"o": prev, "h": max(prev, c) + 0.05, "l": min(prev, c) - 0.05, "c": c})
+        prev = c
+    return out
+
+
+def hlc_session(hlc):
+    """Bars from (high, low, close) tuples; a bar opens at the previous close (the first at its close)."""
+    out, prev = [], None
+    for h, l, c in hlc:
+        out.append({"o": c if prev is None else prev, "h": h, "l": l, "c": c})
+        prev = c
+    return out
+
+
+SERIES_A = [(10, 8, 9), (11, 9, 10.5), (12, 10, 11.8), (11.5, 10.5, 11), (11.2, 10.2, 10.4), (12.6, 11, 12.4),
+            (12.4, 11.6, 11.8), (11.9, 9.8, 10.0)]
+SERIES_B = [(12, 10, 11), (11, 9, 9.5), (10, 8, 8.2), (9.5, 8.5, 9), (9.8, 8.8, 9.6), (9, 7.4, 7.6),
+            (8.4, 7.6, 8.2), (10.2, 8.1, 10.0)]
+
+
+def bar_dicts(hlc):
+    return [{"h": h, "l": l, "c": c} for h, l, c in hlc]
+
+
+class LevelRule(unittest.TestCase):
+    def test_level_plan_is_carried_and_checked(self):
+        p = plan(setup="level", level=364.0)
+        self.assertEqual((p["setup"], p["level"]), ("level", 364.0))
+        self.assertNotIn("level", plan())
+        for bad in (0, -3, "abc"):
+            with self.assertRaises(tm.TMError):
+                plan(setup="level", level=bad)
+        with self.assertRaises(tm.TMError):
+            plan(product="CFD")
+
+    def test_resolve_rule_turns_the_level_into_a_distance_from_the_open(self):
+        p = plan(setup="level", level=367.64, stop_rule="price")
+        rule = tm.resolve_rule(p, {0: {"o": 364.0}})
+        self.assertEqual(rule, {"setup": "level", "level_pct": 1.0, "stop_rule": "pct", "target_r": 1.0,
+                                "stop_pct": 1.6091})
+        self.assertEqual(tm.resolve_rule(plan(setup="level", level=367.64, stop_rule="swing"),
+                                         {0: {"o": 364.0}})["stop_rule"], "swing")
+        self.assertIsNone(tm.resolve_rule(plan(setup="level"), {0: {"o": 364.0}}))      # no level in the plan
+        self.assertIsNone(tm.resolve_rule(p, {}))                                       # no first bar
+        self.assertIsNone(tm.resolve_rule(plan(setup="flag"), {0: {"o": 364.0}}))
+
+    def test_history_replay_on_hand_made_sessions(self):
+        rule = {"setup": "level", "level_pct": 1.0, "stop_rule": "pct", "stop_pct": 1.0, "target_r": 2.0}
+        a = flat_session({10: 101.5, 11: 103.6})          # closes above 101 on slot 10, runs to the target
+        b = flat_session({10: 101.5, 11: 100.0})          # same entry, then falls through the stop
+        c = flat_session({20: 100.9})                     # never closes above 101: no entry
+        d = flat_session({10: 101.5, 11: 101.6})          # enters and then goes nowhere
+        e = flat_session({1: 105.0, 2: 100.0})            # closes above on slot 1, before 09:30: not an entry
+        sessions = [("2026-01-%02d" % (i + 5), s) for i, s in enumerate([a, b, c, d, e])]
+        h = tm.history_replay(sessions, rule, 71)
+        self.assertEqual((h["sessions"], h["triggered"]), (5, 3))
+        self.assertEqual((h["target"], h["stop"], h["close"]), (1, 1, 1))
+        ta, tb, td = h["trades"]
+        self.assertEqual((ta["date"], ta["entry"], ta["stop"], ta["target"], ta["outcome"], ta["R"]),
+                         ("2026-01-05", 101.5, 100.48, 103.54, "target", 2.0))
+        self.assertEqual((tb["outcome"], tb["R"]), ("stop", -1.0))
+        self.assertEqual((td["outcome"], td["R"]), ("close", 0.1))
+        self.assertEqual(ta["time"], tm.clock12(tm.OPEN_MIN + 5 * 11))
+        self.assertNotIn("skipped_no_stop", h)
+
+    def test_entries_stop_at_the_cutoff_and_at_until(self):
+        rule = {"setup": "level", "level_pct": 1.0, "stop_rule": "pct", "stop_pct": 1.0, "target_r": 2.0}
+        late = flat_session({69: 101.5})                   # closes above at 15:05, after the 15:00 cutoff
+        edge = flat_session({68: 101.5})                   # the bar closing at 15:00 still counts
+        h = tm.history_replay([("2026-01-05", late), ("2026-01-06", edge)], rule, 71)
+        self.assertEqual([t["date"] for t in h["trades"]], ["2026-01-06"])
+        h = tm.history_replay([("2026-01-06", edge)], rule, 40)             # --until before the entry bar
+        self.assertEqual(h["triggered"], 0)
+
+    def test_a_sell_level_mirrors(self):
+        rule = {"setup": "level", "level_pct": -1.0, "stop_rule": "pct", "stop_pct": 1.0, "target_r": 2.0}
+        s = flat_session({10: 98.5, 11: 96.4})
+        h = tm.history_replay([("2026-01-05", s)], rule, 71, "sell")
+        t = h["trades"][0]
+        self.assertTrue(t["target"] < t["entry"] < t["stop"])
+        self.assertEqual((t["entry"], t["outcome"]), (98.5, "target"))
+
+    def test_level_replay_on_the_fixture_follows_the_rule(self):
+        days = tm.split_sessions(tm.parse_bars(tm.chart_result(TEXT, "RELIANCE"), NOW_UTC)[1])
+        open0 = days["2026-10-19"][0]["o"]
+        lvl = round(open0 * 1.004, 2)
+        doc = machine(plan(setup="level", level=lvl, stop_rule="pct"), replays=100)
+        h = doc["history"]
+        self.assertEqual(h["rule"]["setup"], "level")
+        self.assertEqual(h["rule"]["stop_rule"], "pct")
+        self.assertGreater(h["triggered"], 5)
+        self.assertEqual(h["sessions"], 57)
+        by_date = dict(tm.full_sessions(days, "2026-10-19")[0])
+        pct = h["rule"]["level_pct"]
+        for t in h["trades"]:
+            D = by_date[t["date"]]
+            line = D[0]["o"] * (1 + pct / 100.0)
+            first = next(i for i in range(2, 69) if D[i]["c"] > line)
+            self.assertEqual(t["entry"], round(D[first]["c"], 2), t["date"])
+            self.assertTrue(t["stop"] < t["entry"] < t["target"], t)
+        text = "\n".join(tm.report(doc))
+        self.assertIn("first close above", text)
+        self.assertIn("the day's open", text)
+        self.assertNotIn("opening range", text.split("History:")[1].splitlines()[0])
+
+    def test_level_plan_without_its_level_says_why(self):
+        doc = machine(plan(setup="level"), replays=100)
+        self.assertIsNone(doc["history"]["rule"])
+        self.assertIn("needs its level price", doc["history"]["note"])
+
+    def test_cli_flags_run_a_level_history(self):
+        days = tm.split_sessions(tm.parse_bars(tm.chart_result(TEXT, "RELIANCE"), NOW_UTC)[1])
+        lvl = round(days["2026-10-19"][0]["o"] * 1.004, 2)
+        code, out, err = run(["run", "--symbol", "RELIANCE", "--date", "2026-10-19", "--entry", "364.18", "--stop", "358.32",
+                              "--target", "370.04", "--entry-time", "10:00 AM", "--setup", "level", "--level", str(lvl),
+                              "--stop-rule", "pct", "--offline", RIL, "--now", NOW, "--replays", "200", "--json"])
+        self.assertEqual(code, 0, err)
+        h = json.loads(out)["history"]
+        self.assertEqual(h["rule"]["setup"], "level")
+        self.assertGreater(h["triggered"], 0)
+
+
+class SwingRule(unittest.TestCase):
+    def test_the_engine_block_is_the_shared_one(self):
+        # the pattern: the same Series A and B as every other copy of the engine
+        snap, ev = tm.swing_run([(h, l, c) for h, l, c in SERIES_A], 5.0, 20, 0)
+        self.assertEqual((snap["trend"], snap["coc"], snap["legs"]), ("down", 12.6, 0))
+        self.assertEqual(ev, [None, "start_up", None, None, None, "bos", None, "reversal"])
+        snap, ev = tm.swing_run(SERIES_B, 5.0, 20, 0)
+        self.assertEqual((snap["trend"], snap["coc"]), ("up", 7.4))
+        self.assertEqual(ev[-1], "reversal")
+
+    def test_rule_stop_swing_for_a_buy(self):
+        rule = {"stop_rule": "swing"}
+        self.assertEqual(tm.rule_stop(rule, None, None, 12.5, True, bar_dicts(SERIES_A[:6])), 10.2)
+        odd = list(SERIES_A[:6])
+        odd[4] = (11.2, 10.249, 10.4)                                       # a pullback low of 10.249 rounds down
+        self.assertEqual(tm.rule_stop(rule, None, None, 12.5, True, bar_dicts(odd)), 10.24)
+        self.assertIsNone(tm.rule_stop(rule, None, None, 10.0, True, bar_dicts(SERIES_A)))          # the trend is down
+        self.assertIsNone(tm.rule_stop(rule, None, None, 10.1, True, bar_dicts(SERIES_A[:6])))      # level above the entry
+        self.assertIsNone(tm.rule_stop(rule, None, None, 10.205, True, bar_dicts(SERIES_A[:6])))    # under 0.05 % away
+        self.assertIsNone(tm.rule_stop(rule, None, None, 12.5, True, None))
+        self.assertIsNone(tm.rule_stop(rule, None, None, 12.5, True, bar_dicts([(10, 8, 9)] * 5)))  # no trend yet
+
+    def test_rule_stop_swing_for_a_sell(self):
+        rule = {"stop_rule": "swing"}
+        self.assertEqual(tm.rule_stop(rule, None, None, 7.6, False, bar_dicts(SERIES_B[:6])), 9.8)
+        self.assertIsNone(tm.rule_stop(rule, None, None, 7.6, True, bar_dicts(SERIES_B[:6])))
+
+    def test_history_recomputes_the_stop_per_session_and_skips_refusals(self):
+        rule = {"setup": "level", "level_pct": round(100 * (12.0 / 9 - 1), 4), "stop_rule": "swing", "target_r": 2.0}
+        x = hlc_session(SERIES_A)                          # closes above 12.0 on slot 5; coc 10.2; then 9.8 < 10.2
+        y = hlc_session([(10, 8, 9), (13, 8, 8.5), (13, 7, 7.5), (12.5, 7.4, 12.2), (12.3, 11, 12.0), (12.2, 11, 12.1),
+                         (12.2, 11, 12.1), (12.2, 11, 12.1)])   # closes above 12 while the trend is down
+        h = tm.history_replay([("2026-01-05", x), ("2026-01-06", y)], rule, 7)
+        self.assertEqual((h["sessions"], h["triggered"], h["skipped_no_stop"]), (2, 1, 1))
+        t = h["trades"][0]
+        self.assertEqual((t["entry"], t["stop"], t["target"], t["outcome"], t["R"]), (12.4, 10.2, 16.8, "stop", -1.0))
+
+    def test_resolve_rule_keeps_the_swing_stop_for_orb_and_level(self):
+        orb = tm.resolve_rule(plan(stop_rule="swing"), {})
+        self.assertEqual((orb["setup"], orb["stop_rule"]), ("orb", "swing"))
+        self.assertNotIn("stop_pct", orb)
+        self.assertEqual(tm.resolve_rule(plan(stop_rule="atr"), {})["stop_rule"], "pct")     # unchanged
+
+    def test_swing_report_line(self):
+        days = tm.split_sessions(tm.parse_bars(tm.chart_result(TEXT, "RELIANCE"), NOW_UTC)[1])
+        lvl = round(days["2026-10-19"][0]["o"] * 1.004, 2)
+        doc = machine(plan(setup="level", level=lvl, stop_rule="swing"), replays=100)
+        h = doc["history"]
+        self.assertEqual(h["rule"]["stop_rule"], "swing")
+        self.assertIn("skipped_no_stop", h)
+        for t in h["trades"]:
+            self.assertTrue(t["stop"] < t["entry"] < t["target"], t)
+        self.assertIn("swing change-of-character level", "\n".join(tm.report(doc)))
+
+
+class DeliveryPlan(unittest.TestCase):
+    def test_a_cnc_plan_is_priced_as_delivery_and_skips_the_history(self):
+        mis = machine(plan(), replays=200)
+        cnc = machine(plan(product="CNC", flat_by=None), replays=200)
+        self.assertEqual(cnc["plan"]["product"], "CNC")
+        self.assertNotIn("product", mis["plan"])
+        self.assertNotIn("flat_by", cnc["plan"])
+        self.assertEqual((cnc["mc"]["costs"]["segment"], mis["mc"]["costs"]["segment"]), ("delivery", "intraday"))
+        self.assertIn("delivery (CNC)", cnc["mc"]["costs"]["label"])
+        self.assertGreater(cnc["mc"]["costs"]["rupees_at_stop"], mis["mc"]["costs"]["rupees_at_stop"])
+        self.assertIsNone(cnc["history"]["rule"])
+        self.assertIn("delivery (CNC)", cnc["history"]["note"])
+        self.assertTrue(any("held overnight" in w for w in cnc["warnings"]))
+        self.assertIn("After delivery charges", "\n".join(tm.report(cnc)))
+        self.assertIn("After intraday charges", "\n".join(tm.report(mis)))
+        self.assertEqual(mis["warnings"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -403,7 +403,130 @@ class Strategies(unittest.TestCase):
         self.assertAlmostEqual(rs["volatility"], bt.stdev([0.01, -0.01] * 50) * math.sqrt(252))
 
 
+# Series A from the swing spec (high, low, close); bar 9 is ours, so the reversal's next open exists
+SERIES_A = [(10, 8, 9), (11, 9, 10.5), (12, 10, 11.8), (11.5, 10.5, 11), (11.2, 10.2, 10.4), (12.6, 11, 12.4),
+            (12.4, 11.6, 11.8), (11.9, 9.8, 10.0), (10.3, 9.9, 10.0)]
+SERIES_A_OPEN = [9, 10, 11, 11.8, 11, 10.4, 12.4, 11.8, 10.0]
+
+
+def swing_data(bars=SERIES_A, opens=SERIES_A_OPEN, sym="SWG"):
+    dates = weekdays(D(2024, 1, 1), D(2024, 3, 29))[:len(bars)]
+    d = {"open": list(opens), "high": [b[0] for b in bars], "low": [b[1] for b in bars],
+         "close": [b[2] for b in bars], "volume": [1000.0] * len(bars)}
+    return dates, {sym: d}
+
+
+class SwingTrend(unittest.TestCase):
+    def run_swing(self, params, dates=None, data=None, **kw):
+        if dates is None:
+            dates, data = swing_data()
+        return bt.simulate("swing_trend", params, ["SWG"], data, dates, zero_charges(), 0, len(dates), 1000.0,
+                           slippage_bps=0.0, **kw)
+
+    def test_spec_series_one_buy_at_the_bos_next_open_and_one_sell(self):
+        res = self.run_swing({"retrace_pct": 5, "entry": "bos", "warmup": 0})
+        fills = [f for f in res["port"].fills if f["side"] in ("BUY", "SELL")]
+        dates, _ = swing_data()
+        self.assertEqual([f["side"] for f in fills], ["BUY", "SELL"])
+        self.assertEqual(fills[0]["date"], dates[6].isoformat())      # signal on index 5, fill on the next open
+        self.assertEqual(fills[0]["price"], 12.4)
+        self.assertEqual(fills[1]["date"], dates[8].isoformat())      # reversal on index 7, fill on the next open
+        self.assertEqual(fills[1]["price"], 10.0)
+        self.assertIn("12.00", fills[0]["note"])
+        self.assertIn("10.20", fills[1]["note"])
+        self.assertEqual(len(res["port"].closed), 1)
+        self.assertLess(res["port"].closed[0]["pnl"], 0)
+
+    def test_warmup_holds_back_early_entries(self):
+        res = self.run_swing({"retrace_pct": 5, "entry": "bos", "warmup": 6})   # the bos is bar 6: total 6 is not > 6
+        self.assertEqual(res["port"].fills, [])
+        res = self.run_swing({"retrace_pct": 5, "entry": "bos", "warmup": 5})
+        self.assertEqual(len([f for f in res["port"].fills if f["side"] == "BUY"]), 1)
+
+    def test_big_retrace_filter_ignores_the_bos(self):
+        res = self.run_swing({"retrace_pct": 20, "entry": "bos", "warmup": 0})   # 15 % pullback < 20 %
+        self.assertEqual(res["port"].fills, [])
+
+    def test_reversal_entry_buys_the_trend_start(self):
+        res = self.run_swing({"retrace_pct": 5, "entry": "reversal", "warmup": 0})
+        buys = [f for f in res["port"].fills if f["side"] == "BUY"]
+        dates, _ = swing_data()
+        self.assertEqual(len(buys), 1)
+        self.assertEqual(buys[0]["date"], dates[2].isoformat())   # start_up on index 1, fill on index 2's open
+        self.assertEqual(buys[0]["price"], 11.0)
+
+    def test_bad_params_refused(self):
+        for bad in ({"entry": "nope"}, {"retrace_pct": -1}, {"warmup": -3}):
+            with self.assertRaises(bt.BTError):
+                self.run_swing(dict({"retrace_pct": 5, "entry": "bos", "warmup": 0}, **bad))
+
+    def test_registered_with_defaults_and_in_the_example(self):
+        self.assertIs(bt.STRATEGIES["swing_trend"], bt.SwingTrend)
+        self.assertEqual(bt.STRATEGY_TYPES["swing_trend"]["params"], {"retrace_pct": 5, "entry": "bos", "warmup": 40})
+        with open(os.path.join(ROOT, "trader-backtest", "strategies.example.json")) as fh:
+            named = json.load(fh)["strategies"]
+        self.assertEqual(named["swing-structure"]["type"], "swing_trend")
+
+    def test_no_lookahead(self):
+        # cutting the series after the bos bar must not change the buy
+        dates, data = swing_data()
+        short = {"SWG": {k: v[:7] for k, v in data["SWG"].items()}}
+        res = bt.simulate("swing_trend", {"retrace_pct": 5, "entry": "bos", "warmup": 0}, ["SWG"], short, dates[:7],
+                          zero_charges(), 0, 7, 1000.0, slippage_bps=0.0)
+        buys = [f for f in res["port"].fills if f["side"] == "BUY"]
+        self.assertEqual([(f["date"], f["price"]) for f in buys], [(dates[6].isoformat(), 12.4)])
+
+    def test_sweep_and_walk_forward_on_synthetic_bars(self):
+        dates, data = load_syn("SYNTREND")
+        cfg = {"strategy": "swing_trend", "symbols": ["SYNTREND"], "params": {"entry": "bos", "warmup": 40},
+               "capital": 100000.0, "fill": "open", "slippage_bps": 5.0, "tax": False}
+        sw = bt.sweep(cfg, data, dates, bt.CHARGES_DEFAULT, 0, len(dates),
+                      bt.parse_sweep(["retrace_pct=0,3,5,8"]), "cagr", 0.7)
+        self.assertEqual(sw["combinations"], 4)
+        self.assertIn("best_out_of_sample", sw)
+        self.assertEqual(sorted(t["params"]["retrace_pct"] for t in sw["table"]), [0, 3, 5, 8])
+
+    def test_cli_run_with_split(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        daily = os.path.join(tmp, "trader", "data", "daily")
+        os.makedirs(daily)
+        shutil.copy(os.path.join(SYN, "SYNTREND.csv"), daily)
+        code, text, err = run_cli(["run", "--name", "swing-structure", "--symbol", "SYNTREND", "--root", tmp,
+                                   "--no-write", "--benchmark", "none", "--split", "0.7", "--json"])
+        self.assertEqual(code, 0, err)
+        s = json.loads(text)
+        self.assertEqual(s["strategy"], "swing_trend")
+        self.assertEqual(s["params"], {"retrace_pct": 5, "entry": "bos", "warmup": 40})
+        self.assertIn("out_of_sample", s["split"])
+
+
 class Data(unittest.TestCase):
+    def test_adj_file_silences_the_guessed_gap_warnings(self):
+        # a .adj.csv that still holds a 50 % overnight gap is trusted: no flags, no "likely split" text anywhere
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        daily = os.path.join(tmp, "trader", "data", "daily")
+        os.makedirs(daily)
+        rows = [(d, 100.0 if i < 30 else 50.0, 100.0 if i < 30 else 50.0)
+                for i, d in enumerate(weekdays(D(2024, 1, 1), D(2024, 4, 30)))]
+        write_csv(os.path.join(daily, "GAPCO.csv"), rows)
+        write_csv(os.path.join(daily, "GAPCO.adj.csv"), rows)
+        write_csv(os.path.join(daily, "RAWCO.csv"), rows)
+        _, adj = bt.load_symbol(daily, "GAPCO", auto_adjust=True)
+        self.assertEqual(adj["corporate_action_flags"], [])
+        self.assertFalse(adj["auto_adjusted"])
+        _, raw = bt.load_symbol(daily, "RAWCO")
+        self.assertEqual(len(raw["corporate_action_flags"]), 1)   # the same bars without an adj file are flagged
+        code, text, err = run_cli(["check", "GAPCO", "RAWCO", "--root", tmp])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(text.count("likely corporate action"), 1)
+        code, text, err = run_cli(["run", "--strategy", "buy_hold", "--symbol", "GAPCO", "--root", tmp,
+                                   "--no-write", "--benchmark", "none"])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("Likely split", text)
+        self.assertIn("gap check is off", text)
+
     def test_split_detection_and_auto_adjust(self):
         bars, inf = bt.load_symbol(SYN, "SPLITCO")
         self.assertFalse(inf["adjusted"])

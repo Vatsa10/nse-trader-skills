@@ -33,6 +33,7 @@ Education and tooling, not financial advice.
 """
 
 import argparse
+import csv
 import datetime
 import http.cookiejar
 import json
@@ -79,6 +80,20 @@ PSU_SYMBOLS = {"IOC", "BPCL", "HINDPETRO", "ONGC", "OIL", "GAIL", "COALINDIA", "
                "HAL", "BHEL", "BEML", "NMDC", "SAIL", "NATIONALUM", "HINDCOPPER", "PFC", "RECLTD", "IRFC",
                "IRCTC", "RVNL", "IRCON", "CONCOR", "LICI", "GICRE", "NIACL", "MAZDOCK", "COCHINSHIP",
                "GRSE", "MOIL", "NLCINDIA", "IREDA", "HUDCO", "NBCC", "ENGINERSIN", "MRPL", "CPCL"}
+# market valuation rule of thumb (Nifty 50 P/E from trader/data/index/nifty-50.csv), a hint, never scored
+NIFTY_PE_EXPENSIVE = 25.0
+NIFTY_PE_CHEAP = 20.0
+NIFTY_INDEX_FILE = "nifty-50.csv"
+EXPENSIVE_EXTRA_TRANCHES = 2      # plan: when the market is expensive, suggest this many more tranches
+EXPENSIVE_PACE_FACTOR = 1.5       # ... and this much more time between them
+# delivery hint (trader/data/delivery/<SYM>.csv): "institutional money" days in the last 30 sessions
+DELIVERY_WINDOW = 30
+DELIVERY_MIN_VALUES = 5
+DELIVERY_IM_RATIO = 1.2
+T2T_SERIES = ("BE", "BZ")
+# swing structure on daily bars: retrace as scan/backtest use it, and the bars it needs to be trusted
+SWING_RETRACE = 5.0
+SWING_MIN_BARS = 40
 VERDICTS = ("Strong long-term candidate", "Reasonable, size small", "Value trap risk / wait",
             "Avoid for long term")
 
@@ -632,6 +647,96 @@ def build_fundamentals(symbol, screener=None, nse=None, manual=None, kite=None, 
     return f
 
 
+# --- swing engine: keep byte-identical in scan.py, backtest.py, invest.py and exit.py (tests/test_repo.py checks) ---
+# Market structure, one bar at a time, closing basis. In an uptrend the first bar that fails to make a new high
+# freezes that high as the pending swing high (pivot); a close above it is a break of structure (bos) and the
+# lowest low of the pullback becomes the change-of-character level (coc), a structural trailing stop. A close
+# beyond coc reverses the trend. Pullbacks shallower than `retrace` percent of the pivot do not move coc.
+# Downtrends are the mirror image. Causal: no future bars, so it is safe to replay in a backtest.
+
+def swing_new(retrace=5.0, sideways=20, min_bars=40):
+    return {"trend": None, "hi": None, "lo": None, "pivot": None, "coc": None, "bars_since": 0, "total": 0,
+            "legs": 0, "last_bos": None, "retrace": retrace or 0.0, "sideways_n": sideways, "min_bars": min_bars}
+
+
+def _swing_shallow(s, depth, pivot):
+    # depth / pivot < retrace %, cross-multiplied so an exact tie (3 / 30 vs 10 %) confirms
+    return s["retrace"] > 0 and depth * 100 < s["retrace"] * pivot
+
+
+def swing_step(s, h, l, c):
+    """Feed one bar (high, low, close). Returns the bar's event: start_up, start_down, bos, reversal or None."""
+    if h is None or l is None or c is None:
+        return None
+    s["total"] += 1
+    if s["trend"] is None:
+        if s["hi"] is None:
+            s["hi"], s["lo"] = h, l
+            return None
+        ev = None
+        if c > s["hi"]:
+            s["trend"], s["coc"], s["hi"], ev = "up", s["lo"], h, "start_up"
+        elif c < s["lo"]:
+            s["trend"], s["coc"], s["lo"], ev = "down", s["hi"], l, "start_down"
+        s["hi"], s["lo"] = max(s["hi"], h), min(s["lo"], l)
+        return ev
+    s["bars_since"] += 1
+    if s["trend"] == "up":
+        if s["pivot"] is not None:
+            if h > s["hi"]:
+                s["hi"], s["bars_since"] = h, 0
+            s["lo"] = min(s["lo"], l)
+        elif h > s["hi"]:
+            s["hi"], s["lo"], s["bars_since"] = h, l, 0
+        else:
+            s["pivot"], s["lo"], s["bars_since"] = s["hi"], l, 1
+        if c < s["coc"]:   # checked on every bar, a new-high bar included
+            s.update(trend="down", coc=s["hi"], hi=None, pivot=None, lo=l, bars_since=0, legs=0)
+            return "reversal"
+        if s["pivot"] is not None and c > s["pivot"]:
+            pivot, s["pivot"], s["bars_since"] = s["pivot"], None, 0
+            if _swing_shallow(s, pivot - s["lo"], pivot):
+                return None
+            s["coc"], s["last_bos"] = s["lo"], pivot
+            s["legs"] += 1
+            return "bos"
+        return None
+    if s["pivot"] is not None:
+        if l < s["lo"]:
+            s["lo"], s["bars_since"] = l, 0
+        s["hi"] = max(s["hi"], h)
+    elif l < s["lo"]:
+        s["lo"], s["hi"], s["bars_since"] = l, h, 0
+    else:
+        s["pivot"], s["hi"], s["bars_since"] = s["lo"], h, 1
+    if c > s["coc"]:
+        s.update(trend="up", coc=s["lo"], lo=None, pivot=None, hi=h, bars_since=0, legs=0)
+        return "reversal"
+    if s["pivot"] is not None and c < s["pivot"]:
+        pivot, s["pivot"], s["bars_since"] = s["pivot"], None, 0
+        if _swing_shallow(s, s["hi"] - pivot, pivot):
+            return None
+        s["coc"], s["last_bos"] = s["hi"], pivot
+        s["legs"] += 1
+        return "bos"
+    return None
+
+
+def swing_snapshot(s):
+    out = {k: s[k] for k in ("trend", "coc", "pivot", "last_bos", "hi", "lo", "bars_since", "legs")}
+    out["sideways"] = s["trend"] is not None and s["bars_since"] > s["sideways_n"]
+    out["stable"] = s["total"] > s["min_bars"]
+    return out
+
+
+def swing_run(bars, retrace=5.0, sideways=20, min_bars=40):
+    """bars: (high, low, close) oldest first. Returns (final snapshot, one event per bar)."""
+    s = swing_new(retrace, sideways, min_bars)
+    events = [swing_step(s, h, l, c) for h, l, c in bars]
+    return swing_snapshot(s), events
+# --- end swing engine ---
+
+
 # ---------------------------------------------------------------- daily bars
 
 def read_daily(trader_dir, symbol):
@@ -656,6 +761,118 @@ def read_daily(trader_dir, symbol):
             rows.sort()
             return rows, path, adj
     return [], None, None
+
+
+def read_daily_bars(trader_dir, symbol):
+    """Sibling of read_daily for the swing engine: (rows, path, adjusted), rows are (date, high, low, close)
+    ascending. A missing or unreadable high/low stays None and the engine skips that bar."""
+    base = os.path.join(trader_dir, "data", "daily")
+    for name, adj in ((symbol + ".adj.csv", True), (symbol + ".csv", False)):
+        path = os.path.join(base, name)
+        if os.path.exists(path):
+            rows = []
+            with open(path, encoding="utf-8") as fh:
+                header = fh.readline().strip().split(",")
+                if header[:1] != ["date"] or "close" not in header:
+                    raise InvestError("%s: header must be date,open,high,low,close,volume" % path)
+                ci = header.index("close")
+                hi = header.index("high") if "high" in header else None
+                li = header.index("low") if "low" in header else None
+                for line in fh:
+                    parts = line.strip().split(",")
+                    if len(parts) <= ci:
+                        continue
+                    d, c = parse_day(parts[0]), num(parts[ci])
+                    if d and c:
+                        h = num(parts[hi]) if hi is not None and hi < len(parts) else None
+                        lo = num(parts[li]) if li is not None and li < len(parts) else None
+                        rows.append((d, h, lo, c))
+            rows.sort(key=lambda r: r[0])
+            return rows, path, adj
+    return [], None, None
+
+
+def swing_numbers(bars, retrace=SWING_RETRACE, min_bars=SWING_MIN_BARS):
+    """bars: (date, high, low, close). Runs the swing engine and returns the trend, the change-of-character
+    level and the cushion: (last close - coc) / last close x 100, negative when the close is on the wrong side
+    of it (a downtrend). Under min_bars bars the numbers are not trusted: cushion is None (scored as missing)."""
+    usable = [b for b in bars if None not in (b[1], b[2], b[3])]
+    if not usable:
+        return None
+    snap, _ = swing_run([(b[1], b[2], b[3]) for b in usable], retrace, 20, min_bars)
+    last = usable[-1][3]
+    cushion = None
+    if snap["stable"] and snap["trend"] is not None and snap["coc"] is not None and last > 0:
+        cushion = round((last - snap["coc"]) / last * 100, 2)
+    return {"swing_trend": snap["trend"], "swing_coc": snap["coc"], "swing_pivot": snap["pivot"],
+            "swing_cushion_pct": cushion, "swing_stable": snap["stable"], "swing_bars": len(usable)}
+
+
+def read_market_valuation(trader_dir):
+    """Latest Nifty 50 P/E row of trader/data/index/nifty-50.csv (written by trader-data, may not exist) with
+    the rule-of-thumb label. None when there is no file or no usable P/E. A hint, never scored."""
+    path = os.path.join(trader_dir, "data", "index", NIFTY_INDEX_FILE)
+    if not os.path.exists(path):
+        return None
+    best = None
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            for row in csv.DictReader(fh):
+                d, pe = parse_day(row.get("date")), num(row.get("pe"))
+                if d and pe and pe > 0 and (best is None or d >= best[0]):
+                    best = (d, pe, num(row.get("pb")), num(row.get("div_yield")))
+    except (OSError, csv.Error, UnicodeDecodeError):
+        return None
+    if not best:
+        return None
+    d, pe, pb, dy = best
+    label = "expensive" if pe >= NIFTY_PE_EXPENSIVE else "cheap" if pe <= NIFTY_PE_CHEAP else "neutral"
+    return {"index": "Nifty 50", "date": d.isoformat(), "pe": pe, "pb": pb, "div_yield_pct": dy, "label": label,
+            "expensive_at": NIFTY_PE_EXPENSIVE, "cheap_at": NIFTY_PE_CHEAP}
+
+
+def read_delivery(trader_dir, symbol):
+    """Rows of trader/data/delivery/<SYM>.csv ascending, as dicts (date, deliv_qty, qty_per_trade, series); an
+    empty cell is None. None when there is no file."""
+    path = os.path.join(trader_dir, "data", "delivery", symbol + ".csv")
+    if not os.path.exists(path):
+        return None
+    rows = []
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            for row in csv.DictReader(fh):
+                d = parse_day(row.get("date"))
+                if d:
+                    rows.append({"date": d, "deliv_qty": num(row.get("deliv_qty")),
+                                 "qty_per_trade": num(row.get("qty_per_trade")),
+                                 "series": (row.get("series") or "").strip().upper()})
+    except (OSError, csv.Error, UnicodeDecodeError):
+        return None
+    rows.sort(key=lambda r: r["date"])
+    return rows
+
+
+def delivery_im_days(rows):
+    """Institutional-money days among the last 30 sessions that have delivery data. A day counts when its
+    delivery quantity (DQ) and its quantity per trade (TQ) are both above 1.2 times their 30-session mean and
+    the series is not trade-to-trade (BE, BZ). Fewer than 5 values: not enough data."""
+    if rows is None:
+        return None
+    win = [r for r in rows if r["deliv_qty"] is not None][-DELIVERY_WINDOW:]
+    dq = [r["deliv_qty"] for r in win]
+    tq = [r["qty_per_trade"] for r in win if r["qty_per_trade"] is not None]
+    if len(dq) < DELIVERY_MIN_VALUES or len(tq) < DELIVERY_MIN_VALUES:
+        return {"enough_data": False, "sessions": len(win), "im_days": None, "last_im_date": None,
+                "text": "not enough delivery data (%d sessions with values, need %d)" % (
+                    min(len(dq), len(tq)), DELIVERY_MIN_VALUES)}
+    mdq, mtq = sum(dq) / len(dq), sum(tq) / len(tq)
+    hits = [r["date"].isoformat() for r in win
+            if r["series"] not in T2T_SERIES and r["qty_per_trade"] is not None and mdq > 0 and mtq > 0
+            and r["deliv_qty"] / mdq > DELIVERY_IM_RATIO and r["qty_per_trade"] / mtq > DELIVERY_IM_RATIO]
+    return {"enough_data": True, "sessions": len(win), "im_days": len(hits), "dates": hits,
+            "last_im_date": hits[-1] if hits else None,
+            "text": "%d institutional-money day(s) in the last %d sessions%s" % (
+                len(hits), len(win), " (latest %s)" % hits[-1] if hits else "")}
 
 
 def close_on_or_before(rows, day):
@@ -792,7 +1009,8 @@ def growth_numbers(annual):
     return out
 
 
-def analyse(f, card, daily=None, gsec=None, today=None, horizon_years=5, daily_meta=None):
+def analyse(f, card, daily=None, gsec=None, today=None, horizon_years=5, daily_meta=None, swing=None,
+            market=None, delivery=None):
     symbol = f.get("symbol")
     today = today or ist_today()
     gsec = card.get("gsec_10y_pct", 6.5) if gsec is None else gsec
@@ -805,6 +1023,8 @@ def analyse(f, card, daily=None, gsec=None, today=None, horizon_years=5, daily_m
     sector_l = " ".join(str(f.get(k) or "") for k in ("sector", "industry", "nse_sector")).lower()
     financial = any(w in sector_l for w in FINANCIAL_WORDS)
     tech = technicals(daily, horizon_years) if daily else None
+    if tech and swing:
+        tech.update(swing)
 
     m = {}
     m["pe"] = f.get("pe")
@@ -833,7 +1053,8 @@ def analyse(f, card, daily=None, gsec=None, today=None, horizon_years=5, daily_m
         if a is not None and b is not None and a > 0:
             yoy = round((b - a) / a * 100, 1)
     m["latest_quarter_profit_yoy"] = yoy
-    for k in ("dist_200dma_pct", "off_52w_high_pct", "price_cagr_5y", "max_drawdown_pct", "volatility_pct"):
+    for k in ("dist_200dma_pct", "swing_cushion_pct", "off_52w_high_pct", "price_cagr_5y", "max_drawdown_pct",
+              "volatility_pct"):
         m[k] = tech.get(k) if tech else None
 
     not_applicable = set()
@@ -940,6 +1161,9 @@ def analyse(f, card, daily=None, gsec=None, today=None, horizon_years=5, daily_m
         ages.append("daily bars to %s (%d days old)%s" % (tech["last_date"], dage,
                                                            "" if (daily_meta or {}).get("adjusted", True)
                                                            else ", UNADJUSTED: splits/bonuses distort CAGR"))
+        if swing and not swing.get("swing_stable"):
+            ages.append("swing trend needs more than %d daily bars (%d here): cushion scored as missing" % (
+                SWING_MIN_BARS, swing.get("swing_bars", 0)))
     else:
         ages.append("no daily bars: run trader-data for %s (technicals pillar scored as missing)" % symbol)
     missing_fields = [k for k in CONTRACT_FIELDS if f.get(k) is None and not (
@@ -953,6 +1177,7 @@ def analyse(f, card, daily=None, gsec=None, today=None, horizon_years=5, daily_m
             "flags": flags, "data_age": ages, "missing_metrics": missing, "missing_fields": missing_fields,
             "scorecard": card.get("_override") or "scorecard.example.json",
             "latest_quarter": lq, "horizon_years": horizon_years,
+            "market_valuation": market, "delivery": delivery,
             "disclaimer": "Education and tooling, not financial advice."}
 
 
@@ -991,6 +1216,7 @@ def plan(f, analysis, ch, amount, tranches=3, every_days=30, today=None, price=N
     if amount <= 0:
         raise InvestError("--amount must be positive")
     tranches = max(1, int(tranches))
+    asked = tranches
     rate = (float(ch["delivery"]["stt_buy_pct"]) + float(ch["delivery"]["stamp_buy_pct"]) +
             float(ch["exchange_txn_pct"]["NSE"]) * 1.2) / 100.0
     unit = price * (1 + rate)
@@ -1055,6 +1281,15 @@ def plan(f, analysis, ch, amount, tranches=3, every_days=30, today=None, price=N
         checklist.append("PSU: watch government pricing and subsidy decisions (e.g. fuel/LPG under-recovery "
                          "compensation) and any offer-for-sale")
     checklist.append("review the whole position once a quarter, after results; re-run analyse")
+    mv = analysis.get("market_valuation")
+    pace = None
+    if mv and mv.get("label") == "expensive":
+        pace = {"tranches": asked + EXPENSIVE_EXTRA_TRANCHES,
+                "every_days": int(round(every_days * EXPENSIVE_PACE_FACTOR))}
+        notes.append("the Nifty 50 P/E is %s on %s (%.0f or more is expensive by the rule of thumb): consider slower "
+                     "pacing, for example %d tranches %d days apart instead of %d every %d. A hint, not a timing "
+                     "signal" % (fmt(mv["pe"], 2), mv["date"], mv["expensive_at"], pace["tranches"],
+                                 pace["every_days"], asked, every_days))
     if VERDICTS.index(analysis["verdict"]) >= 2:
         notes.append("the analyse verdict is '%s': this plan is shown because you asked, not as a "
                      "recommendation" % analysis["verdict"])
@@ -1066,6 +1301,7 @@ def plan(f, analysis, ch, amount, tranches=3, every_days=30, today=None, price=N
                          "per day (once per sell day, whatever the qty)" % (
                              float(ch["delivery"]["stt_sell_pct"]), inr(ch["delivery"]["dp_per_scrip_sell"])),
             "tax": tax, "review_checklist": checklist, "notes": notes, "verdict": analysis["verdict"],
+            "market_valuation": mv, "pace_hint": pace,
             "score": analysis["score"],
             "next_step": "show tranche 1 to the user; only on their explicit yes, run trader-risk then "
                          "trader-broker for a CNC ticket. Not financial advice."}
@@ -1105,6 +1341,11 @@ def print_analysis(a, out=None):
     w("  Growth: revenue CAGR 3y %s / 5y %s, profit CAGR 3y %s / 5y %s, loss years %s of %s" % (
         pct(g.get("revenue_cagr_3y")), pct(g.get("revenue_cagr_5y")), pct(g.get("profit_cagr_3y")),
         pct(g.get("profit_cagr_5y")), g.get("loss_years"), g.get("years_of_data")))
+    mv = a.get("market_valuation")
+    if mv:
+        w("  Market: %s P/E %s on %s is %s (rule of thumb: %.0f or more expensive, %.0f or less cheap; "
+          "a hint, not scored)" % (mv["index"], fmt(mv["pe"], 2), mv["date"], mv["label"], mv["expensive_at"],
+                                   mv["cheap_at"]))
     t = a.get("technicals")
     if t:
         w("  Price: %s on %s, 52w %s to %s, %s from the 200-DMA, CAGR 1y %s 3y %s 5y %s, max drawdown %s, "
@@ -1112,6 +1353,13 @@ def print_analysis(a, out=None):
                              pct(t.get("dist_200dma_pct")), pct(t.get("price_cagr_1y")),
                              pct(t.get("price_cagr_3y")), pct(t.get("price_cagr_5y")),
                              pct(t.get("max_drawdown_pct")), pct(t.get("volatility_pct"))))
+        if t.get("swing_trend"):
+            w("  Swing: %s trend on daily closes, change-of-character level %s, cushion %s%s" % (
+                t["swing_trend"].upper(), fmt(t.get("swing_coc"), 2), pct(t.get("swing_cushion_pct")),
+                "" if t.get("swing_stable") else " (too few bars to trust)"))
+    dv = a.get("delivery")
+    if dv:
+        w("  Delivery: %s (a hint, not scored)" % dv["text"])
     lq = a.get("latest_quarter")
     if lq:
         w("  Latest quarter %s: revenue %s, net profit %s%s" % (
@@ -1274,7 +1522,10 @@ def load_for_analysis(args, symbol, card):
     rows, path, adj = read_daily(args.trader_dir, symbol)
     today = parse_day(args.today) if args.today else ist_today()
     horizon = int(re.sub(r"[^0-9]", "", args.horizon or "5") or 5)
-    return f, analyse(f, card, rows, args.gsec, today, horizon, {"path": path, "adjusted": adj})
+    bars = read_daily_bars(args.trader_dir, symbol)[0] if rows else []
+    return f, analyse(f, card, rows, args.gsec, today, horizon, {"path": path, "adjusted": adj},
+                      swing_numbers(bars) if bars else None, read_market_valuation(args.trader_dir),
+                      delivery_im_days(read_delivery(args.trader_dir, symbol)))
 
 
 def cmd_analyse(args):
