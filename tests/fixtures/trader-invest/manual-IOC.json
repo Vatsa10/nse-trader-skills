@@ -1,0 +1,8 @@
+{"_provenance": "example manual JSON in the fundamentals shape (what a user saves when screener.in blocks); same IOC numbers as screener-IOC.html",
+ "as_of": "2026-10-29", "price": 130.41, "market_cap_cr": 184154, "pe": 5.44, "pb": 0.83, "div_yield_pct": 6.36,
+ "roe_pct": 19.37, "roce_pct": 13.19, "debt_to_equity": 0.58, "promoter_pct": 51.5, "promoter_pledge_pct": 0,
+ "promoter_name": "President of India", "sector": "Oil Gas & Consumable Fuels",
+ "annual": [{"fy": "FY25", "revenue_cr": 845513, "net_profit_cr": 12962, "eps": 9.41, "dividend_ps": 3.0},
+            {"fy": "FY26", "revenue_cr": 886224, "net_profit_cr": 36802, "eps": 26.73, "dividend_ps": 8.29}],
+ "quarterly": [{"q": "Q1FY26", "revenue_cr": 219025, "net_profit_cr": 5689},
+               {"q": "Q1FY27", "revenue_cr": 275972, "net_profit_cr": -2661}]}

@@ -1,0 +1,8 @@
+SYNTHETIC test data. Not real NSE prices.
+
+Every CSV in this folder is made up: weekday dates 2019-01-01 to 2024-12-31 (no NSE holidays removed),
+a smooth trend (exp drift plus a sine wave) plus seeded Gaussian noise. The file names borrow NSE symbols
+(NIFTYBEES, GOLDBEES, ITBEES) only so the rebalance and benchmark code paths see familiar names.
+SYNTREND is a made-up trending stock. SPLITCO is a made-up UNADJUSTED stock with a planted 1:2 split
+(every price halves) on 2022-06-15, to test corporate-action detection.
+Header: date,open,high,low,close,volume (the trader-data daily cache contract).

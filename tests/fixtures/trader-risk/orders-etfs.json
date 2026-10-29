@@ -1,0 +1,47 @@
+{
+  "created_by": "trader-budget",
+  "status": "proposed",
+  "source": "trader-budget/targets.example.json style split, CNC delivery",
+  "orders": [
+    {
+      "symbol": "NIFTYBEES",
+      "side": "buy",
+      "qty": "8",
+      "product": "CNC",
+      "type": "market",
+      "time_in_force": "day"
+    },
+    {
+      "symbol": "GOLDBEES",
+      "side": "buy",
+      "qty": "20",
+      "product": "CNC",
+      "type": "market",
+      "time_in_force": "day"
+    },
+    {
+      "symbol": "BANKBEES",
+      "side": "buy",
+      "qty": "3",
+      "product": "CNC",
+      "type": "market",
+      "time_in_force": "day"
+    },
+    {
+      "symbol": "ITBEES",
+      "side": "buy",
+      "qty": "30",
+      "product": "CNC",
+      "type": "market",
+      "time_in_force": "day"
+    },
+    {
+      "symbol": "BEL",
+      "side": "buy",
+      "qty": "3",
+      "product": "CNC",
+      "type": "market",
+      "time_in_force": "day"
+    }
+  ]
+}

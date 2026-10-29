@@ -1,0 +1,33 @@
+{
+  "created_by": "trader-budget",
+  "created_at": "2026-10-19T04:45:00Z",
+  "status": "proposed",
+  "paper": true,
+  "note": "Proposals only. Nothing is placed until trader-risk passes each order and you say yes to it in the chat.",
+  "source": "trader/plan.json (RELIANCE orb 2026-10-19)",
+  "orders": [
+    {
+      "symbol": "RELIANCE",
+      "side": "buy",
+      "qty": "4",
+      "product": "MIS",
+      "type": "market",
+      "time_in_force": "day",
+      "order_class": "bracket",
+      "take_profit_limit_price": "1472.30",
+      "stop_loss_stop_price": "1432.30",
+      "why": "opening-range breakout on RELIANCE: 4 shares MIS, bound by your ₹100 max loss per trade (4 x 20.00 + ~₹6.12 charges = ₹86.12 at the stop)",
+      "plan": {
+        "entry": 1452.3,
+        "stop": 1432.3,
+        "target": 1472.3,
+        "risk_per_share": 20.0,
+        "charges": 6.12,
+        "max_loss": 86.12,
+        "setup": "orb",
+        "entry_time": "09:45 AM",
+        "flat_by": "15:15"
+      }
+    }
+  ]
+}

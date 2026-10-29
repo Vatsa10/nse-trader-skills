@@ -1,0 +1,15 @@
+{
+ "data": {
+  "NSE:TCS": {
+   "instrument_token": 2953217,
+   "last_price": 2530.0,
+   "ohlc": {
+    "open": 2568.0,
+    "high": 2625.0,
+    "low": 2517.2,
+    "close": 2506.9
+   }
+  }
+ },
+ "status": "success"
+}

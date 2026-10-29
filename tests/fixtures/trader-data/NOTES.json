@@ -1,0 +1,12 @@
+{
+ "what": "format samples for trader-data tests",
+ "real_values": "OHLCV numbers come from tests/fixtures/real (NSE bhavcopy-derived eod2_data, see its provenance.json)",
+ "synthetic": [
+  "yahoo-5m-RELIANCE.json",
+  "nse-chart-RELIANCE.json",
+  "kite-historical-RELIANCE-minute.json (intraday paths are made up, bounded by the real daily bar)",
+  "sec_list.csv bands (illustrative)",
+  "circuit limits (previous close +/- 10%)",
+  "instrument tokens and _id fields"
+ ]
+}

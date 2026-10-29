@@ -1,0 +1,1 @@
+{"chart": {"result": [{"meta": {"currency": "INR", "symbol": "HINDCOPPER.NS", "exchangeName": "NSI", "regularMarketTime": 1792387320, "regularMarketPrice": 324.85, "chartPreviousClose": 314.45, "previousClose": 314.45, "_note": "synthetic fixture"}, "timestamp": [1792381500], "indicators": {"quote": [{"close": [314.9]}]}}], "error": null}}

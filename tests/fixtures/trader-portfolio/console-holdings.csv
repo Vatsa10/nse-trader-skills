@@ -1,0 +1,8 @@
+Client ID,AB1234,,,,,,,,,,
+Equity Holdings Statement as on 2026-10-28,,,,,,,,,,,
+,,,,,,,,,,,
+Symbol,ISIN,Sector,Quantity Available,Quantity Discrepant,Quantity Long Term,Quantity Pledged (Margin),Quantity Pledged (Loan),Average Price,Previous Closing Price,Unrealized P&L,Unrealized P&L Pct.
+TATAGOLD,INF277KA1976,ETF,675,0,300,0,0,14.82,15.48,445.5,4.45
+TATSILV,INF277KA1984,ETF,392,0,0,0,0,22.6,25.2,1019.2,11.5
+HINDCOPPER,INE531E01026,NON-FERROUS METALS,10,0,0,0,0,472.35,356.85,-1155,-24.45
+HAL,INE066F01020,AEROSPACE & DEFENSE,1,0,1,0,0,4800,4598.4,-201.6,-4.2

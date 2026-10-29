@@ -1,0 +1,10 @@
+{
+  "as_of": "2026-10-19",
+  "source": "fixture in the trader-data bands shape",
+  "bands": {
+    "RELIANCE": {"band_pct": 10, "lower": 1306.80, "upper": 1597.20},
+    "BEL": {"band_pct": 5, "lower": 389.50, "upper": 430.50},
+    "HINDCOPPER": {"band_pct": null, "lower": null, "upper": null},
+    "GOLDBEES": {"band_pct": 20, "lower": 81.84, "upper": 122.76}
+  }
+}

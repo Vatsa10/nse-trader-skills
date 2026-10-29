@@ -1,0 +1,28 @@
+{
+ "info": {
+  "symbol": "RELIANCE",
+  "companyName": "Reliance Industries Limited",
+  "isFNOSec": true
+ },
+ "metadata": {
+  "series": "EQ",
+  "symbol": "RELIANCE",
+  "lastUpdateTime": "23-Oct-2026 16:00:00",
+  "pdSymbolPe": 0
+ },
+ "priceInfo": {
+  "lastPrice": 1190,
+  "open": 1184,
+  "close": 1190,
+  "previousClose": 1184.5,
+  "intraDayHighLow": {
+   "min": 1163.1,
+   "max": 1201.9,
+   "value": 1190
+  },
+  "lowerCP": "1066.05",
+  "upperCP": "1302.95",
+  "pPriceBand": "No Band",
+  "basePrice": 1184.5
+ }
+}

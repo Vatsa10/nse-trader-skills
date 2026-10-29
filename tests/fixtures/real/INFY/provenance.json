@@ -1,0 +1,19 @@
+{
+ "symbol": "INFY",
+ "kind": "daily",
+ "source": "github:BennyThadikaran/eod2_data",
+ "url": "https://raw.githubusercontent.com/BennyThadikaran/eod2_data/04c645452ff4a214e3666fc265fdc3a56a5831c4/daily/infy.csv",
+ "repo": "https://github.com/BennyThadikaran/eod2_data",
+ "commit": "04c645452ff4a214e3666fc265fdc3a56a5831c4",
+ "path": "daily/infy.csv",
+ "upstream": "NSE daily reports (bhavcopy), per the repo README: https://www.nseindia.com/all-reports",
+ "adjusted": "split and bonus adjusted; no dividend adjustment (repo README)",
+ "licence": "none stated in eod2_data; the companion eod2 code repo is GPL-3.0; underlying prices are NSE market data",
+ "fetched_at": "2026-10-29T10:57:18Z",
+ "trimmed": "rows from 2023-10-01 only; columns as published",
+ "rows": 759,
+ "first": "2023-10-03",
+ "last": "2026-10-23",
+ "source_sha256": "98b870e9b41c418afaa55db2b6b68dada55ab78ae0f7862f72aad4f4b7b835a5",
+ "checks": "RELIANCE close 2026-10-22 = 1184.50 matches 5paisa.com/blog/reliance-industries-stock-update-22-oct-26"
+}

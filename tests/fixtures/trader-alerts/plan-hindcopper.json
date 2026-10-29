@@ -1,0 +1,12 @@
+{
+ "symbol": "HINDCOPPER",
+ "date": "2026-10-19",
+ "setup": "orb",
+ "entry": 314.3,
+ "stop": 308.1,
+ "stop_label": "opening-range midpoint",
+ "target": 320.5,
+ "target_label": "1R (one times the risk)",
+ "flat_by": "15:15",
+ "_note": "synthetic fixture"
+}

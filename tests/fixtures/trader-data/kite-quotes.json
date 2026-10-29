@@ -1,0 +1,33 @@
+{
+ "NSE:RELIANCE": {
+  "instrument_token": 738561,
+  "timestamp": "2026-10-23 15:59:59",
+  "last_trade_time": "2026-10-23 15:59:54",
+  "last_price": 1190,
+  "volume": 14905641,
+  "average_price": 1185.3,
+  "net_change": 0,
+  "ohlc": {
+   "open": 1184,
+   "high": 1201.9,
+   "low": 1163.1,
+   "close": 1184.5
+  },
+  "lower_circuit_limit": 1066.05,
+  "upper_circuit_limit": 1302.95
+ },
+ "NSE:HINDCOPPER": {
+  "instrument_token": 4592385,
+  "timestamp": "2026-10-23 15:59:58",
+  "last_price": 399.05,
+  "volume": 8082637,
+  "ohlc": {
+   "open": 408.0,
+   "high": 408.0,
+   "low": 392.3,
+   "close": 412.55
+  },
+  "lower_circuit_limit": 371.3,
+  "upper_circuit_limit": 453.8
+ }
+}
