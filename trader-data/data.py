@@ -68,6 +68,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -703,6 +704,16 @@ def retry_wait(attempt, headers=None):
     return min(RETRY_CAP, 2.0 ** attempt) * _jitter()
 
 
+def ungzip(body, partial=False):
+    """A gzip body -> bytes. A ranged (206) answer is a cut-off stream by design, so keep what decodes;
+    a full answer that ends early is a broken download and raises EOFError."""
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    out = d.decompress(body)
+    if not partial and not d.eof:
+        raise EOFError("gzip stream ended early")
+    return out
+
+
 class Session(object):
     """One cookie jar per run (saved in the data folder when one is given), browser-like headers,
     gzip handled, and retries with back-off on NSE hosts."""
@@ -785,7 +796,11 @@ class Session(object):
             with self.opener.open(req, timeout=timeout) as r:
                 body = r.read()
                 if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
-                    body = gzip.decompress(body)
+                    try:
+                        body = ungzip(body, partial=r.status == 206)
+                    except (EOFError, zlib.error):
+                        raise SourceError(host, "%s sent a cut-off or broken gzip answer" % host,
+                                          "network or firewall", transient=True)
                 return r.status, body, dict(r.headers.items())
         except urllib.error.HTTPError as e:
             try:
@@ -936,15 +951,35 @@ def nse_prime(sess, force=False):
     sess.save_cookies()
 
 
+def nse_try_prime(sess, force=False):
+    """Prime the cookies, but a refused home page is not the end: the JSON endpoints often answer without
+    them. After one refusal this run stops asking for the home page (it would only be refused again)."""
+    if getattr(sess, "nse_home_refused", None) is not None:
+        return
+    try:
+        nse_prime(sess, force)
+    except SourceError as e:
+        sess.nse_home_refused = e
+
+
 def nse_api(sess, path, referer):
-    nse_prime(sess)
+    blocked = getattr(sess, "nse_blocked", None)
+    if blocked is not None:   # the home page and an API call were both refused: no hammering
+        raise blocked
+    nse_try_prime(sess)
     hdr = {"Accept": "application/json, text/plain, */*", "Referer": referer, "X-Requested-With": "XMLHttpRequest"}
     code, body = sess.get(NSE + path, hdr)
     if code == 401:
-        nse_prime(sess, force=True)
+        nse_try_prime(sess, force=True)
         code, body = sess.get(NSE + path, hdr)
     if code != 200:
-        raise SourceError("nse-api", "NSE %s answered HTTP %d" % (path.split("?")[0], code), hint("nse", code))
+        refused = getattr(sess, "nse_home_refused", None)
+        err = SourceError("nse-api", "NSE %s answered HTTP %d%s" % (
+            path.split("?")[0], code, " (the home page was refused first: %s)" % refused if refused else ""),
+            hint("nse", code))
+        if refused is not None and code in (401, 403):
+            sess.nse_blocked = err
+        raise err
     return _json(body, "nse-api", "NSE " + path.split("?")[0])
 
 

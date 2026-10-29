@@ -1,6 +1,7 @@
 import csv
 import datetime
 import email.utils
+import gzip
 import http.cookiejar
 import io
 import json
@@ -735,6 +736,43 @@ class Transport(Net):
         self.assertNotIn(8.0, self.sleeps)
 
 
+class GzipAnswers(unittest.TestCase):
+    """Session.once on real-looking responses: doctor's ranged probes get a cut-off gzip stream."""
+
+    class Reply(io.BytesIO):
+        def __init__(self, status, body):
+            io.BytesIO.__init__(self, body)
+            self.status, self.headers = status, {"Content-Encoding": "gzip"}
+
+    def once(self, status, body):
+        sess = data.Session()
+        sess.opener = type("Opener", (), {"open": lambda _, req, timeout: self.Reply(status, body)})()
+        saved, data._transport = data._transport, None
+        try:
+            return sess.once(ARCH, {}, 5, "nsearchives.nseindia.com")
+        finally:
+            data._transport = saved
+
+    TEXT = b"Index Name,Open Index Value\n" + bytes(range(256)) * 20   # barely compresses, so a cut is mid-stream
+
+    def test_a_ranged_answer_keeps_what_decodes(self):
+        full = gzip.compress(self.TEXT)
+        code, body, _ = self.once(206, full[:len(full) // 2])
+        self.assertEqual(code, 206)
+        self.assertTrue(body.startswith(b"Index Name"), body[:20])
+        self.assertLess(len(body), len(self.TEXT))
+
+    def test_a_full_answer_cut_short_is_a_transient_source_error(self):
+        full = gzip.compress(self.TEXT)
+        with self.assertRaises(data.SourceError) as cm:
+            self.once(200, full[:len(full) // 2])
+        self.assertTrue(cm.exception.transient)
+        self.assertIn("cut-off or broken gzip", str(cm.exception))
+
+    def test_a_whole_gzip_answer_decodes(self):
+        self.assertEqual(self.once(200, gzip.compress(b"fine"))[1], b"fine")
+
+
 class Cookies(Net):
     def cookie(self, domain="www.nseindia.com", expires=None, name="nsit"):
         return http.cookiejar.Cookie(0, name, "abc", None, False, domain, True, False, "/", True, False, expires,
@@ -1162,7 +1200,16 @@ class Bands(Net):
         self.assertNotIn("NOSUCH", b["bands"])
         self.assertEqual(b["unknown"], ["NOSUCH"])
         self.assertIn("not guessed", out)
-        self.assertEqual(len(f.urls("quote-equity")), 0)    # home page blocked: no API hammering
+        # home page blocked: one API try (it often answers anyway), then no hammering once it refuses too
+        self.assertEqual(len(f.urls("quote-equity")), 1)
+
+    def test_a_refused_home_page_does_not_stop_an_answering_api(self):
+        # live NSE refuses the home page from some networks while its JSON endpoints still answer
+        f = self.net([("www.nseindia.com/api/holiday-master", 200, b'{"CM": []}'), ("www.nseindia.com/", 403, b"")])
+        sess = data.Session()
+        self.assertEqual(data.nse_api(sess, "/api/holiday-master?type=trading", data.NSE + "/"), {"CM": []})
+        self.assertEqual(data.nse_api(sess, "/api/holiday-master?type=trading", data.NSE + "/"), {"CM": []})
+        self.assertEqual(len([u for u, _ in f.calls if u.rstrip("/") == data.NSE]), 1)   # asked for the home page once
 
 
 # ---------------------------------------------------------------- Kite MCP imports
