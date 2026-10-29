@@ -837,5 +837,288 @@ class Cli(unittest.TestCase):
         self.assertEqual(out["note"], "A scan is a list of charts that match a rule, not a list of stocks to buy.")
 
 
+# SwingTrend-style engine, hand-checkable series (high, low, close), see the spec's branch catalogue
+SERIES_A = [(10, 8, 9), (11, 9, 10.5), (12, 10, 11.8), (11.5, 10.5, 11), (11.2, 10.2, 10.4), (12.6, 11, 12.4),
+            (12.4, 11.6, 11.8), (11.9, 9.8, 10.0)]
+SERIES_B = [(12, 10, 11), (11, 9, 9.5), (10, 8, 8.2), (9.5, 8.5, 9), (9.8, 8.8, 9.6), (9, 7.4, 7.6),
+            (8.4, 7.6, 8.2), (10.2, 8.1, 10.0)]
+
+
+def swing_state(trend, retrace=0, **kw):
+    s = scan.swing_new(retrace, 20, 40)
+    s.update(trend=trend, **kw)
+    return s
+
+
+class Swing(unittest.TestCase):
+    def test_no_trend_yet(self):
+        s = scan.swing_new(0)
+        self.assertIsNone(scan.swing_step(s, 20, 18, 19))                       # P1
+        self.assertEqual((s["hi"], s["lo"], s["trend"]), (20, 18, None))
+        self.assertIsNone(scan.swing_step(s, 21, 19, 19.5))                     # P2: the range widens
+        self.assertEqual((s["hi"], s["lo"], s["trend"]), (21, 18, None))
+        s = swing_state(None, hi=20, lo=18)
+        self.assertEqual(scan.swing_step(s, 19, 17, 17.5), "start_down")        # P3
+        self.assertEqual((s["trend"], s["lo"], s["coc"]), ("down", 17, 20))
+        s = swing_state(None, hi=20, lo=18)
+        self.assertEqual(scan.swing_step(s, 22, 19, 21), "start_up")            # P4
+        self.assertEqual((s["trend"], s["hi"], s["coc"]), ("up", 22, 18))
+        s = swing_state(None, hi=20, lo=18)
+        self.assertEqual(scan.swing_step(s, 23, 16, 22), "start_up")            # P5: an outside bar
+        self.assertEqual((s["hi"], s["coc"], s["lo"]), (23, 18, 16))
+        s = scan.swing_new(0)
+        self.assertIsNone(scan.swing_step(s, None, 1, 1))                       # a bar with a hole does not count
+        self.assertEqual(s["total"], 0)
+
+    def test_uptrend_branches(self):
+        s = swing_state("up", hi=30, lo=27, coc=20)
+        self.assertIsNone(scan.swing_step(s, 32, 29, 31))                       # U1: new high, no pivot
+        self.assertEqual((s["hi"], s["lo"], s["bars_since"], s["pivot"]), (32, 29, 0, None))
+        s = swing_state("up", hi=30, lo=27, coc=20)
+        scan.swing_step(s, 29.5, 28, 28.5)                                      # U2: a pivot is born
+        self.assertEqual((s["pivot"], s["lo"], s["bars_since"], s["trend"]), (30, 28, 1, "up"))
+        s = swing_state("up", hi=30, lo=27, coc=20)
+        scan.swing_step(s, 30, 28, 29)                                          # U3: an equal high counts as failing
+        self.assertEqual((s["pivot"], s["lo"]), (30, 28))
+        s = swing_state("up", hi=30, lo=28, coc=20, pivot=30, bars_since=1)
+        scan.swing_step(s, 29, 27, 27.5)                                        # U4
+        self.assertEqual((s["bars_since"], s["lo"]), (2, 27))
+        s = swing_state("up", hi=30, lo=28, coc=20, pivot=30, bars_since=4)
+        self.assertIsNone(scan.swing_step(s, 31, 29, 29.5))                     # U5: a poke is not a break
+        self.assertEqual((s["hi"], s["bars_since"], s["pivot"]), (31, 0, 30))
+        s = swing_state("up", hi=30, lo=27, coc=20, pivot=30, legs=2)
+        self.assertEqual(scan.swing_step(s, 32, 29, 31), "bos")                 # U6
+        self.assertEqual((s["coc"], s["legs"], s["pivot"], s["hi"], s["bars_since"], s["last_bos"]),
+                         (27, 3, None, 32, 0, 30))
+        s = swing_state("up", 15, hi=30, lo=27, coc=20, pivot=30, legs=2)
+        self.assertIsNone(scan.swing_step(s, 32, 29, 31))                       # U7: the retrace filter ignores it
+        self.assertEqual((s["coc"], s["legs"], s["pivot"], s["hi"], s["bars_since"]), (20, 2, None, 32, 0))
+        scan.swing_step(s, 31, 29, 30)                                          # U9: a fresh pivot at the higher high
+        self.assertEqual((s["pivot"], s["lo"], s["bars_since"]), (32, 29, 1))
+        s = swing_state("up", 10, hi=30, lo=27, coc=20, pivot=30)
+        self.assertEqual(scan.swing_step(s, 32, 29, 31), "bos")                 # exactly the retrace confirms
+        s = swing_state("up", hi=30, lo=28, coc=20, pivot=30, bars_since=1)
+        self.assertIsNone(scan.swing_step(s, 31, 29, 30))                       # U8: a close equal to the pivot
+        self.assertEqual(s["pivot"], 30)
+        s = swing_state("up", hi=30, lo=28, coc=25, pivot=30, legs=2)
+        self.assertEqual(scan.swing_step(s, 28, 24, 24.5), "reversal")          # U10
+        self.assertEqual((s["trend"], s["coc"], s["lo"], s["hi"], s["pivot"], s["legs"]),
+                         ("down", 30, 24, None, None, 0))
+        s = swing_state("up", hi=30, lo=28, coc=25)
+        self.assertEqual(scan.swing_step(s, 28, 23, 24), "reversal")            # U11: pivot and reversal in one bar
+        self.assertEqual((s["trend"], s["coc"], s["lo"]), ("down", 30, 23))
+        s = swing_state("up", hi=30, lo=27, coc=25)
+        self.assertIsNone(scan.swing_step(s, 29, 25, 25))                       # U12: equal to coc does not reverse
+        self.assertEqual(s["trend"], "up")
+        s = swing_state("up", hi=30, lo=27, coc=25)
+        self.assertEqual(scan.swing_step(s, 33, 26, 24), "reversal")            # a new-high bar can reverse too
+        self.assertEqual(s["coc"], 33)
+
+    def test_downtrend_mirror(self):
+        s = swing_state("down", hi=11.5, lo=10, coc=14, pivot=10)
+        self.assertEqual(scan.swing_step(s, 11, 8.5, 9), "bos")                 # D1
+        self.assertEqual((s["coc"], s["legs"], s["lo"], s["last_bos"]), (11.5, 1, 8.5, 10))
+        s = swing_state("down", hi=11.5, lo=10, coc=14, pivot=10)
+        self.assertEqual(scan.swing_step(s, 15, 12, 14.5), "reversal")          # D2
+        self.assertEqual((s["trend"], s["coc"], s["hi"]), ("up", 10, 15))
+
+    def test_series_a_and_b(self):
+        s = scan.swing_new(5.0)
+        ev = [scan.swing_step(s, *b) for b in SERIES_A[:5]]
+        self.assertEqual(ev, [None, "start_up", None, None, None])
+        self.assertEqual((s["pivot"], s["lo"], s["bars_since"], s["coc"]), (12, 10.2, 2, 8))
+        self.assertEqual(scan.swing_step(s, *SERIES_A[5]), "bos")
+        self.assertEqual((s["last_bos"], s["coc"], s["legs"], s["hi"], s["bars_since"]), (12, 10.2, 1, 12.6, 0))
+        scan.swing_step(s, *SERIES_A[6])
+        self.assertEqual((s["pivot"], s["lo"]), (12.6, 11.6))
+        self.assertEqual(scan.swing_step(s, *SERIES_A[7]), "reversal")
+        snap, events = scan.swing_run(SERIES_A, 5.0)
+        self.assertEqual(events, [None, "start_up", None, None, None, "bos", None, "reversal"])
+        self.assertEqual((snap["trend"], snap["coc"], snap["lo"], snap["legs"], snap["bars_since"]),
+                         ("down", 12.6, 9.8, 0, 0))
+        self.assertFalse(snap["stable"])
+        for r in (10, 5):
+            self.assertEqual(scan.swing_run(SERIES_A, r)[1], events)
+        snap, events = scan.swing_run(SERIES_A, 20)                              # 15 % is under 20: the BOS is ignored
+        self.assertEqual(events, [None, "start_up"] + [None] * 6)
+        self.assertEqual((snap["trend"], snap["coc"], snap["pivot"], snap["lo"], snap["legs"], snap["bars_since"]),
+                         ("up", 8, 12.6, 9.8, 0, 2))
+        snap, events = scan.swing_run(SERIES_B, 5.0)
+        self.assertEqual(events, [None, "start_down", None, None, None, "bos", None, "reversal"])
+        self.assertEqual((snap["trend"], snap["coc"], snap["hi"], snap["legs"]), ("up", 7.4, 10.2, 0))
+
+    def test_stable_and_sideways(self):
+        self.assertFalse(scan.swing_run(SERIES_A, 5.0, min_bars=8)[0]["stable"])
+        self.assertTrue(scan.swing_run(SERIES_A, 5.0, min_bars=7)[0]["stable"])
+        s = swing_state("up", hi=30, lo=28, coc=20, pivot=30, bars_since=21)
+        self.assertTrue(scan.swing_snapshot(s)["sideways"])
+        s["bars_since"] = 20
+        self.assertFalse(scan.swing_snapshot(s)["sideways"])
+
+    def test_swing_tags(self):
+        info = scan.swing_info(SERIES_A[:6], 5, 0)
+        self.assertEqual((info["trend"], info["event"], info["coc"]), ("up", "bos", 10.2))
+        self.assertEqual(scan.swing_tags(SERIES_A[:6], 5, 0), ["swing_up"])
+        self.assertEqual(scan.swing_tags(SERIES_A, 5, 0), [])                   # trend down
+        self.assertEqual(scan.swing_tags(SERIES_B, 5, 0), ["swing_reversal_up"])
+        self.assertEqual(scan.swing_tags(SERIES_B), [])                         # 8 bars is under the 40-bar warm-up
+        self.assertEqual(scan.swing_info([], 5, 0)["event"], None)
+
+
+def long_rows(closes, spread=0.5, volume=200000):
+    day, out = D(2025, 1, 1), []
+    for c in closes:
+        out.append((day, c, c + spread, c - spread, c, volume))
+        day += datetime.timedelta(days=1)
+    return out
+
+
+class SwingScreens(unittest.TestCase):
+    """The swing tags on the long-term screen. Rows are made up in the test."""
+
+    @staticmethod
+    def waves(cycles=21):
+        c, out = 100.0, []
+        for _ in range(cycles):
+            for _ in range(8):
+                c += 2.0
+                out.append(c)
+            for _ in range(4):
+                c -= 3.0
+                out.append(c)
+        return [100.0] + out
+
+    def test_an_uptrend_with_pullbacks_is_swing_up(self):
+        rows = long_rows(self.waves())
+        self.assertGreaterEqual(len(rows), scan.LT_BARS)
+        m = scan.longterm_metrics(rows)
+        self.assertEqual(m["swing_trend"], "up")
+        self.assertLess(m["swing_coc"], m["close"])
+        self.assertTrue(m["swing_stable"])
+        self.assertIn("swing_up", scan.longterm_tags(m))
+        hits, counts, _ = scan.scan_longterm({"WAVY": rows}, ["WAVY"], screen="swing_up")
+        self.assertEqual([h["symbol"] for h in hits], ["WAVY"])
+        h = hits[0]
+        self.assertEqual(h["setups"], ["swing_up"])
+        self.assertEqual(h["swing_trend"], "up")
+        self.assertEqual(h["swing_coc"], round(m["swing_coc"], 2))
+        self.assertIn(h["swing_event"], (None, "bos"))
+        self.assertIsInstance(h["swing_bars_since"], int)
+        # a collapse through the change-of-character level ends it
+        crash = long_rows(self.waves() + [60.0, 55.0, 50.0])
+        m2 = scan.longterm_metrics(crash)
+        self.assertEqual(m2["swing_trend"], "down")
+        self.assertNotIn("swing_up", scan.longterm_tags(m2))
+        self.assertNotIn("swing_reversal_up", scan.longterm_tags(m2))
+
+    def test_a_fresh_reversal_is_its_own_tag(self):
+        # 193 copies of Series B's first bar (a range the price stays inside), then the other seven bars
+        bars = [SERIES_B[0]] * 193 + SERIES_B[1:]
+        rows = [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in long_rows([0.0] * len(bars))]
+        rows = [(d, c * 10, h * 10, l * 10, c * 10, 200000) for (d, _, _, _, _, _), (h, l, c) in zip(rows, bars)]
+        m = scan.longterm_metrics(rows)
+        self.assertEqual((m["swing_trend"], m["swing_event"], m["swing_coc"]), ("up", "reversal", 74.0))
+        self.assertEqual(scan.longterm_tags(m).count("swing_reversal_up"), 1)
+        self.assertNotIn("swing_up", scan.longterm_tags(m))
+        hits, _, _ = scan.scan_longterm({"REV": rows}, ["REV"], screen="swing_reversal_up")
+        self.assertEqual(hits[0]["swing_event"], "reversal")
+        self.assertEqual(hits[0]["swing_bars_since"], 0)
+
+    def test_the_cli_table_and_json(self):
+        d = tempfile.mkdtemp()
+        cwd = os.getcwd()
+        os.chdir(d)
+        try:
+            os.makedirs(os.path.join("trader", "data", "daily"))
+            with open(os.path.join("trader", "data", "daily", "WAVY.csv"), "w") as fh:
+                fh.write("date,open,high,low,close,volume\n")
+                for r in long_rows(self.waves()):
+                    fh.write("%s,%.2f,%.2f,%.2f,%.2f,%d\n" % (r[0].isoformat(), r[1], r[2], r[3], r[4], r[5]))
+            code, text, err = run(["longterm", "--screen", "swing_up", "--now", "2026-12-01 08:30", "--no-write"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("SWING COCH", text)
+            self.assertIn("swing structure up", text)
+            code, text, _ = run(["longterm", "--now", "2026-12-01 08:30", "--no-write", "--json"])
+            doc = json.loads(text)
+            self.assertEqual(doc["hits"][0]["swing_trend"], "up")
+            self.assertNotIn("\u2014", text)
+        finally:
+            os.chdir(cwd)
+            shutil.rmtree(d)
+
+
+CAL = os.path.join(SDIR, "calendar-2027.json")
+
+
+class Calendar(unittest.TestCase):
+    """trading_day reads trader/data/calendar.json (written by trader-data) when it is there."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        os.chdir(self.d)
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def put(self, text):
+        os.makedirs(os.path.join("trader", "data"), exist_ok=True)
+        with open(os.path.join("trader", "data", "calendar.json"), "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def put_fixture(self):
+        with open(CAL, encoding="utf-8") as fh:
+            self.put(fh.read())
+
+    def test_without_the_file_the_built_in_table_answers(self):
+        self.assertEqual(scan.trading_day(D(2026, 10, 20)), (False, "NSE holiday: Dussehra"))
+        self.assertEqual(scan.trading_day(D(2027, 1, 26)), (True, ""))          # not in the 2026 table
+        self.assertIn("holiday list covers 2026 only", scan.calendar_note(D(2027, 1, 4)))
+
+    def test_the_file_covers_2027(self):
+        self.put_fixture()
+        self.assertEqual(scan.trading_day(D(2027, 1, 26)), (False, "NSE holiday: Republic Day"))
+        self.assertEqual(scan.trading_day(D(2027, 1, 27)), (True, ""))          # the year is covered: open
+        self.assertEqual(scan.trading_day(D(2027, 1, 30)), (False, "weekend"))
+        self.assertEqual(scan.calendar_note(D(2027, 1, 4)), "")                 # the warning is dropped
+        self.assertIn("nseindia.com", scan.calendar_note(D(2028, 1, 4)))        # but not for a year it lacks
+        self.assertEqual(scan.session(D(2027, 1, 27)), (datetime.time(9, 15), datetime.time(15, 30)))
+        self.assertIsNone(scan.session(D(2027, 1, 26)))
+
+    def test_a_special_session_is_open_even_on_a_sunday(self):
+        self.put_fixture()
+        self.assertEqual(scan.trading_day(D(2027, 10, 31)), (True, ""))         # Diwali Laxmi Pujan, a Sunday
+        self.assertIsNotNone(scan.session(D(2027, 10, 31)))
+        self.assertEqual(scan.trading_day(D(2027, 10, 30)), (False, "weekend"))
+
+    def test_a_covered_year_beats_the_built_in_table(self):
+        # years lists 2026 and no holidays: the built-in Dussehra holiday is not in the file, so the day is open
+        self.put(json.dumps({"years": [2026], "holidays": {"2026-10-19": "Test closure"}}))
+        self.assertEqual(scan.trading_day(D(2026, 10, 19)), (False, "NSE holiday: Test closure"))
+        self.assertEqual(scan.trading_day(D(2026, 10, 20)), (True, ""))
+        # a year the file does not cover falls through to the built-in table
+        self.put(json.dumps({"years": [2027], "holidays": {}}))
+        self.assertEqual(scan.trading_day(D(2026, 10, 20)), (False, "NSE holiday: Dussehra"))
+
+    def test_years_as_strings_or_a_dict_and_bad_dates(self):
+        self.put(json.dumps({"years": {"2027": {"2027-01-26": "Republic Day"}}, "holidays": {"junk": "x",
+                                                                                           "2027-03-04": "Holi"}}))
+        self.assertEqual(scan.trading_day(D(2027, 3, 4)), (False, "NSE holiday: Holi"))
+        self.assertEqual(scan.trading_day(D(2027, 3, 5)), (True, ""))
+
+    def test_a_corrupt_or_wrong_shape_file_is_ignored(self):
+        for text in ("{not json", "[1, 2]", '"x"', ""):
+            self.put(text)
+            self.assertEqual(scan.trading_day(D(2026, 10, 20)), (False, "NSE holiday: Dussehra"), text)
+            self.assertIn("2026 only", scan.calendar_note(D(2027, 1, 4)))
+
+    def test_the_orb_window_follows_the_calendar(self):
+        self.put(json.dumps({"years": [2026], "holidays": {"2026-10-19": "Test closure"}}))
+        with self.assertRaises(scan.ScanError) as cm:
+            scan.orb_window(scan.parse_now("2026-10-19 10:00"), None, 15, datetime.time(15, 0))
+        self.assertIn("Test closure", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

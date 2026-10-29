@@ -10,14 +10,17 @@ description: >-
   scan on 5-minute bars from the 09:15 IST open, then writes
   trader/watchlist.json for trader-news and trader-entry. Also a long-term
   screen of the trader-data daily cache (above the 200-day average, near the
-  52-week high, near the 52-week low as a value screen, RSI). Free Yahoo data
+  52-week high, near the 52-week low as a value screen, RSI, and market
+  structure: swing up with a change-of-character stop level, or a swing
+  reversal up). Free Yahoo data
   (SYMBOL.NS), bar by bar, with the trader-data cache as the fallback when
   Yahoo or NSE block the download. Use when the user says "scan the market", "find
   me setups", "what is breaking out on NSE", "opening range breakouts", "scan
   the Nifty 500", "scan for bull flags", "oversold stocks", "pre-market scan",
   "build my watchlist", "what should I look at today", "stocks above the
-  200 DMA", "near 52-week high", "52-week low value stocks", or at the start
-  of a trading day before /trader-news.
+  200 DMA", "near 52-week high", "52-week low value stocks", "stocks in a
+  swing uptrend", "swing reversal", "change of character level", or at the
+  start of a trading day before /trader-news.
 argument-hint: "[universe | daily | orb | longterm] [--at HH:MM] [--cache]"
 ---
 
@@ -67,8 +70,9 @@ scanner asks Yahoo for `SYMBOL.NS` (with `&` sent as `%26`) and drops a
 | `trader/data/daily/<SYMBOL>.csv` | read by `daily --cache`, `longterm`, and `daily` when Yahoo fails (written by trader-data; `<SYMBOL>.adj.csv` wins when present) |
 | `trader/data/intraday/<SYMBOL>-5m.json` | read by `orb --cache` and `orb` when Yahoo fails (written by trader-data, Yahoo v8 shape) |
 | `trader/data/universe.csv` | read by `universe` when niftyindices.com refuses (written by trader-data) |
+| `trader/data/calendar.json` | read for the trading calendar when it exists (written by trader-data): `years`, `holidays`, `special_sessions`. Missing or unreadable means the built-in 2026 table |
 | `nifty500-snapshot.csv` (+ `.json`) | bundled with this skill: the Nifty 500 list as of 2026-07-13, the last fallback |
-| `trader/longterm.json` | written by `longterm`: same shape as the watchlist, `mode: "longterm"`, per hit the 200-day average, 52-week high and low and the distance from each |
+| `trader/longterm.json` | written by `longterm`: same shape as the watchlist, `mode: "longterm"`, per hit the 200-day average, 52-week high and low and the distance from each, and the swing fields (`swing_trend`, `swing_coc`, `swing_event`, `swing_bars_since`) |
 
 ## The universe
 
@@ -132,6 +136,7 @@ is no universe file. A stock needs at least 200 sessions. Per stock:
 | off the high | last close / 52-week high - 1, in percent (0 or below) |
 | over the low | last close / 52-week low - 1, in percent |
 | RSI 14 | Wilder, on the last 120 closes |
+| swing trend, `swing_coc` | a market-structure engine (below) over the last 252 sessions |
 
 | screen | the rule |
 | --- | --- |
@@ -139,6 +144,22 @@ is no universe file. A stock needs at least 200 sessions. Per stock:
 | `near_52w_high` | within `--near-high` (5) percent of the 52-week high |
 | `near_52w_low` | within `--near-low` (10) percent above the 52-week low: a value screen, cheap is not the same as good |
 | `oversold` | RSI 14 under 30 |
+| `swing_up` | the swing trend is up and stable (more than 40 bars fed) |
+| `swing_reversal_up` | the swing trend turned up on the last bar |
+
+The swing engine is a one-pass, bar-by-bar market-structure tracker on
+highs, lows and closes. In an uptrend the first bar that fails to make a new
+high freezes that high as the pending swing high. A close above it is a
+break of structure (`event: "bos"`), and the lowest low of the pullback
+becomes the change-of-character level (`swing_coc`), a structural trailing
+stop on a closing basis. A close under `swing_coc` reverses the trend
+(`event: "reversal"`). Pullbacks shallower than 5 % of the swing high do
+not move `swing_coc` (`SWING_RETRACE`). It looks at no future bar, so it
+replays cleanly. The first trend comes from an arbitrary opening range, so
+the engine is called stable only after 40 bars and the tags need that.
+`swing_coc` can sit far under price in a steep rally; it is a reference,
+not an order. `swing_bars_since` counts the bars since the last swing event
+(a long count means sideways).
 
 `--screen NAME` keeps one screen (default: a stock that matches any).
 Liquidity: last close at least `--min-price` (₹20) and a 20-day average
@@ -192,10 +213,15 @@ MIS square-off) it prints one plain line and writes nothing.
   Say which data the scan used: Yahoo, the cache, or both.
 - Partial results are said as partial: "Fetched 480 of 500 charts (20 failed
   or had no data)". Never round a partial scan up to "the whole market".
-- Times are IST (UTC+05:30, no daylight saving). NSE equity holidays are
-  built in for 2026 only; for any other year the scanner warns "holiday list
-  covers 2026 only: check nseindia.com". NSE has no early closes. The Diwali
-  Muhurat session (a Sunday, timings by circular) is treated as closed.
+- Times are IST (UTC+05:30, no daylight saving). The trading calendar is
+  `trader/data/calendar.json` when it exists and parses (trader-data writes
+  it): a date in `special_sessions` is open, a weekend is closed, a date in
+  `holidays` is closed, a year listed in `years` is otherwise open. NSE
+  equity holidays are also built in for 2026 only; with no calendar file, or
+  for a year neither has, the scanner warns "holiday list covers 2026 only:
+  check nseindia.com". NSE has no early closes. The Diwali Muhurat session
+  (a Sunday, timings by circular) is treated as closed unless the calendar
+  lists it as a special session.
 - Circuit limits: NSE stocks have daily price bands (2, 5, 10 or 20 %). A
   breakout into the upper circuit may not be fillable; say so.
 

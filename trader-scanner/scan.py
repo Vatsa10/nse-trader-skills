@@ -47,6 +47,12 @@ longterm  Long-term screen of the trader-data daily cache
             near_52w_low   within --near-low (10) percent above the 52-week
                            low (a value screen: cheap, not necessarily good)
             oversold       RSI 14 under 30
+            swing_up       market structure is up (a SwingTrend-style engine on the
+                           last 252 sessions, 5 % retrace filter, stable after 40
+                           bars): the change-of-character level (swing_coc) has held
+            swing_reversal_up  the engine's trend turned up on the last bar
+          Each hit carries swing_trend, swing_coc (a closing-basis structural stop),
+          swing_event and swing_bars_since.
           --screen NAME keeps only that screen (default: any). Liquidity:
           --min-price (20) and 20-day average volume >= --min-volume (1,00,000).
           Writes trader/longterm.json. No network.
@@ -70,8 +76,12 @@ Bars: null closes are dropped, a bar off the 5-minute grid (the live tick,
 like 10:49:45) is dropped, and a bar counts only once it is complete
 (start + 5 minutes <= the clock). Times are India time (IST, UTC+05:30, no
 daylight saving). --now pins the clock ("2026-10-19 10:00", IST; ...Z for UTC).
-Market days: Monday to Friday minus the NSE holiday list (2026 only; other
-years get a warning). The Muhurat session is treated as closed.
+Market days: Monday to Friday minus the NSE holiday list. trader/data/calendar.json
+(trader-data's shared calendar: "years", "holidays", "special_sessions") wins
+when it exists and parses: a special session is open, a listed holiday is
+closed, a year it covers is open. Otherwise the built-in list (2026 only;
+other years get a warning). Without a special-session entry the Muhurat
+session is treated as closed.
 
 Symbols are NSE symbols (RELIANCE, HDFCBANK); Yahoo is asked for SYMBOL.NS.
 A trailing .NS typed by the user is dropped. Option-looking symbols are refused.
@@ -123,6 +133,9 @@ DATA_HINT = ("run `python3 trader-data/data.py doctor`; or call Kite MCP get_his
              "`python3 trader-data/data.py import-kite`")
 LT_BARS = 200       # the 200-day average needs 200 sessions
 YEAR_BARS = 252     # about a year of NSE sessions
+SWING_RETRACE = 5.0   # daily swing engine: pullbacks under this percent of the swing high do not move the stop (ours)
+SWING_MIN_BARS = 40   # the engine's trend counts as stable only after this many bars (SwingTrend docs: feed 60+)
+SWING_FEED = YEAR_BARS   # bars fed to the engine for the long-term tags: a fixed warm-up window
 NIFTY500_FILE = "ind_nifty500list.csv"
 NIFTY500_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 EQUITY_FILE = "EQUITY_L.csv"
@@ -158,6 +171,7 @@ NSE_HOLIDAYS = {  # NSE equity segment, weekday holidays
 }
 NSE_EARLY_CLOSE = {}  # NSE has no early closes (the Muhurat session is treated as closed)
 CALENDAR_YEARS = (2026,)
+CALENDAR_FILE = os.path.join(DATA_DIR, "calendar.json")   # trader-data's shared trading calendar, when it exists
 IST_OFFSET = datetime.timedelta(hours=5, minutes=30)  # fixed, India has no DST
 OPEN = datetime.time(9, 15)
 CLOSE = datetime.time(15, 30)
@@ -223,11 +237,54 @@ def parse_hhmm(text, flag="--at"):
     return datetime.time(int(m.group(1)), int(m.group(2)))
 
 
+def _calendar_dates(doc):
+    """{"YYYY-MM-DD": name} from a calendar.json section; bad keys are skipped."""
+    out = {}
+    if isinstance(doc, dict):
+        for k, v in doc.items():
+            try:
+                out[datetime.date.fromisoformat(str(k)).isoformat()] = str(v or "")
+            except ValueError:
+                continue
+    return out
+
+
+def load_calendar(path=None):
+    """trader/data/calendar.json -> {"years": set, "holidays": {...}, "special": {...}}, or None when the
+    file is missing or not the shape this tool knows (the built-in table then answers)."""
+    try:
+        with open(path or CALENDAR_FILE, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    years = set()
+    ys = doc.get("years")
+    for y in (list(ys) if isinstance(ys, (list, tuple, dict)) else []):
+        try:
+            years.add(int(y))
+        except (TypeError, ValueError):
+            continue
+    return {"years": years, "holidays": _calendar_dates(doc.get("holidays")),
+            "special": _calendar_dates(doc.get("special_sessions"))}
+
+
 def trading_day(d):
-    """(is_trading_day, reason). Weekends and the NSE holiday list."""
+    """(is_trading_day, reason). A special session is open; then weekends, the shared calendar.json
+    (its holidays, then any year it covers is open), then the built-in NSE holiday list."""
+    cal = load_calendar()
+    iso = d.isoformat()
+    if cal and iso in cal["special"]:
+        return True, ""
     if d.weekday() >= 5:
         return False, "weekend"
-    name = NSE_HOLIDAYS.get(d.isoformat())
+    if cal:
+        if iso in cal["holidays"]:
+            return False, "NSE holiday: " + (cal["holidays"][iso] or "closed")
+        if d.year in cal["years"]:
+            return True, ""
+    name = NSE_HOLIDAYS.get(iso)
     if name:
         return False, "NSE holiday: " + name
     return True, ""
@@ -242,8 +299,11 @@ def session(d):
 
 
 def calendar_note(d):
-    """A warning when the holiday list does not cover the date's year."""
+    """A warning when neither calendar.json nor the built-in holiday list covers the date's year."""
     if d.year in CALENDAR_YEARS:
+        return ""
+    cal = load_calendar()
+    if cal and d.year in cal["years"]:
         return ""
     return "holiday list covers 2026 only: check nseindia.com"
 
@@ -523,6 +583,116 @@ def build_universe(texts, source="nifty500"):
         if why == "keep":
             kept[clean_symbol(r[sym_key])] = " ".join((r.get(name_key) or "").split())
     return sorted(kept.items()), counts, used
+
+
+# --- swing engine: keep byte-identical in scan.py, backtest.py, invest.py and exit.py (tests/test_repo.py checks) ---
+# Market structure, one bar at a time, closing basis. In an uptrend the first bar that fails to make a new high
+# freezes that high as the pending swing high (pivot); a close above it is a break of structure (bos) and the
+# lowest low of the pullback becomes the change-of-character level (coc), a structural trailing stop. A close
+# beyond coc reverses the trend. Pullbacks shallower than `retrace` percent of the pivot do not move coc.
+# Downtrends are the mirror image. Causal: no future bars, so it is safe to replay in a backtest.
+
+def swing_new(retrace=5.0, sideways=20, min_bars=40):
+    return {"trend": None, "hi": None, "lo": None, "pivot": None, "coc": None, "bars_since": 0, "total": 0,
+            "legs": 0, "last_bos": None, "retrace": retrace or 0.0, "sideways_n": sideways, "min_bars": min_bars}
+
+
+def _swing_shallow(s, depth, pivot):
+    # depth / pivot < retrace %, cross-multiplied so an exact tie (3 / 30 vs 10 %) confirms
+    return s["retrace"] > 0 and depth * 100 < s["retrace"] * pivot
+
+
+def swing_step(s, h, l, c):
+    """Feed one bar (high, low, close). Returns the bar's event: start_up, start_down, bos, reversal or None."""
+    if h is None or l is None or c is None:
+        return None
+    s["total"] += 1
+    if s["trend"] is None:
+        if s["hi"] is None:
+            s["hi"], s["lo"] = h, l
+            return None
+        ev = None
+        if c > s["hi"]:
+            s["trend"], s["coc"], s["hi"], ev = "up", s["lo"], h, "start_up"
+        elif c < s["lo"]:
+            s["trend"], s["coc"], s["lo"], ev = "down", s["hi"], l, "start_down"
+        s["hi"], s["lo"] = max(s["hi"], h), min(s["lo"], l)
+        return ev
+    s["bars_since"] += 1
+    if s["trend"] == "up":
+        if s["pivot"] is not None:
+            if h > s["hi"]:
+                s["hi"], s["bars_since"] = h, 0
+            s["lo"] = min(s["lo"], l)
+        elif h > s["hi"]:
+            s["hi"], s["lo"], s["bars_since"] = h, l, 0
+        else:
+            s["pivot"], s["lo"], s["bars_since"] = s["hi"], l, 1
+        if c < s["coc"]:   # checked on every bar, a new-high bar included
+            s.update(trend="down", coc=s["hi"], hi=None, pivot=None, lo=l, bars_since=0, legs=0)
+            return "reversal"
+        if s["pivot"] is not None and c > s["pivot"]:
+            pivot, s["pivot"], s["bars_since"] = s["pivot"], None, 0
+            if _swing_shallow(s, pivot - s["lo"], pivot):
+                return None
+            s["coc"], s["last_bos"] = s["lo"], pivot
+            s["legs"] += 1
+            return "bos"
+        return None
+    if s["pivot"] is not None:
+        if l < s["lo"]:
+            s["lo"], s["bars_since"] = l, 0
+        s["hi"] = max(s["hi"], h)
+    elif l < s["lo"]:
+        s["lo"], s["hi"], s["bars_since"] = l, h, 0
+    else:
+        s["pivot"], s["hi"], s["bars_since"] = s["lo"], h, 1
+    if c > s["coc"]:
+        s.update(trend="up", coc=s["lo"], lo=None, pivot=None, hi=h, bars_since=0, legs=0)
+        return "reversal"
+    if s["pivot"] is not None and c < s["pivot"]:
+        pivot, s["pivot"], s["bars_since"] = s["pivot"], None, 0
+        if _swing_shallow(s, s["hi"] - pivot, pivot):
+            return None
+        s["coc"], s["last_bos"] = s["hi"], pivot
+        s["legs"] += 1
+        return "bos"
+    return None
+
+
+def swing_snapshot(s):
+    out = {k: s[k] for k in ("trend", "coc", "pivot", "last_bos", "hi", "lo", "bars_since", "legs")}
+    out["sideways"] = s["trend"] is not None and s["bars_since"] > s["sideways_n"]
+    out["stable"] = s["total"] > s["min_bars"]
+    return out
+
+
+def swing_run(bars, retrace=5.0, sideways=20, min_bars=40):
+    """bars: (high, low, close) oldest first. Returns (final snapshot, one event per bar)."""
+    s = swing_new(retrace, sideways, min_bars)
+    events = [swing_step(s, h, l, c) for h, l, c in bars]
+    return swing_snapshot(s), events
+# --- end swing engine ---
+
+
+def swing_info(bars, retrace=SWING_RETRACE, min_bars=SWING_MIN_BARS):
+    """bars (high, low, close) oldest first -> the engine's snapshot plus `event`, the last bar's event."""
+    snap, events = swing_run(bars, retrace, min_bars=min_bars)
+    snap["event"] = events[-1] if events else None
+    return snap
+
+
+def swing_tag_list(trend, event, stable):
+    """The long-term swing tags. A trend reading counts only once the engine is stable; a trend that
+    just turned up is swing_reversal_up, not swing_up."""
+    if not stable or trend != "up":
+        return []
+    return ["swing_reversal_up"] if event == "reversal" else ["swing_up"]
+
+
+def swing_tags(bars, retrace=SWING_RETRACE, min_bars=SWING_MIN_BARS):
+    sw = swing_info(bars, retrace, min_bars)
+    return swing_tag_list(sw["trend"], sw["event"], sw["stable"])
 
 
 # ---------------------------------------------------------------- daily setups
@@ -1071,6 +1241,8 @@ LT_SCREENS = [
     ("near_52w_high", "near the 52-week high"),
     ("near_52w_low", "near the 52-week low (value screen)"),
     ("oversold", "oversold (RSI under 30)"),
+    ("swing_up", "swing structure up (change-of-character level holding)"),
+    ("swing_reversal_up", "swing trend just reversed up"),
 ]
 LT_LABEL = dict(LT_SCREENS)
 
@@ -1086,11 +1258,13 @@ def longterm_metrics(rows):
     lo = min(r[3] for r in yr)
     vol20 = sum(r[5] for r in rows[-20:]) / float(min(20, len(rows)))
     r = rsi(c[-120:])
+    sw = swing_info([(x[2], x[3], x[4]) for x in rows[-SWING_FEED:]])
     return {"close": last, "dma50": dma50, "dma200": dma200, "vs_200dma_pct": (last / dma200 - 1) * 100,
             "high52": hi, "low52": lo, "from_high_pct": (last / hi - 1) * 100,
             "above_low_pct": (last / lo - 1) * 100 if lo > 0 else None, "rsi": r, "avg_volume20": vol20,
             "ret_1y_pct": (last / yr[0][4] - 1) * 100 if yr[0][4] else None, "bars": len(rows),
-            "full_year": len(rows) >= YEAR_BARS}
+            "full_year": len(rows) >= YEAR_BARS, "swing_trend": sw["trend"], "swing_coc": sw["coc"],
+            "swing_event": sw["event"], "swing_bars_since": sw["bars_since"], "swing_stable": sw["stable"]}
 
 
 def longterm_tags(m, near_high=5.0, near_low=10.0):
@@ -1103,6 +1277,7 @@ def longterm_tags(m, near_high=5.0, near_low=10.0):
         tags.append("near_52w_low")
     if m["rsi"] is not None and m["rsi"] < 30:
         tags.append("oversold")
+    tags.extend(swing_tag_list(m["swing_trend"], m["swing_event"], m["swing_stable"]))
     return tags
 
 
@@ -1138,7 +1313,10 @@ def scan_longterm(rows_by_sym, symbols, min_price=20.0, min_volume=100000, scree
                      "above_low_pct": round(m["above_low_pct"], 2) if m["above_low_pct"] is not None else None,
                      "rsi": round(m["rsi"], 1) if m["rsi"] is not None else None,
                      "ret_1y_pct": round(m["ret_1y_pct"], 2) if m["ret_1y_pct"] is not None else None,
-                     "avg_volume20": int(m["avg_volume20"]), "full_year": m["full_year"]})
+                     "avg_volume20": int(m["avg_volume20"]), "full_year": m["full_year"],
+                     "swing_trend": m["swing_trend"],
+                     "swing_coc": round(m["swing_coc"], 2) if m["swing_coc"] is not None else None,
+                     "swing_event": m["swing_event"], "swing_bars_since": m["swing_bars_since"]})
     if screen == "near_52w_low":
         hits.sort(key=lambda h: (h["above_low_pct"], h["symbol"]))
     else:
@@ -1434,6 +1612,13 @@ def _p(x):
     return "{:,.2f}".format(x)
 
 
+def swing_text(h):
+    """'up 1,234.50': the swing trend and its change-of-character level, or '-'."""
+    if not h.get("swing_trend"):
+        return "-"
+    return "%s %s" % (h["swing_trend"], _p(h["swing_coc"]) if h.get("swing_coc") is not None else "-")
+
+
 def cmd_longterm(a):
     now = parse_now(a.now)
     data_dir = a.data_dir or DATA_DIR
@@ -1492,13 +1677,14 @@ def cmd_longterm(a):
     if hits:
         per = [(k, sum(1 for h in hits if k in h["setups"])) for k, _ in LT_SCREENS]
         print("%d matched: %s." % (len(hits), ", ".join("%d %s" % (n, LT_LABEL[k]) for k, n in per if n)))
-        print("  %-10s %12s %12s %8s %12s %8s %12s %8s %6s  %s" % (
-            "SYMBOL", "CLOSE", "200-DMA", "VS 200", "52W HIGH", "OFF HI", "52W LOW", "OVER LO", "RSI", "SCREENS"))
+        print("  %-10s %12s %12s %8s %12s %8s %12s %8s %6s %-14s  %s" % (
+            "SYMBOL", "CLOSE", "200-DMA", "VS 200", "52W HIGH", "OFF HI", "52W LOW", "OVER LO", "RSI", "SWING COCH",
+            "SCREENS"))
         for h in hits[:a.show]:
-            print("  %-10s %12s %12s %+7.1f%% %12s %+7.1f%% %12s %+7.1f%% %6s  %s" % (
+            print("  %-10s %12s %12s %+7.1f%% %12s %+7.1f%% %12s %+7.1f%% %6s %-14s  %s" % (
                 h["symbol"], money(h["price"]), money(h["dma200"]), h["vs_200dma_pct"], money(h["high52"]),
                 h["from_high_pct"], money(h["low52"]), h["above_low_pct"] or 0.0,
-                ("%.1f" % h["rsi"]) if h["rsi"] is not None else "-",
+                ("%.1f" % h["rsi"]) if h["rsi"] is not None else "-", swing_text(h),
                 ", ".join(LT_LABEL[t] for t in h["setups"])))
         if len(hits) > a.show:
             print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, a.out))
