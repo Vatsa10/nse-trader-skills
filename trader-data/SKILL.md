@@ -12,12 +12,13 @@ description: >-
   user downloaded from Kite Console or nseindia.com. Validates every write
   (OHLC sanity, no duplicates, ascending dates, gaps against the NSE trading
   calendar), fetches only missing dates, probes every source with `doctor`,
-  and records real data as test fixtures. Use when the user says "get me
+  keeps a self-updating NSE holiday calendar (`calendar`, so 2027 and later
+  work without a code change), and records real data as test fixtures. Use when the user says "get me
   RELIANCE history", "update my data", "download prices", "Yahoo is not
   working", "NSE blocked me", "what is the price band / circuit limit",
   "import this CSV", "is my data fresh", or before a backtest, an
   investment check or a scan that needs daily bars.
-argument-hint: "[daily|intraday|bands|doctor|status] [symbol]"
+argument-hint: "[daily|intraday|bands|calendar|doctor|status] [symbol]"
 ---
 
 # trader-data
@@ -40,6 +41,8 @@ python3 "${CLAUDE_SKILL_DIR}/data.py" import-kite kite-hist.json --kind historic
 python3 "${CLAUDE_SKILL_DIR}/data.py" import-kite kite-quotes.json --kind quotes
 python3 "${CLAUDE_SKILL_DIR}/data.py" import-kite kite-ohlc.json --kind ohlc --date 2026-10-23
 python3 "${CLAUDE_SKILL_DIR}/data.py" import-csv ~/Downloads/RELIANCE.csv --symbol RELIANCE
+python3 "${CLAUDE_SKILL_DIR}/data.py" calendar                            # keep the NSE holiday calendar current
+python3 "${CLAUDE_SKILL_DIR}/data.py" calendar --refresh                   # refetch holidays and circulars now
 python3 "${CLAUDE_SKILL_DIR}/data.py" status                              # cached, fresh, gaps
 python3 "${CLAUDE_SKILL_DIR}/data.py" record RELIANCE --date 2026-10-23   # real data -> test fixtures
 ```
@@ -57,6 +60,7 @@ Every command takes `--data DIR` (default `trader/data`) and `--now
 | `trader/data/bands.json` | `{"as_of","source","bands":{SYM:{"band_pct","lower","upper"}},"unknown":[...]}` | risk, exit, broker |
 | `trader/data/sources.json` | doctor's result per source: ok, latency, error, checked_at | everyone, to pick a source |
 | `trader/data/cache_meta.json` | which source filled each file and when | status, record |
+| `trader/data/calendar.json` | NSE holidays and special sessions (contract below) | data, alerts, and the skills that load alerts |
 
 `band_pct` is `null` for a stock with no band (F&O stocks; they still have
 dynamic circuit limits in `lower` / `upper`). A symbol whose band could not
@@ -129,18 +133,66 @@ stops the import unless `--drop-bad`; `--adjusted` files it in `.adj.csv`;
 
 - Errors (the write is refused): low above open/close, high below them, a
   price at or below 0, a duplicate date, dates not ascending.
-- Warnings: NSE trading days missing (calendar 2024, 2025, 2026: NSE circulars
-  CMTR/59722, CMTR/65587, the 2026 list in trader-alerts plus the 15 Jan 2026
-  BMC election closure), a bar on a closed day, a 1/2, 1/5 or 1/10 overnight
+- Warnings: NSE trading days missing (calendar 2024, 2025, 2026 built in: NSE
+  circulars CMTR/59722, CMTR/65587, the 2026 list in trader-alerts plus the
+  15 Jan 2026 BMC election closure; any other year from `calendar.json`, see
+  below), a bar on a closed day, a 1/2, 1/5 or 1/10 overnight
   gap (a split or bonus: refresh `.adj.csv` from Yahoo). Muhurat, budget-day
   and Saturday DR sessions are accepted as real.
 - Intraday: 5 minute boundaries, 09:15-15:30 IST, 75 bars per full session.
 
+## The NSE calendar (`calendar`, `calendar.json`)
+
+The built-in holiday tables stop at 2026. `data.py calendar` keeps a cache,
+`trader/data/calendar.json`, so 2027 and later work without a code change.
+Run it once now and then once a day (or whenever `status` says "no holiday
+list for <year>"). It is also the file trader-alerts reads, and through
+trader-alerts the skills that load it by path.
+
+```json
+{"fetched_at": "2027-03-08T04:30:00Z",
+ "years": [2026, 2027],
+ "holidays": {"2027-01-26": "Republic Day", "2027-04-08": "Circular: Trading Holiday on account of ..."},
+ "special_sessions": {"2026-11-08": "Diwali Laxmi Pujan (Muhurat)", "2027-03-06": "Circular: Live Trading Session on ..."},
+ "last_circular_check": "2027-03-08",
+ "warnings": ["circular mentions a trading holiday but no date could be read, not guessed: ..."]}
+```
+
+- `holidays` are weekday closures only (ISO date to name). `years` are the
+  years whose holiday list NSE has published, so a weekday of those years
+  that is not in `holidays` is open.
+- `special_sessions` are sessions on a weekend or holiday, plus the Muhurat
+  evening session.
+- Is NSE open on date d: a special session means open; Saturday and Sunday
+  mean closed; a date in `holidays` means closed; a year in `years` means
+  open; any other year falls back to the built-in tables. A missing or
+  corrupt file means the built-in tables, never an error.
+- Sources: `GET /api/holiday-master?type=trading` (the `CM` list: weekend
+  rows are dropped), and `GET /api/circulars?from_date=DD-MM-YYYY&to_date=DD-MM-YYYY&dept=CMTR`
+  since the last check (first run: 5 days back, then at most once a day).
+  A circular subject with "trading holiday" and "on account of" adds a
+  closure; "live trading session" (or "muhurat") adds a special session. The
+  date is read from the subject; if none can be read a warning is recorded
+  and nothing is guessed. Entries that came from a circular are prefixed
+  "Circular: " and survive a holiday-list refetch.
+- The holiday list is refetched when the current year is missing from
+  `years`, when today is a listed closure and the list is over a day old, or
+  with `--refresh`. The command prints what changed (`+` added, `-` removed)
+  and, for 2024 to 2026, where NSE's list and the built-in table disagree.
+  If NSE blocks the fetch, nothing is written and the built-in answer stays.
+- Muhurat (Diwali Laxmi Pujan) is a real session of about an hour in the
+  evening, so it is recorded as a special session, never as a closure: data
+  bars exist for that day and a bar on it is accepted. trader-alerts reports
+  it as a special session ("regular market closed, special session: ...")
+  because the normal 09:15-15:30 market is shut and the evening timings come
+  from an NSE circular that is not tracked here.
+
 ## doctor
 
-Probes Yahoo query1 and query2, the NSE home page and quote API, the
-nsearchives bhavcopy, the niftyindices Nifty 500 list, Google News RSS and
-the Kite MCP endpoint, each with a timeout, prints a table (ok / FAIL,
+Probes Yahoo query1 and query2, the NSE home page and quote API, the NSE
+holiday-master and circulars endpoints (the calendar feeds: a changed shape
+is reported, not silently empty), the nsearchives bhavcopy, the niftyindices
+Nifty 500 list, Google News RSS and the Kite MCP endpoint, each with a timeout, prints a table (ok / FAIL,
 latency, error and a hint such as "403: NSE blocks this IP (cloud, VPN and
 datacenter IPs usually are); use Kite MCP or import-csv") and writes
 `trader/data/sources.json`. Exit 0 if at least one price source works.

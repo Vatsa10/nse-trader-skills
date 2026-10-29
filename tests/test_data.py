@@ -125,6 +125,243 @@ class Calendar(unittest.TestCase):
         self.assertEqual(data.last_complete_session(datetime.datetime(2026, 10, 25, 12, 0)), D(2026, 10, 23))
 
 
+# ---------------------------------------------------------------- calendar.json (self-updating calendar)
+
+class CalendarFile(Net):
+    NOW = "2027-03-08 10:00"      # a Monday, 5 days after the first circular in the fixture
+
+    def setUp(self):
+        Net.setUp(self)
+        self.cal_path = os.path.join(self.dd, "calendar.json")
+        self.addCleanup(setattr, data, "_CAL", None)
+
+    def feed(self, master=None, circ=None):
+        return self.net([("api/holiday-master", 200, master if master is not None else fx("nse-holiday-master.json")),
+                         ("api/circulars", 200, circ if circ is not None else fx("nse-circulars-cmtr.json")),
+                         ("www.nseindia.com/", 200, b"<html>home</html>")])
+
+    def cal(self):
+        return json.loads(rd(self.cal_path))
+
+    def use(self):
+        data._CAL = data.load_calendar(self.dd)
+        return data._CAL
+
+    def test_fetch_writes_the_contract(self):
+        f = self.feed()
+        code, out, err = self.run_d("calendar", "--now", self.NOW)
+        self.assertEqual(code, 0, out + err)
+        cal = self.cal()
+        self.assertEqual(sorted(cal), ["fetched_at", "holidays", "last_circular_check", "special_sessions",
+                                       "warnings", "years"])
+        self.assertEqual(cal["fetched_at"], "2027-03-08T04:30:00Z")
+        self.assertEqual(cal["years"], [2027])
+        self.assertEqual(cal["last_circular_check"], "2027-03-08")
+        hol = cal["holidays"]
+        self.assertEqual([k for k in hol if not hol[k].startswith("Circular: ")],
+                         ["2027-01-26", "2027-03-22", "2027-03-26"])    # weekend rows and the FO list left out
+        self.assertEqual(hol["2027-01-26"], "Republic Day")
+        self.assertTrue(hol["2027-04-08"].startswith("Circular: Trading Holiday on account of Special Holiday"))
+        sp = cal["special_sessions"]
+        self.assertEqual(sorted(sp), ["2027-03-06", "2027-10-29"])
+        self.assertEqual(sp["2027-10-29"], "Diwali Laxmi Pujan (Muhurat)")
+        self.assertNotIn("2027-10-29", hol)                              # Muhurat is a session, not a closure
+        self.assertEqual(sum("no date could be read" in w for w in cal["warnings"]), 1)
+        self.assertTrue(any("1 holiday-master row" in w for w in cal["warnings"]))
+        self.assertIn("warning: circular mentions a trading holiday but no date could be read", out)
+        self.assertIn("+ 2027-01-26 holiday: Republic Day", out)
+        self.assertEqual(f.urls("holiday-master")[0].split("nseindia.com")[1], "/api/holiday-master?type=trading")
+        self.assertIn("from_date=03-03-2027&to_date=08-03-2027&dept=CMTR", f.urls("api/circulars")[0])  # 5 days back
+
+    def test_resolution_order(self):
+        D = datetime.date
+        self.feed()
+        self.run_d("calendar", "--now", self.NOW)
+        self.assertIsNotNone(self.use())
+        self.assertFalse(data.trading_day(D(2027, 1, 26)))      # listed holiday
+        self.assertFalse(data.trading_day(D(2027, 4, 8)))       # closure from a circular
+        self.assertTrue(data.trading_day(D(2027, 3, 6)))        # Saturday with a live session
+        self.assertTrue(data.trading_day(D(2027, 10, 29)))      # Muhurat: bars exist
+        self.assertFalse(data.trading_day(D(2027, 2, 14)))      # Sunday
+        self.assertFalse(data.trading_day(D(2027, 8, 15)))      # Sunday holiday: weekend either way
+        self.assertTrue(data.trading_day(D(2027, 8, 16)))       # a covered year: unlisted weekday is open
+        self.assertTrue(data.trading_day(D(2027, 12, 24)))
+        self.assertFalse(data.trading_day(D(2026, 10, 20)))     # 2026 not in the file: built-in Dussehra
+        self.assertTrue(data.trading_day(D(2028, 1, 26)))       # uncovered year: built-in tables say open
+        self.assertTrue(data.calendar_known(2027))
+        self.assertFalse(data.calendar_known(2028))
+        self.assertEqual(data.prev_trading_day(D(2027, 1, 27)), D(2027, 1, 25))
+        data._CAL = None
+        self.assertTrue(data.trading_day(D(2027, 1, 26)))       # without the file Jan 2027 is not known
+
+    def test_a_failed_fetch_leaves_the_builtin_answer(self):
+        self.net([("", 403, b"Access Denied")])
+        code, out, _ = self.run_d("calendar", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertIn("built-in tables stay in force", out)
+        self.assertFalse(os.path.exists(self.cal_path))
+        self.assertIsNone(data.load_calendar(self.dd))
+        self.assertTrue(data.trading_day(datetime.date(2027, 1, 26)))
+        self.assertFalse(data.trading_day(datetime.date(2026, 10, 20)))
+
+    def test_bot_wall_html_is_not_a_calendar(self):
+        self.net([("api/holiday-master", 200, b"<html>Access Denied</html>"), ("api/circulars", 200, b"[]"),
+                  ("www.nseindia.com/", 200, b"home")])
+        code, out, _ = self.run_d("calendar", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertIn("did not return JSON", out)
+        self.assertFalse(os.path.exists(self.cal_path))
+
+    def test_second_run_is_quiet_and_refresh_reports_changes(self):
+        self.feed()
+        self.run_d("calendar", "--now", self.NOW)
+        f = self.net([])
+        code, out, _ = self.run_d("calendar", "--now", "2027-03-08 15:00")
+        self.assertEqual(code, 0)
+        self.assertIn("calendar.json is current", out)
+        self.assertEqual(f.calls, [])
+        master = json.loads(fx("nse-holiday-master.json"))
+        master["CM"] = [r for r in master["CM"] if r["description"] != "Holi"] + [
+            {"tradingDate": "03-May-2027", "weekDay": "Monday", "description": "Sample added closure"}]
+        f = self.feed(master=json.dumps(master).encode(), circ=b'{"data": []}')
+        code, out, _ = self.run_d("calendar", "--refresh", "--now", "2027-03-09 10:00")
+        self.assertEqual(code, 0, out)
+        self.assertIn("- 2027-03-22 holiday: Holi", out)
+        self.assertIn("+ 2027-05-03 holiday: Sample added closure", out)
+        self.assertIn("from_date=08-03-2027&to_date=09-03-2027", f.urls("api/circulars")[0])   # since the last check
+        cal = self.cal()
+        self.assertIn("2027-04-08", cal["holidays"])        # the circular closure survives a refetch
+        self.assertEqual(cal["last_circular_check"], "2027-03-09")
+        self.assertEqual(sum("no date could be read" in w for w in cal["warnings"]), 1)    # not duplicated
+
+    def test_next_day_reads_only_new_circulars(self):
+        self.feed()
+        self.run_d("calendar", "--now", self.NOW)
+        f = self.feed(circ=b'{"data": []}')
+        code, out, _ = self.run_d("calendar", "--now", "2027-03-09 10:00")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(f.urls("holiday-master"), [])       # the year is covered: no holiday refetch
+        self.assertEqual(len(f.urls("api/circulars")), 1)
+
+    def test_new_year_triggers_a_holiday_fetch(self):
+        self.feed()
+        self.run_d("calendar", "--now", self.NOW)
+        f = self.feed()
+        self.run_d("calendar", "--now", "2028-01-03 10:00")
+        self.assertEqual(len(f.urls("holiday-master")), 1)    # 2028 is not in the file
+
+    def test_a_listed_holiday_with_an_old_list_refetches(self):
+        self.feed()
+        self.run_d("calendar", "--now", self.NOW)
+        f = self.feed()
+        self.run_d("calendar", "--now", "2027-03-22 08:00")     # Holi, list is two weeks old
+        self.assertEqual(len(f.urls("holiday-master")), 1)
+
+    def test_muhurat_on_a_sunday_is_a_special_session(self):
+        master = json.loads(fx("nse-holiday-master.json"))
+        master["CM"].append({"tradingDate": "31-Oct-2027", "weekDay": "Sunday", "description": "Diwali Laxmi Pujan *"})
+        self.feed(master=json.dumps(master).encode())
+        self.run_d("calendar", "--now", self.NOW)
+        self.use()
+        self.assertEqual(self.cal()["special_sessions"]["2027-10-31"], "Diwali Laxmi Pujan (Muhurat)")
+        self.assertNotIn("2027-10-31", self.cal()["holidays"])
+        self.assertTrue(data.trading_day(datetime.date(2027, 10, 31)))
+
+    def test_corrupt_or_wrong_shape_file_means_builtin(self):
+        os.makedirs(self.dd)
+        for text in ("{not json", "[]", '{"years": [2027], "holidays": [1, 2]}', '{"years": "x"}', ""):
+            wr(self.cal_path, text)
+            self.assertIsNone(data.load_calendar(self.dd), text)
+            code, out, _ = self.run_d("status", "--now", self.NOW)
+            self.assertEqual(code, 0)
+            self.assertIn("calendar.json: none", out)
+            self.assertTrue(data.trading_day(datetime.date(2027, 1, 26)))
+        wr(self.cal_path, "{not json")
+        self.feed()
+        code, out, _ = self.run_d("calendar", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertIn("unreadable", out)
+        self.assertEqual(self.cal()["years"], [2027])
+
+    def test_trader_alerts_reads_what_data_writes(self):
+        D = datetime.date
+        self.feed()
+        self.run_d("calendar", "--now", self.NOW)
+        self.addCleanup(alerts.apply_calendar, os.path.join(self.tmp, "none.json"))
+        alerts.apply_calendar(self.cal_path)
+        self.use()
+        for d in (D(2027, 1, 26), D(2027, 4, 8), D(2027, 3, 22), D(2027, 2, 14)):
+            self.assertFalse(alerts.trading_day(d)[0], d)
+            self.assertFalse(data.trading_day(d), d)
+        self.assertTrue(alerts.trading_day(D(2027, 3, 6))[0])                       # live Saturday session
+        self.assertTrue(alerts.trading_day(D(2027, 10, 29))[1].startswith("special session"))   # Muhurat
+        self.assertTrue(data.trading_day(D(2027, 10, 29)))
+
+    def test_bad_keys_in_the_file_are_dropped(self):
+        os.makedirs(self.dd)
+        wr(self.cal_path, json.dumps({"years": [2027], "holidays": {"2027-01-26": "Republic Day", "soon": "x"}}))
+        cal = data.load_calendar(self.dd)
+        self.assertEqual(cal["holidays"], {"2027-01-26": "Republic Day"})
+        self.assertEqual(cal["special_sessions"], {})
+        self.assertEqual(cal["warnings"], [])
+
+    def test_circular_subjects(self):
+        D = datetime.date
+        for text in ("Live Trading Session on Saturday, March 6, 2027", "session on 6th March 2027 only",
+                     "session on 06-Mar-2027", "session on 06/03/2027", "on Mar 6, 2027"):
+            self.assertEqual(data.dates_in_text(text)[0], D(2027, 3, 6), text)
+        self.assertEqual(data.dates_in_text("no date here, Foo 40, 2027"), [])
+        doc = {"data": [
+            {"sub": "Trading Holiday on account of Id on Saturday, March 6, 2027"},                     # weekend: no-op
+            {"sub": "Live Trading Session and Trading Holiday on account of X on March 8, 2027"},       # ambiguous
+            {"sub": "Muhurat Trading on Sunday, November 7, 2027"},
+            {"subject": "Trading holiday on account of Y on 12-Apr-2027"},
+            {}]}
+        closures, special, warns = data.parse_circulars(doc)
+        self.assertEqual(list(closures), ["2027-04-12"])
+        self.assertEqual(list(special), ["2027-11-07"])
+        self.assertEqual(len(warns), 1)
+        self.assertIn("both", warns[0])
+        with self.assertRaises(data.DataError):
+            data.parse_circulars({"nothing": 1})
+        with self.assertRaises(data.DataError):
+            data.parse_holiday_master({"CM": []})
+
+    def test_validation_follows_the_calendar(self):
+        rows = [data.bar("2027-01-25", 1, 1, 1, 1, 1), data.bar("2027-01-27", 1, 1, 1, 1, 1)]
+        errs, warns = data.validate_daily(rows)
+        self.assertTrue(any("no holiday list" in w and "data.py calendar" in w for w in warns), warns)
+        self.feed()
+        self.run_d("calendar", "--now", self.NOW)
+        self.use()
+        self.assertEqual(data.validate_daily(rows), ([], []))     # 26 Jan is a listed holiday: no gap
+        errs, warns = data.validate_daily(rows + [data.bar("2027-01-28", 1, 1, 1, 1, 1)])
+        self.assertEqual(errs, [])
+        errs, warns = data.validate_daily([data.bar("2027-01-26", 1, 1, 1, 1, 1)])
+        self.assertTrue(any("NSE was closed (Republic Day)" in w for w in warns), warns)
+
+    def test_status_shows_the_calendar(self):
+        code, out, _ = self.run_d("status", "--now", self.NOW)
+        self.assertIn("calendar.json: none (built-in tables cover 2024, 2025, 2026)", out)
+        self.assertIn("no holiday list for 2027: run data.py calendar", out)
+        self.feed()
+        self.run_d("calendar", "--now", self.NOW)
+        code, out, _ = self.run_d("status", "--now", self.NOW)
+        self.assertIn("calendar.json: years 2027", out)
+        self.assertNotIn("no holiday list", out)
+
+    def test_builtin_disagreement_is_printed(self):
+        master = json.loads(fx("nse-holiday-master.json"))
+        master["CM"] = [{"tradingDate": "26-Jan-2026", "weekDay": "Monday", "description": "Republic Day"},
+                        {"tradingDate": "27-Jan-2026", "weekDay": "Tuesday", "description": "Surprise closure"}]
+        self.feed(master=json.dumps(master).encode(), circ=b'{"data": []}')
+        code, out, _ = self.run_d("calendar", "--now", "2026-10-29 10:00")
+        self.assertEqual(code, 0, out)
+        self.assertIn("2026: closed in NSE's list only: 2026-01-27", out)
+        self.assertIn("2026: closed in the built-in table only:", out)
+        self.assertIn("2026-01-15, 2026-03-03", out)
+
+
 # ---------------------------------------------------------------- validation and parsing
 
 class Validation(unittest.TestCase):
@@ -581,6 +818,35 @@ class Doctor(Net):
         code, out, _ = self.run_d("doctor")
         self.assertEqual(code, 1)
         self.assertIn("Kite MCP", out)
+
+    def read_sources(self):
+        with open(os.path.join(self.dd, "sources.json")) as fh:
+            return json.load(fh)["sources"]
+
+    def test_probes_both_calendar_endpoints(self):
+        f = self.net([("api/holiday-master", 200, fx("nse-holiday-master.json")),
+                      ("api/circulars", 200, fx("nse-circulars-cmtr.json")), ("www.nseindia.com/", 200, b"home"),
+                      ("", 403, b"")])
+        self.run_d("doctor", "--now", "2026-10-23 19:00")
+        s = self.read_sources()
+        self.assertTrue(s["nse-holidays"]["ok"])
+        self.assertTrue(s["nse-circulars"]["ok"])
+        self.assertEqual(s["nse-holidays"]["kind"], "cal")
+        self.assertIn("from_date=16-10-2026&to_date=23-10-2026&dept=CMTR", f.urls("api/circulars")[0])
+        hdr = [h for u, h in f.calls if "holiday-master" in u][0]
+        self.assertEqual(hdr["Accept"], "application/json")
+        self.assertIn("exchange-communication-holidays", hdr["Referer"])
+
+    def test_a_changed_calendar_shape_is_reported(self):
+        self.net([("api/holiday-master", 200, b'{"FO": []}'), ("api/circulars", 200, b"<html>wall</html>"),
+                  ("", 403, b"")])
+        code, out, _ = self.run_d("doctor")
+        s = self.read_sources()
+        self.assertFalse(s["nse-holidays"]["ok"])
+        self.assertIn("no CM holiday list", s["nse-holidays"]["error"])
+        self.assertFalse(s["nse-circulars"]["ok"])
+        self.assertIn("not JSON", s["nse-circulars"]["error"])
+        self.assertEqual(code, 1)
 
 
 class RecordStatus(Net):

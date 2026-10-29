@@ -83,6 +83,119 @@ class Calendar(unittest.TestCase):
         self.assertFalse(alerts.market_status(ist("2027-03-01T10:00"))["calendar_known"])
 
 
+CAL27 = os.path.join(QDIR, "calendar-2027.json")
+
+
+class CalendarFile(unittest.TestCase):
+    """trader/data/calendar.json (written by trader-data) merged over the built-in 2026 table."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.none = os.path.join(self.tmp, "none.json")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.addCleanup(alerts.apply_calendar, self.none)        # back to the built-in tables
+
+    def test_the_file_extends_the_years(self):
+        D = datetime.date
+        self.assertIsNotNone(alerts.apply_calendar(CAL27))
+        self.assertEqual(alerts.trading_day(D(2027, 1, 26)), (False, "NSE holiday: Republic Day"))
+        self.assertEqual(alerts.trading_day(D(2027, 3, 22)), (False, "NSE holiday: Holi"))
+        self.assertEqual(alerts.trading_day(D(2027, 4, 8))[0], False)           # closure from a circular
+        self.assertEqual(alerts.trading_day(D(2027, 3, 8)), (True, ""))
+        self.assertEqual(alerts.trading_day(D(2027, 2, 13)), (False, "weekend"))
+        self.assertEqual(alerts.trading_day(D(2026, 10, 20)), (False, "NSE holiday: Dussehra"))
+        # 2026 is listed in the file, so the file replaces the built-in 2026 table for that year
+        self.assertEqual(alerts.trading_day(D(2026, 1, 26)), (True, ""))
+        self.assertEqual(alerts.CALENDAR_YEARS, (2026, 2027))
+        st = alerts.market_status(ist("2027-03-08T10:00"))
+        self.assertTrue(st["open"])
+        self.assertTrue(st["calendar_known"])
+        self.assertFalse(alerts.market_status(ist("2028-03-08T10:00"))["calendar_known"])
+        self.assertEqual(alerts.market_status(ist("2027-01-25T16:00"))["next_open"], "2027-01-27 09:15")
+
+    def test_clock_text(self):
+        alerts.apply_calendar(CAL27)
+        code, text, _ = run(["clock", "--now", "2027-01-26 10:00"])
+        self.assertEqual(code, 1)
+        self.assertIn("NSE holiday: Republic Day", text)
+        self.assertNotIn("holiday list covers", text)
+        code, text, _ = run(["clock", "--now", "2028-01-04T10:00"])
+        self.assertIn("holiday list covers 2026, 2027 only: check nseindia.com", text)
+        self.assertIn("data.py calendar", text)
+
+    def test_normal_hours_special_session(self):
+        alerts.apply_calendar(CAL27)
+        st = alerts.market_status(ist("2027-03-06T10:00"))                      # a Saturday
+        self.assertTrue(st["open"])
+        self.assertIn("Live Trading Session", st["special_session"])
+        self.assertFalse(st["muhurat"])
+        code, text, _ = run(["clock", "--now", "2027-03-06 10:00"])
+        self.assertEqual(code, 0)
+        self.assertIn("Special session today: Circular: Live Trading Session", text)
+
+    def test_muhurat_is_a_special_session_not_a_plain_holiday(self):
+        D = datetime.date
+        alerts.apply_calendar(CAL27)
+        ok, why = alerts.trading_day(D(2027, 10, 29))                           # a Friday
+        self.assertFalse(ok)
+        self.assertTrue(why.startswith("special session: Diwali Laxmi Pujan (Muhurat)"), why)
+        self.assertNotIn("holiday", why)
+        st = alerts.market_status(ist("2027-10-29T18:30"))
+        self.assertFalse(st["open"])                                            # the regular market is closed
+        self.assertTrue(st["muhurat"])
+        self.assertEqual(st["special_session"], "Diwali Laxmi Pujan (Muhurat)")
+        self.assertEqual(st["next_open"], "2027-11-01 09:15")
+        code, text, _ = run(["clock", "--now", "2027-10-29 18:30"])
+        self.assertEqual(code, 1)
+        self.assertIn("regular market closed, special session: Diwali Laxmi Pujan (Muhurat)", text)
+        # the built-in Muhurat (Sunday 8 Nov 2026) says the same without any file
+        alerts.apply_calendar(self.none)
+        self.assertTrue(alerts.trading_day(D(2026, 11, 8))[1].startswith("special session: "))
+        self.assertTrue(alerts.market_status(ist("2026-11-08T18:30"))["muhurat"])
+
+    def test_a_muhurat_on_a_sunday_in_the_file(self):
+        path = os.path.join(self.tmp, "cal.json")
+        with open(path, "w") as fh:
+            json.dump({"years": [2027], "holidays": {}, "special_sessions": {"2027-10-31": "Diwali Laxmi Pujan (Muhurat)"}},
+                      fh)
+        alerts.apply_calendar(path)
+        self.assertIn("2027-10-31", alerts.MUHURAT_SESSIONS)
+        self.assertNotIn("2027-10-31", alerts.SPECIAL_SESSIONS)
+        self.assertFalse(alerts.market_status(ist("2027-10-31T18:30"))["open"])
+
+    def test_missing_or_corrupt_file_is_the_builtin_table(self):
+        self.assertIsNone(alerts.apply_calendar(self.none))
+        self.assertEqual(sorted(alerts.NSE_HOLIDAYS), NSE_2026)
+        for text in ("", "{nope", "[]", '{"years": ["x"]}', '{"years": [2027], "holidays": ["a"]}', "null"):
+            path = os.path.join(self.tmp, "bad.json")
+            with open(path, "w") as fh:
+                fh.write(text)
+            self.assertIsNone(alerts.apply_calendar(path), text)
+            self.assertEqual(sorted(alerts.NSE_HOLIDAYS), NSE_2026, text)
+            self.assertEqual(alerts.CALENDAR_YEARS, (2026,))
+            self.assertEqual(alerts.trading_day(datetime.date(2026, 10, 20)), (False, "NSE holiday: Dussehra"))
+        self.assertEqual(alerts.NSE_HOLIDAYS, alerts.BUILTIN_HOLIDAYS)
+
+    def test_applying_twice_does_not_pile_up(self):
+        alerts.apply_calendar(CAL27)
+        once = (dict(alerts.NSE_HOLIDAYS), dict(alerts.SPECIAL_SESSIONS), dict(alerts.MUHURAT_SESSIONS))
+        alerts.apply_calendar(CAL27)
+        self.assertEqual((alerts.NSE_HOLIDAYS, alerts.SPECIAL_SESSIONS, alerts.MUHURAT_SESSIONS), once)
+        alerts.apply_calendar(self.none)
+        self.assertNotIn("2027-01-26", alerts.NSE_HOLIDAYS)
+        self.assertNotIn("2027-03-06", alerts.SPECIAL_SESSIONS)
+
+    def test_the_default_path_is_trader_data(self):
+        self.assertEqual(alerts.CALENDAR_PATH, os.path.join("trader", "data", "calendar.json"))
+        old = alerts.CALENDAR_PATH
+        alerts.CALENDAR_PATH = CAL27
+        try:
+            self.assertIsNotNone(alerts.apply_calendar())
+            self.assertIn("2027-01-26", alerts.NSE_HOLIDAYS)
+        finally:
+            alerts.CALENDAR_PATH = old
+
+
 class Quotes(unittest.TestCase):
     def test_yahoo_fixtures(self):
         with open(os.path.join(QDIR, "yahoo-RELIANCE.json")) as fh:
