@@ -54,8 +54,8 @@ The branches may only argue from recorded numbers, so build them before any
 branch runs. Run what is missing and skip what exists and is fresh:
 
 1. trader-data: daily bars, `delivery`, `actions`, `index` (Nifty 50, India VIX).
-2. Long term: trader-invest `fetch` then `invest.py --json analyse SYM >
-   trader/invest/SYM.json` (that file is how the analysis reaches the brief),
+2. Long term: trader-invest `fetch` then `analyse SYM` (it saves
+   trader/invest/SYM.json, which is how the analysis reaches the brief),
    and trader-scanner `longterm` for the swing and relative-strength tags.
 3. Intraday or swing: trader-scanner, and trader-exit for `trader/plan.json`.
 4. trader-news for headlines on the symbol (quote them in the branch input if

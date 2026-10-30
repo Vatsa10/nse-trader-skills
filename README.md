@@ -1,6 +1,6 @@
 # The NSE Day Trader skill
 
-13 Claude skills for NSE trading and long-term investing: scan Nifty 500 charts, time entries and exits, analyse fundamentals, backtest years of data and manage your portfolio before you risk a rupee.
+15 Claude skills for NSE trading and long-term investing: scan Nifty 500 charts, time entries and exits, analyse fundamentals, argue the bull and bear case, backtest years of data, manage your portfolio and see it all on one report before you risk a rupee.
 
 An NSE (India) port and extension of Jake Schincariol's MIT-licensed
 [day-trader-skill](https://github.com/Jakeschincariol/day-trader-skill).
@@ -23,7 +23,7 @@ git clone https://github.com/Vatsa10/nse-trader-skills
 cp -r nse-trader-skills/trader-* ~/.claude/skills/
 ```
 
-## The thirteen
+## The fifteen
 
 **Data**
 
@@ -52,6 +52,13 @@ cp -r nse-trader-skills/trader-* ~/.claude/skills/
 | `/trader-budget` | Budget Manager | Whole-share sizing to your max loss per trade. |
 | `/trader-broker` | Order Executor | Zerodha Kite tickets, three approval gates, contract-note `reconcile`. |
 | `/trader-alerts` | Price Alerts | Price, stop, 09:15 bell and 15:15 flat-by alarms. |
+
+**Decide and review**
+
+| command | job | what it does |
+| --- | --- | --- |
+| `/trader-thesis` | Thesis Panel | For one stock or trade: builds an evidence brief from everything the other skills recorded, has five isolated agents argue it from trading angles (bear analyst, risk manager, FII/DII flows, value-trap hunter, 3am stop-out...), then a critic scores the arguments, flags traps and gives a buy / wait / avoid (or take / skip) verdict with the fact that would change it. Never an order. |
+| `/trader-report` | Report | One self-contained HTML dashboard of everything the skills wrote: market (Nifty P/E, VIX, breadth, FII/DII, option chain, pre-open gaps), sortable scan tables, per-stock charts with levels and stops, thesis, plan, portfolio and backtest. Claude can publish it as a private Artifact page you open and share. |
 
 ## Long-term workflow
 

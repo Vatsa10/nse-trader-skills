@@ -488,6 +488,13 @@ def symbol_block(c, sym, watch, longterm, actions):
         keys = ("price", "pe", "pb", "roe_pct", "roce_pct", "debt_to_equity", "promoter_pct", "div_yield_pct", "sector")
         c.src("symbols", fp, str(fund.get("as_of") or ""))
         parts.append("<h4>Fundamentals (trader-invest fetch)</h4>" + kv_table([(k, fund[k]) for k in keys if k in fund]))
+    ap = os.path.join(c.trader, "invest", sym + ".json")
+    an = c.read_json(ap)
+    if isinstance(an, dict) and "score" in an:
+        c.src("symbols", ap, str(an.get("as_of") or ""))
+        pil = [("%s pillar" % k, (v or {}).get("score")) for k, v in sorted((an.get("pillars") or {}).items())]
+        parts.append("<h4>Long-term scorecard (trader-invest analyse)</h4>" + kv_table(
+            [("score", an.get("score")), ("verdict", an.get("verdict")), ("coverage %", an.get("coverage_pct"))] + pil))
     return "".join(parts)
 
 

@@ -18,7 +18,7 @@ Files read, all optional (trader/ is the parent of --data, default trader/data):
 
   trader/data/daily/<SYM>.adj.csv|.csv      date,open,high,low,close,volume
   trader/data/fundamentals/<SYM>.json       trader-invest fetch
-  trader/invest/<SYM>.json                  invest.py --json analyse SYM > trader/invest/SYM.json
+  trader/invest/<SYM>.json                  invest.py analyse SYM (saved automatically)
   trader/longterm.json, trader/watchlist.json   trader-scanner hits
   trader/data/delivery/<SYM>.csv            date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series
   trader/data/actions.json                  {"symbols":{SYM:{"actions":[{ex_date,kind,factor,dividend}]}}}
@@ -227,7 +227,7 @@ def read_invest(trader_dir, sym):
                     "concerns": doc.get("concerns"), "missing_fields": doc.get("missing_fields"),
                     "data_age": doc.get("data_age"), "cyclical": doc.get("cyclical"), "psu": doc.get("psu")}
             return src("invest_analysis", path, doc.get("as_of"), vals), None
-    return None, "no trader-invest analysis (run: invest.py --json analyse %s > trader/invest/%s.json)" % (sym, sym)
+    return None, "no trader-invest analysis (run: invest.py analyse %s, which saves trader/invest/%s.json)" % (sym, sym)
 
 
 HIT_KEYS = ("setups", "price", "close_date", "vs_200dma_pct", "from_high_pct", "swing_trend", "swing_coc",

@@ -39,6 +39,7 @@ python3 "${CLAUDE_SKILL_DIR}/invest.py" analyse IOC                    # --horiz
 python3 "${CLAUDE_SKILL_DIR}/invest.py" compare IOC BPCL HINDPETRO
 python3 "${CLAUDE_SKILL_DIR}/invest.py" plan IOC --amount 5000 --tranches 3
 python3 "${CLAUDE_SKILL_DIR}/invest.py" --json analyse IOC             # --json works for every command
+# analyse also saves trader/invest/IOC.json (read by trader-thesis and trader-report); --no-save skips it
 ```
 
 ## When to use

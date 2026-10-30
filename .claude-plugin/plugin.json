@@ -1,6 +1,6 @@
 {
   "name": "nse-trader-skill",
-  "description": "13 Claude skills for NSE trading and long-term investing: scan Nifty 500 charts, time entries and exits, analyse fundamentals, backtest years of data and manage your portfolio before you risk a rupee.",
+  "description": "15 Claude skills for NSE trading and long-term investing: scan Nifty 500 charts, time entries and exits, analyse fundamentals, argue the bull and bear case, backtest years of data, manage your portfolio and see it all on one report before you risk a rupee.",
   "version": "4.0.0-nse",
   "author": {
     "name": "Jake Schincariol",
@@ -12,6 +12,8 @@
   "keywords": [
     "backtest",
     "backtesting",
+    "bull-bear-case",
+    "dashboard",
     "claude-code",
     "claude-skills",
     "day-trading",

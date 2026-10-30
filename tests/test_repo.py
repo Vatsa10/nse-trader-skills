@@ -8,13 +8,14 @@ from _load import ROOT
 # v2, the day-trading pack: the eleven folders the reel's repo card shows
 SKILLS = ["trader-scanner", "trader-news", "trader-entry", "trader-exit", "trader-timemachine",
           "trader-risk", "trader-budget", "trader-broker", "trader-alerts", "trader-data",
-          "trader-invest", "trader-backtest", "trader-portfolio"]
-ABOUT = ("13 Claude skills for NSE trading and long-term investing: scan Nifty 500 charts, time entries and exits, "
-         "analyse fundamentals, backtest years of data and manage your portfolio before you risk a rupee.")
+          "trader-invest", "trader-backtest", "trader-portfolio", "trader-thesis", "trader-report"]
+ABOUT = ("15 Claude skills for NSE trading and long-term investing: scan Nifty 500 charts, time entries and exits, "
+         "analyse fundamentals, argue the bull and bear case, backtest years of data, manage your portfolio "
+         "and see it all on one report before you risk a rupee.")
 # skills on the way to an order carry the safety block
 ORDER_PATH = ["trader-scanner", "trader-entry", "trader-exit", "trader-timemachine", "trader-budget",
               "trader-risk", "trader-broker", "trader-alerts",
-              "trader-invest", "trader-portfolio", "trader-backtest"]
+              "trader-invest", "trader-portfolio", "trader-backtest", "trader-thesis", "trader-report"]
 SWING_COPIES = [("trader-scanner", "scan.py"), ("trader-backtest", "backtest.py"),
                 ("trader-invest", "invest.py"), ("trader-exit", "exit.py"),
                 ("trader-timemachine", "timemachine.py")]

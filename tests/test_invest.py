@@ -244,6 +244,16 @@ class Analyse(Base):
         self.assertLess(a["pillars"]["stability"]["score"], 40)
         self.assertTrue(any("next results due by 2026-11-14" in x for x in a["data_age"]))
 
+    def test_analyse_saves_the_analysis_for_thesis_and_report(self):
+        a = self.analyse("IOC")
+        path = os.path.join(self.td, "invest", "IOC.json")
+        with open(path, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        self.assertEqual((saved["score"], saved["verdict"]), (a["score"], a["verdict"]))
+        os.remove(path)
+        self.analyse("IOC", "--no-save")
+        self.assertFalse(os.path.exists(path))
+
     def test_tcs_is_a_quality_compounder(self):
         a = self.analyse("TCS")
         self.assertFalse(a["cyclical"])

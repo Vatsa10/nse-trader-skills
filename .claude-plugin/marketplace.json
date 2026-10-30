@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "nse-trader-skill",
-      "description": "Thirteen Claude skills for NSE: data layer with fallbacks, chart scanner, news, entry timer, exit planner, time machine, risk and budget managers, Zerodha Kite order executor (paper by default, never without your yes), alerts, long-term analyst, multi-year backtester and portfolio manager.",
+      "description": "Fifteen Claude skills for NSE: data layer with fallbacks, chart scanner, news, entry timer, exit planner, time machine, risk and budget managers, Zerodha Kite order executor (paper by default, never without your yes), alerts, long-term analyst, multi-year backtester, portfolio manager, bull and bear thesis panel and an HTML report.",
       "source": "./",
       "category": "productivity"
     }

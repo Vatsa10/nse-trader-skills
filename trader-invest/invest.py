@@ -1534,6 +1534,10 @@ def load_for_analysis(args, symbol, card):
                       delivery_im_days(read_delivery(args.trader_dir, symbol)))
 
 
+def analysis_path(trader_dir, symbol):
+    return os.path.join(trader_dir, "invest", symbol + ".json")
+
+
 def cmd_analyse(args):
     card = load_scorecard(args.trader_dir, args.scorecard)
     _, a = load_for_analysis(args, clean_symbol(args.symbol), card)
@@ -1541,6 +1545,11 @@ def cmd_analyse(args):
         print(json.dumps(a, indent=2, ensure_ascii=False))
     else:
         print_analysis(a)
+    if not args.no_save:
+        # trader-thesis and trader-report read the saved analysis
+        path = analysis_path(args.trader_dir, a["symbol"])
+        write_json(path, a)
+        print("wrote %s" % shown(path), file=sys.stderr if args.json else sys.stdout)
     return 0
 
 
@@ -1611,6 +1620,8 @@ def build_parser():
         a.add_argument("--horizon", default="5y")
         a.add_argument("--gsec", type=float, help="10y G-sec yield %% (default from the scorecard, 6.5)")
         a.add_argument("--scorecard", help="scorecard JSON (default trader/scorecard.json over the example)")
+        a.add_argument("--no-save", action="store_true",
+                       help="do not write trader/invest/<SYM>.json (read by trader-thesis and trader-report)")
 
     c = sub.add_parser("compare", help="side by side")
     common(c)
