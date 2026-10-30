@@ -648,6 +648,12 @@ def section_news(c):
             ["symbol", "date", "purpose", "sessions away", "soon"],
             [[e.get("ticker"), e.get("date"), e.get("purpose"), e.get("sessions_away"), "yes" if e.get("soon") else ""]
              for e in cal], False))
+    deals = [d for d in doc.get("deal_flow") or [] if isinstance(d, dict)]
+    if deals:
+        out.append("<h3>Bulk, block and short deals (net by client)</h3>" + data_table(
+            ["symbol", "client", "bought", "sold", "net", "% of 20-day avg volume"],
+            [[d.get("symbol"), d.get("client"), numcell(d.get("bought"), 0), numcell(d.get("sold"), 0),
+              numcell(d.get("net"), 0), numcell(d.get("pct_of_avg_volume"))] for d in deals]))
     fl = doc.get("flows")
     if isinstance(fl, dict) and fl:
         out.append("<h3>FII/DII (Rs crore)</h3>" + kv_table([(k, v) for k, v in fl.items() if not isinstance(v, (dict, list))]))

@@ -150,6 +150,8 @@ class Base(unittest.TestCase):
              "calendar": [{"ticker": "RELIANCE", "date": "2026-10-30", "purpose": "Financial Results",
                            "sessions_away": 0, "soon": True}],
              "moves": [{"ticker": "RELIANCE", "price": 1160.8, "pct": -0.57, "moving": False}],
+             "deal_flow": [{"symbol": "RELIANCE", "client": "SOME FUND LLP", "bought": 2040212, "sold": 0, "net": 2040212,
+                            "pct_of_avg_volume": 13.44}],
              "items": [{"ticker": "TCS", "source": "Google News", "title": "TCS jumps <b>", "link": "https://example.com/a",
                         "time": "2026-10-29T03:50:00+00:00", "tags": ["macro"]}], "flows": {}, "notes": []}))
         w(os.path.join(self.data, "pattern-study.json"), json.dumps(
@@ -177,6 +179,7 @@ class Build(Base):
         self.assertNotIn("Not available", page)
         self.assertIn("Results soon (gap risk):</b> RELIANCE", page)
         self.assertIn("TCS jumps &lt;b&gt;", page)                  # headlines escaped
+        self.assertIn("SOME FUND LLP", page)
         self.assertIn('href="https://example.com/a"', page)
         self.assertIn("out-of-sample", page.replace("in-sample", ""))   # the study's split is explained
         self.assertIn("Entry signal (trader-entry)", page)

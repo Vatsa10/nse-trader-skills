@@ -537,6 +537,57 @@ def parse_rss(data, ticker, source="Yahoo Finance"):
     return out
 
 
+SHORT_SYMBOL = 4         # a symbol this short can be an everyday acronym (TCS, ITC, LT, IOC)
+INDIA_WORDS = re.compile(r"(?i)\b(?:india|indian|nse|bse|sensex|nifty|sebi|crore|lakh|mumbai|rs|inr)\b|₹")
+_NAMES = None
+
+
+def company_names():
+    """{SYMBOL: company name} from trader/universe.txt (trader-scanner universe) or the scanner's bundled Nifty 500
+    snapshot next to this skill; {} when neither is there."""
+    global _NAMES
+    if _NAMES is not None:
+        return _NAMES
+    names = {}
+    snap = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trader-scanner",
+                        "nifty500-snapshot.csv")
+    try:
+        with open(snap, encoding="utf-8", newline="") as fh:
+            for r in csv.DictReader(fh):
+                if r.get("Symbol") and r.get("Company Name"):
+                    names[r["Symbol"].strip().upper()] = r["Company Name"].strip()
+    except OSError:
+        pass
+    try:
+        with open(os.path.join("trader", "universe.txt"), encoding="utf-8") as fh:
+            for line in fh:
+                sym, _, name = line.strip().partition("|")
+                if sym and name:
+                    names[sym.strip().upper()] = name.strip()
+    except OSError:
+        pass
+    _NAMES = names
+    return names
+
+
+def about_company(item, name=None):
+    """Is a symbol feed's headline about this listed company? Yahoo's SYMBOL.NS feed for a short symbol that is also a
+    common acronym carries stories that only share the letters (seen live: a US horse-racing "TCS" series under
+    TCS.NS). A long symbol (RELIANCE, HINDCOPPER) does not collide, so its feed is kept whole. For a symbol of 4
+    letters or fewer a headline stays when it names the company, has an Indian-market word or says SYMBOL.NS."""
+    sym = item.get("ticker") or ""
+    if len(sym) > SHORT_SYMBOL:
+        return True
+    text = "%s %s" % (item.get("title") or "", re.sub(r"<[^>]+>", " ", item.get("summary") or ""))
+    low = text.lower()
+    if name:
+        core = re.sub(r"(?i)[\s.,]+(?:limited|ltd\.?)\s*$", "", name).strip().lower()
+        words = core.split()
+        if core and (core in low or (len(words) > 2 and " ".join(words[:2]) in low)):
+            return True
+    return bool(INDIA_WORDS.search(text)) or (sym + ".NS") in text
+
+
 def parse_chart(data, ticker):
     """Yahoo chart JSON -> {"ticker", "price", "prev_close", "pct", "time"} or raise."""
     try:
@@ -1022,11 +1073,15 @@ def collect(fetcher, watch, state, google=True, errors=None, nse=False):
     """Headlines per symbol. When every headline feed fails for a symbol (or with nse=True),
     NSE's corporate announcements; when NSE fails too, the pages to open by hand."""
     errors = [] if errors is None else errors
-    items = []
+    items, off_topic = [], 0
     for t in sorted(watch):
         ok = False
         try:
-            items += parse_rss(fetcher.get(YAHOO % yahoo_symbol(t), "yahoo-%s.xml" % t), t)
+            got = parse_rss(fetcher.get(YAHOO % yahoo_symbol(t), "yahoo-%s.xml" % t), t)
+            name = watch.get(t) or company_names().get(t)
+            keep = [i for i in got if about_company(i, name)]
+            off_topic += len(got) - len(keep)
+            items += keep
             ok = True
         except NewsError as exc:
             errors.append("Yahoo headlines for %s: %s" % (t, exc))
@@ -1046,6 +1101,9 @@ def collect(fetcher, watch, state, google=True, errors=None, nse=False):
             if fetcher.offline and "no file" in str(exc):
                 continue
             errors.append("NSE announcements for %s: %s; %s" % (t, exc, manual_links(t)))
+    if off_topic:
+        errors.append("%d Yahoo headline(s) left out as not about the company (a short symbol's "
+                      "letters, with no company name and no Indian-market word)" % off_topic)
     return items
 
 

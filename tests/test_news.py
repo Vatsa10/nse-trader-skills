@@ -28,6 +28,30 @@ def run(args):
     return code, out.getvalue(), err.getvalue()
 
 
+class OnTopic(unittest.TestCase):
+    """Yahoo's TCS.NS feed carried a US horse-racing "Thoroughbred Championship Series (TCS)" story, live."""
+
+    def item(self, ticker, title, summary=""):
+        return {"ticker": ticker, "title": title, "summary": summary}
+
+    def test_a_short_symbol_needs_the_company_or_an_indian_market_word(self):
+        horse = self.item("TCS", "Thoroughbred Championship Series Expands to Include Oaks Division",
+                          "Churchill Downs (Nasdaq: CHDN) announced the expansion of the TCS in 2027.")
+        self.assertFalse(news.about_company(horse, "Tata Consultancy Services Ltd."))
+        self.assertTrue(news.about_company(self.item("TCS", "Tata Consultancy Services wins a deal"),
+                                           "Tata Consultancy Services Ltd."))
+        self.assertTrue(news.about_company(self.item("TCS", "TCS shares rise 2% on the NSE")))
+        self.assertTrue(news.about_company(self.item("IOC", "Fuel retailers see Rs 5,000 crore hit")))
+        self.assertTrue(news.about_company(self.item("TCS", "Quarterly view", "Coverage of TCS.NS")))
+
+    def test_a_long_symbol_keeps_its_whole_feed(self):
+        # RELIANCE or HINDCOPPER do not collide with everyday words: sector stories stay
+        self.assertTrue(news.about_company(self.item("HINDCOPPER", "Copper hits a three-month high on China demand")))
+
+    def test_names_come_from_the_bundled_snapshot(self):
+        self.assertEqual(news.company_names().get("TCS"), "Tata Consultancy Services Ltd.")
+
+
 class Feeds(unittest.TestCase):
     def test_yahoo_rss(self):
         items = news.parse_rss(raw("yahoo-RELIANCE.xml"), "RELIANCE")
