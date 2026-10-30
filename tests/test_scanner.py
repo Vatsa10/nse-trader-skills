@@ -2018,6 +2018,22 @@ class IntradayPatterns(unittest.TestCase):
         tight = [105, 104, 103, 102, 101, 100, 101, 102, 103, 102, 101, 100.5, 100, 101, 102, 103, 103, 103]
         self.assertIsNone(self.one(tight, "double_bottom"))
 
+    def test_a_few_missing_bars_are_filled_flat(self):
+        # Yahoo drops a 5-minute bar now and then (live: 1 to 3 of 68 by 14:55); one gap used to drop the chart
+        bars = ibars(I_DB, "10:45", 0.5)
+        day = bars[0]["start"].date()
+        cutoff = bars[-1]["start"] + datetime.timedelta(minutes=5)
+        gappy = bars[:6] + bars[7:]
+        full, n = scan.fill_gaps(gappy, day, cutoff, 1)
+        self.assertEqual((len(full), n), (len(bars), 1))
+        f = full[6]
+        self.assertTrue(f["filled"])
+        self.assertEqual((f["h"], f["l"], f["c"], f["v"]), (bars[5]["c"],) * 3 + (0,))   # flat: no new pivot
+        self.assertEqual(scan.fill_gaps(bars[:6] + bars[8:], day, cutoff, 1), (None, 2))   # more than allowed
+        self.assertEqual(scan.fill_gaps(bars[1:], day, cutoff, 3), (None, 1))             # the 09:15 bar is needed
+        self.assertEqual(self.one(I_DB, "double_bottom")["level"],
+                         [h for h in scan.intraday_hits(full) if h["pattern"] == "intraday_double_bottom"][0]["level"])
+
     def test_broken_out_is_the_breakout_state(self):
         h = self.one(I_DB[:-1] + [105.0], "double_bottom")
         self.assertEqual(h["state"], "breakout")

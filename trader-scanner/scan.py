@@ -1065,6 +1065,30 @@ def usable(bars, day, cutoff, n_range):
     return all(b["start"] == slot(day, k) for k, b in enumerate(bars))
 
 
+def fill_gaps(bars, day, cutoff, max_missing):
+    """For the intraday patterns: Yahoo's 5-minute series routinely drop a bar or three mid-session (seen
+    live: 7 of 10 large caps), and one gap failed `usable` for the whole chart. A missing slot becomes a flat
+    bar at the previous close with no volume, which can make no new pivot. -> (bars, filled) or (None, missing)
+    when more than max_missing slots, or the first one, are absent."""
+    want = int((cutoff - slot(day, 0)).total_seconds() // (BAR_MIN * 60))
+    s = session(day)
+    if s:
+        want = min(want, int((datetime.datetime.combine(day, s[1]) - slot(day, 0)).total_seconds()
+                             // (BAR_MIN * 60)))
+    have = {b["start"]: b for b in bars}
+    missing = [k for k in range(want) if slot(day, k) not in have]
+    if not want or 0 in missing or len(missing) > max_missing:
+        return None, len(missing)
+    out = []
+    for k in range(want):
+        b = have.get(slot(day, k))
+        if b is None:
+            c = out[-1]["c"]
+            b = {"start": slot(day, k), "c": c, "h": c, "l": c, "v": 0, "filled": True}
+        out.append(b)
+    return out, len(missing)
+
+
 def orb_candidate(bars, n_range):
     """Stage 1, closes only: some completed bar after the range closed at or above
     the highest close of the range. Necessary for a breakout (range high >= any range close)."""
@@ -1615,6 +1639,7 @@ def carry_first_seen(hits, previous):
 # ones with the intraday parameters from the stock-pattern notes (pivots 3 + 3, bars not days). A bar's high and low
 # are real (stage 2 charts), the session so far is the whole look-back.
 INTRA_MIN_BARS = 12         # the flag looks at the last 12 bars; before 10:15 there is nothing to read
+INTRA_MAX_GAPS = 0.05       # up to 5% of the session's 5-minute bars may be missing and filled flat (ours)
 INTRA = {
     "L": 3, "R": 3,
     "db_gap": (8, 60), "db_rebound_u": 0.0, "db_rebound_pct": 0.8,   # lows 8 to 60 bars apart, rebound >= 0.8 % (repo)
@@ -1692,15 +1717,22 @@ def scan_intraday_patterns(stage1, symbols, day, cutoff, min_price=0.0, min_volu
     """stage1 = {SYM: series}; confirm(sym) -> a series with real highs and lows (None = stage 1 has them). With
     max_confirm only the most traded (price x volume so far) are read. Returns (hits, counts, failed {sym: why})."""
     counts = {"requested": len(symbols), "fetched": 0, "unusable": 0, "illiquid": 0, "scanned": 0,
-              "confirmed": 0, "unconfirmed": 0}
+              "confirmed": 0, "unconfirmed": 0, "gaps_filled": 0}
     hits, failed, cands = [], {}, []
+
+    def whole(bars):
+        if len(bars) < INTRA_MIN_BARS:
+            return None, 0
+        n = int((cutoff - slot(day, 0)).total_seconds() // (BAR_MIN * 60))
+        return fill_gaps(bars, day, cutoff, max(1, int(n * INTRA_MAX_GAPS)))
+
     for sym in symbols:
         s = stage1.get(sym)
         if not s:
             continue
         counts["fetched"] += 1
-        bars = session_bars(s, day, cutoff)
-        if not usable(bars, day, cutoff, INTRA_MIN_BARS):
+        bars, _ = whole(session_bars(s, day, cutoff))
+        if bars is None:
             counts["unusable"] += 1
             continue
         vol = sum(b["v"] for b in bars) if s.get("v") else (s.get("meta") or {}).get("regularMarketVolume") or 0
@@ -1721,10 +1753,12 @@ def scan_intraday_patterns(stage1, symbols, day, cutoff, min_price=0.0, min_volu
             except ScanError as e:
                 failed[sym] = str(e)
                 continue
-            full = session_bars(s2, day, cutoff)
-            if not usable(full, day, cutoff, INTRA_MIN_BARS):
-                failed[sym] = "the v8 chart has a missing bar"
+            full, gaps = whole(session_bars(s2, day, cutoff))
+            if full is None:
+                failed[sym] = "the v8 chart misses %d bars (more than %d%% of the session, or the first)" % (
+                    gaps, int(INTRA_MAX_GAPS * 100))
                 continue
+            counts["gaps_filled"] += gaps
         counts["confirmed"] += 1
         for h in intraday_hits(full, only, state):
             hits.append(dict({"symbol": sym}, **h))
@@ -2978,12 +3012,14 @@ def cmd_patterns_intraday(a):
         print(flows_text)
     if po and preopen_line(po):
         print(preopen_line(po))
-    print("Fetched %s of %s charts%s; %s usable%s; %s read with real highs and lows."
+    print("Fetched %s of %s charts%s; %s usable%s%s; %s read with real highs and lows%s."
           % (indian(counts["fetched"]), indian(len(symbols)),
              (" (%s failed or had no data)" % indian(nfailed)) if nfailed else "",
              indian(counts["scanned"]),
              (" (%s under the price / volume floor)" % indian(counts["illiquid"])) if counts["illiquid"] else "",
-             indian(counts["confirmed"])))
+             (" (%s missed too many 5-minute bars)" % indian(counts["unusable"])) if counts["unusable"] else "",
+             indian(counts["confirmed"]),
+             (" (%s missing bar(s) filled flat)" % indian(counts["gaps_filled"])) if counts.get("gaps_filled") else ""))
     if calendar_note(day):
         print(calendar_note(day) + ".")
     if counts["unconfirmed"]:
