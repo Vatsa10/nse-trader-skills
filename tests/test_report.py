@@ -18,7 +18,9 @@ VOID = {"meta", "link", "input", "br", "hr", "img", "col", "line"}
 
 
 class Check(HTMLParser):
-    """Collects tags, flags unbalanced non-void tags and any external reference."""
+    """Collects tags, flags unbalanced non-void tags and any external resource the page would load (a script,
+    style, image, frame or font). A plain <a href> to a news story is navigation, not a load, and is allowed only
+    when it opens safely (rel=noopener)."""
 
     def __init__(self):
         HTMLParser.__init__(self)
@@ -28,6 +30,8 @@ class Check(HTMLParser):
         d = dict(attrs)
         for k in ("src", "href"):
             if re.match(r"(?i)\s*(https?:)?//", d.get(k) or ""):
+                if tag == "a" and "noopener" in (d.get("rel") or ""):
+                    continue
                 self.external.append((tag, d[k]))
         if tag == "script":
             self.scripts += 1
@@ -141,6 +145,25 @@ class Base(unittest.TestCase):
              "tax": False, "generated": "2026-10-29T10:00:00+05:30",
              "metrics": {"start": "2020-01-01", "end": "2026-10-29", "cagr": 0.1234, "max_drawdown": -0.3, "sharpe": 0.8}}))
         w(os.path.join(bt, "report.html"), "<html></html>")
+        w(os.path.join(self.trader, "news.json"), json.dumps(
+            {"checked": "2026-10-30T09:00:00+00:00", "results_soon": ["RELIANCE"],
+             "calendar": [{"ticker": "RELIANCE", "date": "2026-10-30", "purpose": "Financial Results",
+                           "sessions_away": 0, "soon": True}],
+             "moves": [{"ticker": "RELIANCE", "price": 1160.8, "pct": -0.57, "moving": False}],
+             "items": [{"ticker": "TCS", "source": "Google News", "title": "TCS jumps <b>", "link": "https://example.com/a",
+                        "time": "2026-10-29T03:50:00+00:00", "tags": ["macro"]}], "flows": {}, "notes": []}))
+        w(os.path.join(self.data, "pattern-study.json"), json.dumps(
+            {"mode": "pattern-study", "symbols": 500, "split_date": "2025-08-08", "options": {"horizon": 40, "cost_pct": 0.25},
+             "patterns": {"double_bottom": {"in": {"trades": 94, "win_pct": 54.3, "exp_r": -0.004, "se_r": 0.07, "pf": 1.0,
+                                                   "control_r": -0.02, "lift_r": 0.02, "median_risk_pct": 16.4,
+                                                   "exits": {"target": 43, "stop": 23, "time": 28}}}},
+             "note": "A study of history, not a forecast."}))
+        w(os.path.join(self.trader, "entry.json"), json.dumps(
+            {"symbol": "RELIANCE", "setup": "orb", "status": "triggered", "time": "09:45", "price": 1452.3,
+             "date": "2026-10-19"}))
+        w(os.path.join(self.trader, "timemachine.json"), json.dumps(
+            {"date": "2026-10-19", "verdict": "Coin flip: no edge after costs.",
+             "mc": {"replays": 10000, "p_target": 0.41, "p_stop": 0.44, "p_neither": 0.15, "avg_R": -0.02}}))
 
 
 class Build(Base):
@@ -149,9 +172,15 @@ class Build(Base):
         code, page = self.build("--symbol", "M&M")
         self.assertEqual(code, 0)
         self.assert_valid(page)
-        for k in ("market", "scans", "symbols", "thesis", "plan", "portfolio", "backtest"):
+        for k in ("market", "news", "scans", "study", "symbols", "thesis", "plan", "portfolio", "backtest"):
             self.assertIn('<section data-tab="%s"' % k, page)
         self.assertNotIn("Not available", page)
+        self.assertIn("Results soon (gap risk):</b> RELIANCE", page)
+        self.assertIn("TCS jumps &lt;b&gt;", page)                  # headlines escaped
+        self.assertIn('href="https://example.com/a"', page)
+        self.assertIn("out-of-sample", page.replace("in-sample", ""))   # the study's split is explained
+        self.assertIn("Entry signal (trader-entry)", page)
+        self.assertIn("Coin flip: no edge after costs.", page)
         # numbers match the inputs
         self.assertIn("25302.75", page)
         self.assertIn("+0.61% on 2026-10-28", page)          # 25302.75 / 25150.25 - 1
@@ -216,9 +245,13 @@ class Build(Base):
         self.assertIn('<section data-tab="market"', page)
         self.assertNotIn('<section data-tab="scans"', page)
         self.assertIn('<section data-tab="portfolio"', page)
+        w(os.path.join(self.trader, "orders.json"), json.dumps(
+            {"status": "proposal", "orders": [{"symbol": "ORDERSYM", "side": "BUY", "qty": 7}]}))
         code, page = self.build("--public")
-        self.assertNotIn("INFY", page)
-        self.assertNotIn("1452.3", page)
+        self.assertNotIn("INFY", page)                        # holdings: money, left out
+        self.assertNotIn("ORDERSYM", page)                    # proposed orders: left out
+        self.assertIn("1452.3", page)                         # the trade plan itself is not private
+        self.assertIn("Left out on purpose (--public): proposed orders and risk verdicts", page)
         self.assertIn("Left out on purpose", page)
         self.assertEqual(run(["build", "--sections", "nope", "--out", self.out])[0], 2)
 

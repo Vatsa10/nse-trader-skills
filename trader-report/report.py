@@ -4,7 +4,7 @@
     python3 report.py build                                  # trader/report.html from whatever the other skills wrote
     python3 report.py build --symbol RELIANCE --symbol "M&M" # add a per-symbol page section
     python3 report.py build --sections market,scans --title "Morning" --out morning.html
-    python3 report.py build --public                         # leave out holdings, plan, orders and risk verdicts
+    python3 report.py build --public                         # leave out holdings, proposed orders and risk verdicts
 
 Reads (all optional, all under the project's trader/ folder):
   trader/data/index/nifty-50.csv, india-vix.csv   date,open,high,low,close,volume,pe,pb,div_yield (trader-data index)
@@ -60,10 +60,10 @@ PE_CHEAP = 20.0
 W, H = 640, 200
 ML, MR, MT, MB = 46, 12, 16, 24
 
-ALL_SECTIONS = ["market", "scans", "symbols", "thesis", "plan", "portfolio", "backtest"]
-TITLES = {"market": "Market", "scans": "Scans", "symbols": "Symbols", "thesis": "Thesis",
-          "plan": "Plan and risk", "portfolio": "Portfolio", "backtest": "Backtest"}
-PRIVATE = ("plan", "portfolio")
+ALL_SECTIONS = ["market", "news", "scans", "study", "symbols", "thesis", "plan", "portfolio", "backtest"]
+TITLES = {"market": "Market", "news": "News", "scans": "Scans", "study": "Pattern study", "symbols": "Symbols",
+          "thesis": "Thesis", "plan": "Plan and risk", "portfolio": "Portfolio", "backtest": "Backtest"}
+PRIVATE = ("portfolio",)   # whole sections; --public also drops orders and risk verdicts from Plan
 
 esc = html.escape
 
@@ -587,7 +587,7 @@ def section_plan(c):
             pairs += [("qty used for costs", cost.get("qty")), ("charges at stop", cost.get("at_stop")), ("charges at target", cost.get("at_target"))]
         out.append("<h3>Trade plan</h3>" + kv_table(pairs))
     rp = os.path.join(c.trader, "state", "risk.json")
-    risk = c.read_json(rp)
+    risk = None if c.public else c.read_json(rp)
     if isinstance(risk, dict) and isinstance(risk.get("results"), list):
         ran = True
         c.src("plan", rp, str(risk.get("checked_at") or risk.get("date") or ""))
@@ -597,7 +597,9 @@ def section_plan(c):
                               [[r.get("symbol"), r.get("side"), r.get("amount"), r.get("verdict"), numcell(r.get("max_loss")),
                                 "; ".join(str(x) for x in (r.get("reasons") or []))] for r in risk["results"] if isinstance(r, dict)]))
     op = os.path.join(c.trader, "orders.json")
-    orders = c.read_json(op)
+    orders = None if c.public else c.read_json(op)
+    if c.public and (os.path.exists(rp) or os.path.exists(op)):
+        out.append("<p class=\"note\">Left out on purpose (--public): proposed orders and risk verdicts.</p>")
     if isinstance(orders, dict) and isinstance(orders.get("orders"), list):
         ran = True
         c.src("plan", op, str(orders.get("created") or orders.get("created_at") or ""))
@@ -606,10 +608,103 @@ def section_plan(c):
                               [[o.get("symbol"), o.get("side"), o.get("qty"), o.get("product"), o.get("type"),
                                 o.get("stop_loss_stop_price"), o.get("take_profit_limit_price")]
                                for o in orders["orders"] if isinstance(o, dict)]))
+    ep = os.path.join(c.trader, "entry.json")
+    entry = c.read_json(ep)
+    if isinstance(entry, dict) and entry.get("symbol"):
+        ran = True
+        c.src("plan", ep, str(entry.get("date") or entry.get("now") or ""))
+        keys = ("symbol", "setup", "status", "time", "price", "level", "or_high", "or_low", "date")
+        out.insert(0, "<h3>Entry signal (trader-entry)</h3>" + kv_table([(k, entry[k]) for k in keys if k in entry]))
+    tp = os.path.join(c.trader, "timemachine.json")
+    tm = c.read_json(tp)
+    if isinstance(tm, dict) and isinstance(tm.get("mc"), dict):
+        ran = True
+        mc = tm["mc"]
+        c.src("plan", tp, str(tm.get("date") or tm.get("created_at") or ""))
+        pairs = [("target first", mc.get("p_target")), ("stop first", mc.get("p_stop")),
+                 ("neither by flat-by", mc.get("p_neither")), ("average R", mc.get("avg_R")), ("verdict", tm.get("verdict"))]
+        out.append("<h3>Time machine (%s replays)</h3>" % esc(fmt(mc.get("replays") or tm.get("replays") or "")) +
+                   kv_table([(k, v) for k, v in pairs if v is not None]))
     if not ran:
         raise Missing(["python3 trader-exit/exit.py plan ... --write", "python3 trader-budget/size.py --write",
                        "python3 trader-risk/check.py"])
     return "".join(out)
+
+
+def section_news(c):
+    """The last trader-news briefing (trader/news.json): results soon, the board calendar, deals, moves, headlines."""
+    p = os.path.join(c.trader, "news.json")
+    doc = c.read_json(p)
+    if not isinstance(doc, dict):
+        raise Missing(["python3 trader-news/news.py (saves trader/news.json)"])
+    c.src("news", p, str(doc.get("checked") or ""))
+    out = []
+    soon = doc.get("results_soon") or []
+    if soon:
+        out.append('<p class="warn"><b>Results soon (gap risk):</b> %s</p>' % esc(", ".join(soon)))
+    cal = [e for e in doc.get("calendar") or [] if isinstance(e, dict)]
+    if cal:
+        out.append("<h3>Board meetings</h3>" + data_table(
+            ["symbol", "date", "purpose", "sessions away", "soon"],
+            [[e.get("ticker"), e.get("date"), e.get("purpose"), e.get("sessions_away"), "yes" if e.get("soon") else ""]
+             for e in cal], False))
+    fl = doc.get("flows")
+    if isinstance(fl, dict) and fl:
+        out.append("<h3>FII/DII (Rs crore)</h3>" + kv_table([(k, v) for k, v in fl.items() if not isinstance(v, (dict, list))]))
+    moves = [m for m in doc.get("moves") or [] if isinstance(m, dict)]
+    if moves:
+        out.append("<h3>Moves vs yesterday's close</h3>" + data_table(
+            ["symbol", "price", "change %", "moving"],
+            [[m.get("ticker"), numcell(m.get("price")), numcell(m.get("pct")), "yes" if m.get("moving") else ""]
+             for m in moves]))
+    items = [i for i in doc.get("items") or [] if isinstance(i, dict)]
+    if items:
+        rows = []
+        for i in items[:60]:
+            link = i.get("link") or ""
+            title = esc(str(i.get("title") or ""))
+            if link.startswith(("https://", "http://")):
+                title = '<a href="%s" rel="noopener noreferrer" target="_blank">%s</a>' % (esc(link, quote=True), title)
+            rows.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                esc(str(i.get("time") or i.get("published") or "")), esc(str(i.get("ticker") or "")),
+                esc(str(i.get("source") or "")), title, esc(", ".join(i.get("tags") or []))))
+        out.append('<h3>Headlines (%d)</h3><input class="flt" placeholder="filter headlines" aria-label="filter headlines">'
+                   '<table class="sortable"><thead><tr><th>time</th><th>symbol</th><th>source</th><th>headline</th>'
+                   '<th>tags</th></tr></thead><tbody>%s</tbody></table>' % (len(items), "".join(rows)))
+    notes = [n for n in doc.get("notes") or [] if isinstance(n, str)]
+    if notes:
+        out.append("<h3>Notes</h3><ul>%s</ul>" % "".join("<li>%s</li>" % esc(n) for n in notes))
+    return "".join(out) or "<p>Nothing new in the last briefing.</p>"
+
+
+def section_study(c):
+    """trader-scanner patterns --study (trader/data/pattern-study.json): how each pattern did in history."""
+    p = os.path.join(c.data, "pattern-study.json")
+    doc = c.read_json(p)
+    if not isinstance(doc, dict) or not isinstance(doc.get("patterns"), dict):
+        raise Missing(["python3 trader-scanner/scan.py patterns --study"])
+    c.src("study", p, str(doc.get("split_date") or ""))
+    rows = []
+    for pat, segs in doc["patterns"].items():
+        for seg in ("in", "out", "all"):
+            s = (segs or {}).get(seg)
+            if isinstance(s, dict):
+                ex = s.get("exits") or {}
+                rows.append([pat, {"in": "in-sample", "out": "out-of-sample", "all": "all"}[seg], s.get("trades"),
+                             numcell(s.get("win_pct")), numcell(s.get("exp_r")), numcell(s.get("se_r")),
+                             numcell(s.get("pf")), numcell(s.get("control_r")), numcell(s.get("lift_r")),
+                             numcell(s.get("median_risk_pct")),
+                             "%s/%s/%s" % (ex.get("target", 0), ex.get("stop", 0), ex.get("time", 0))])
+    opts = doc.get("options") or {}
+    head = ('<p class="src">%s stocks; buy the next open after a close over the level; out at the stop, the target or '
+            '%s sessions; %s%% costs. Split at %s: tune on in-sample, judge on out-of-sample. Expectancy in R '
+            '(1 R = entry - stop); lift is over random entries with the same risk.</p>' % (
+                esc(fmt(doc.get("symbols"))), esc(fmt(opts.get("horizon"))), esc(fmt(opts.get("cost_pct"))),
+                esc(str(doc.get("split_date") or "?"))))
+    if doc.get("params"):
+        head += '<p class="src">Overrides: %s</p>' % esc(json.dumps(doc["params"]))
+    return head + data_table(["pattern", "segment", "trades", "win %", "expect R", "+/- SE", "PF", "random R", "lift R",
+                              "median risk %", "target/stop/time"], rows) + '<p class="src">%s</p>' % esc(doc.get("note") or "")
 
 
 def section_portfolio(c):
@@ -682,8 +777,9 @@ def rel_link(target, out_dir):
         return target.replace(os.sep, "/")
 
 
-BUILDERS = {"market": section_market, "scans": section_scans, "symbols": section_symbols, "thesis": section_thesis,
-            "plan": section_plan, "portfolio": section_portfolio, "backtest": section_backtest}
+BUILDERS = {"market": section_market, "news": section_news, "scans": section_scans, "study": section_study,
+            "symbols": section_symbols, "thesis": section_thesis, "plan": section_plan, "portfolio": section_portfolio,
+            "backtest": section_backtest}
 
 
 # ---------------------------------------------------------------- page
@@ -700,7 +796,7 @@ section{padding:12px 0 18px;border-top:1px solid var(--line)}
 .card span,.card small{display:block;color:var(--mut);font-size:12px}.card b{font-size:20px;font-variant-numeric:tabular-nums}
 table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
 th{color:var(--mut);font-weight:500}table.sortable th{cursor:pointer}table.kv th{width:36%}.wrap{overflow-x:auto}
-.flt{width:100%;box-sizing:border-box;margin:6px 0;padding:6px 8px;font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px}
+.warn{color:var(--s3)}.flt{width:100%;box-sizing:border-box;margin:6px 0;padding:6px 8px;font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px}
 figure{margin:12px 0}figcaption{font-weight:600}svg{width:100%;height:auto;display:block;margin:6px 0}
 svg .a{fill:var(--mut);font-size:11px}svg .g{stroke:var(--line)}svg .m{stroke:var(--mut);stroke-dasharray:4 4}svg .m.s2{stroke:var(--s2)}svg .m.s3{stroke:var(--s3)}svg .m.band{stroke:var(--band)}
 svg .ln{stroke-width:1.6;fill:none}svg .ln.s1{stroke:var(--s1)}svg .ln.s2{stroke:var(--s2)}svg .ln.s3{stroke:var(--s3)}svg rect.s1{stroke:var(--s1);fill:var(--s1)}svg rect.s2{stroke:var(--s2);fill:var(--s2)}svg rect.s3{stroke:var(--s3);fill:var(--s3)}
@@ -795,7 +891,7 @@ def main(argv=None):
     b.add_argument("--title", default="NSE trader report")
     b.add_argument("--sections", help="comma list from: " + ", ".join(ALL_SECTIONS))
     b.add_argument("--symbol", action="append", help="add a per-symbol section (repeatable)")
-    b.add_argument("--public", action="store_true", help="leave out holdings, plan, orders and risk verdicts")
+    b.add_argument("--public", action="store_true", help="leave out holdings, proposed orders and risk verdicts")
     a = ap.parse_args(argv)
     if a.cmd != "build":
         ap.print_help()

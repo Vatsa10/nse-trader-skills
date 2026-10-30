@@ -102,12 +102,16 @@ this week on my holdings?".
   skills recorded into one brief, has five isolated agents argue it (bear
   analyst, risk manager, FII/DII flows, value-trap hunter, 3am stop-out...),
   and ends with a verdict and the one fact that would change it.
-- **Interactive reports:** `/trader-report` builds `trader/report.html`, one
-  self-contained page with charts and sortable, filterable tables. Where
-  Claude has the Artifact tool (Claude Code, claude.ai) ask it to publish
-  the report: you get a private claude.ai page you can open on any device
-  and share from its Share menu, and rebuilding updates the same page.
-  `--public` leaves out holdings, plans and orders for a page you hand around.
+- **Answers come back as an interactive page:** with `"output": "html"` in
+  `trader/config.json` (the default), every skill ends by rebuilding the
+  sections it fills of `trader/report.html` (market, news, scans, pattern
+  study, symbols, thesis, plan, portfolio, backtest) and Claude publishes it
+  as an Artifact: a private claude.ai page with charts and sortable,
+  filterable tables that you can open on any device and share from its Share
+  menu. It is always the same page, so it stays one living dashboard, and the
+  chat reply is just the headline and the link. `"output": "text"` keeps
+  answers in the chat. `--public` leaves out holdings, proposed orders and
+  risk verdicts; they go on a published page only after you say yes.
 - **Other skills:** Claude Code loads every installed skill side by side.
   The general [adhd](https://github.com/UditAkhourii/adhd) brainstorming
   skill (MIT, whose method trader-thesis adapts) suits open strategy

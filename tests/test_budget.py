@@ -27,6 +27,7 @@ CONTRACT_CFG = {
     "no_entries_before": "09:30", "no_entries_after": "15:00", "no_mis_after": "15:00", "flat_by": "15:15",
     "default_product": "MIS", "broker": "zerodha", "paper": True, "blocked": [],
     "allow_mis_leverage": False, "allow_short": False,
+    "output": "html",     # how results reach the user in Claude: the interactive trader-report page, or "text"
 }
 SPLIT = {"budget": 10000, "cash_buffer_pct": 10, "max_position_pct": 50, "min_order_inr": 500, "paper": True,
          "blocked": []}

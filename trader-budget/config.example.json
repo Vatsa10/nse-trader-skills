@@ -19,5 +19,6 @@
   "paper": true,
   "blocked": [],
   "allow_mis_leverage": false,
-  "allow_short": false
+  "allow_short": false,
+  "output": "html"
 }

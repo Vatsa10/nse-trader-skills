@@ -43,8 +43,8 @@ python3 "${CLAUDE_SKILL_DIR}/report.py" build --public
 
 Defaults: `--data trader/data`, `--trader trader`, `--out trader/report.html`.
 `--symbol` is repeatable and adds a per-symbol section. `--public` leaves out
-the portfolio, the plan, the orders and the risk verdicts so the page is safe
-to hand around. Exit code 0 even when nothing is there: an empty tree gives a
+the portfolio, the proposed orders and the risk verdicts (the trade plan stays) so
+the page is safe to hand around. Exit code 0 even when nothing is there: an empty tree gives a
 valid page whose footer lists what to run.
 
 ## Sections: what each needs and who fills it
@@ -107,3 +107,36 @@ section shows its source file and as-of date, and the footer lists them all.
   stay on the user's machine unless the user says yes to publishing them.
 - Nothing here places an order. Any real order goes through trader-risk and
   trader-broker and needs the user's explicit yes for that one order.
+
+<!-- html output: keep byte-identical in every SKILL.md (tests/test_repo.py checks) -->
+## Results in Claude: an interactive page, not a wall of text
+
+`output` in `trader/config.json` decides how a result reaches the user: `"html"` (the default when the key
+is missing) or `"text"`. In html mode, when Claude has an Artifact tool (Claude Code, claude.ai):
+
+1. Run this skill's command as usual (with `--write` where it has one, so the result lands in a file).
+2. Rebuild the page with the sections that skill fills, for the symbols in play:
+   `python3 "${CLAUDE_SKILL_DIR}/../trader-report/report.py" build --public --sections SECTIONS [--symbol SYM ...]`
+3. Publish `trader/report.html` as an Artifact. Always the same file, so the page keeps one URL and every
+   skill updates the same living dashboard (first publish: icon `chart`).
+4. Reply in chat in 2 to 4 lines: the headline (verdict, setup, PASS or BLOCK), any warning (stale data,
+   a missing source, results soon), and the link. The detail lives on the page, not in the chat.
+
+| skill | sections |
+| --- | --- |
+| trader-data | market, symbols |
+| trader-scanner | scans, market (`patterns --study`: study) |
+| trader-news | news, market |
+| trader-invest, trader-thesis | symbols, thesis, market |
+| trader-entry, trader-exit, trader-timemachine, trader-budget, trader-risk | plan, symbols |
+| trader-backtest | backtest |
+| trader-portfolio | portfolio (only with the user's yes, see below) |
+| trader-alerts, trader-broker | plan (its orders only with the user's yes, see below) |
+| trader-report | all of them |
+
+`--public` leaves out holdings, proposed orders and risk verdicts. Publishing distributes the page, so those
+go on it only after the user says yes to that exact page; otherwise keep `--public` or answer in chat.
+Without an Artifact tool, or in text mode, answer in chat as the steps above describe and mention
+`trader/report.html` for a browser. The page is a view of the files; the files stay the source of truth,
+and nothing on it places an order.
+<!-- end html output -->

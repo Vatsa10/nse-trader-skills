@@ -215,6 +215,30 @@ class Repo(unittest.TestCase):
         finally:
             socket.getaddrinfo = saved
 
+    def test_every_skill_answers_with_the_interactive_page(self):
+        # in Claude, results come back as the trader-report page (output: html), the same block in every skill
+        marks = ("<!-- html output:", "<!-- end html output -->")
+        with open(os.path.join(ROOT, "reference", "specs", "html_output.md"), encoding="utf-8") as fh:
+            spec = fh.read()
+        want = spec[spec.find(marks[0]):spec.find(marks[1])]
+        self.assertTrue(want)
+        for s in SKILLS:
+            with open(os.path.join(ROOT, s, "SKILL.md"), encoding="utf-8") as fh:
+                text = fh.read()
+            self.assertEqual(text[text.find(marks[0]):text.find(marks[1])], want, s)
+            self.assertIn(s, want, "%s has no row in the html output table" % s)
+        # every section the table names is one the report builds
+        import importlib.util
+        spec_ = importlib.util.spec_from_file_location("report_for_repo", os.path.join(ROOT, "trader-report", "report.py"))
+        rp = importlib.util.module_from_spec(spec_)
+        spec_.loader.exec_module(rp)
+        for row in re.findall(r"(?m)^\| (trader-[^|]+)\|([^|]+)\|$", want):
+            for word in re.findall(r"\b([a-z]+)\b", re.sub(r"\(.*?\)|`.*?`", "", row[1])):
+                if word not in ("all", "of", "them"):
+                    self.assertIn(word, rp.ALL_SECTIONS, row)
+        with open(os.path.join(ROOT, "trader-budget", "config.example.json")) as fh:
+            self.assertEqual(json.load(fh).get("output"), "html")
+
     def test_every_script_prints_the_rupee_sign_on_a_cp1252_pipe(self):
         marks = ("# --- utf8 output:", "# --- end utf8 output ---")
         with open(os.path.join(ROOT, "reference", "specs", "utf8_output.py"), encoding="utf-8") as fh:

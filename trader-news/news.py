@@ -1158,6 +1158,8 @@ def main(argv=None):
     ap.add_argument("--watchlist", default="trader/watchlist.json")
     ap.add_argument("--plan", default="trader/plan.json")
     ap.add_argument("--state", default="trader/state/news.json")
+    ap.add_argument("--briefing", help="where the last briefing is saved for trader-report (default: news.json "
+                                       "beside the state folder, trader/news.json; '' to skip)")
     ap.add_argument("--hours", type=float, default=48, help="ignore items older than this")
     ap.add_argument("--all", action="store_true", help="show seen items too")
     ap.add_argument("--no-google", action="store_true", help="Yahoo headlines only")
@@ -1220,13 +1222,24 @@ def main(argv=None):
         if events and not args.dry_run:
             save_events(args.events, events, now)
     flows = load_flows(args.flows)
+    mv = [dict(m, time=m["time"].isoformat() if m.get("time") else None,
+               moving=abs(m["pct"]) >= args.move_pct) for m in moves]
+    ev = [dict(e, date=e["date"].isoformat()) for e in events]
+    briefing = {"checked": now.isoformat(), "results_soon": [e["ticker"] for e in events if e["soon"]],
+                "calendar": ev, "moves": mv, "items": _json_ready(shown), "deal_flow": flow,
+                "flows": flows, "notes": errors}
+    if args.briefing is None:
+        args.briefing = os.path.join(os.path.dirname(os.path.dirname(args.state)), "news.json")
+    if not args.dry_run and args.briefing:
+        # the last briefing, for trader-report's News section (the page Claude shows in html output mode)
+        folder = os.path.dirname(args.briefing)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        with open(args.briefing, "w", encoding="utf-8") as fh:
+            json.dump(briefing, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
     if args.json:
-        mv = [dict(m, time=m["time"].isoformat() if m.get("time") else None,
-                   moving=abs(m["pct"]) >= args.move_pct) for m in moves]
-        ev = [dict(e, date=e["date"].isoformat()) for e in events]
-        print(json.dumps({"checked": now.isoformat(), "results_soon": [e["ticker"] for e in events if e["soon"]],
-                          "calendar": ev, "moves": mv, "items": _json_ready(shown), "deal_flow": flow,
-                          "flows": flows, "notes": errors}, indent=2, ensure_ascii=False))
+        print(json.dumps(briefing, indent=2, ensure_ascii=False))
     else:
         sys.stdout.write(render(shown, errors, now, moves, args.move_pct, flow_shown, events, flows))
     if not args.dry_run:
