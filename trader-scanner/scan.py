@@ -1636,7 +1636,8 @@ def carry_first_seen(hits, previous):
 
 # ---------------------------------------------------------------- pattern study (does a rule have an edge?)
 
-STUDY = {"horizon": 40, "trigger_bars": 20, "cost_pct": 0.25, "split": 0.6, "controls": 5, "seed": 7}
+STUDY = {"horizon": 40, "trigger_bars": 20, "cost_pct": 0.25, "split": 0.6, "controls": 20,
+         "seed": 7}
 
 
 def study_exit(rows, k0, entry, stop, target, horizon):
@@ -1661,19 +1662,69 @@ def study_r(entry, stop, exit_px, cost_pct):
     return (exit_px - entry) / risk - cost_pct / 100.0 * entry / risk
 
 
+STUDY_BENCH = "NIFTYBEES"
+
+
+def rolling_mean(xs, n):
+    """Mean of the n values ending at each index (None before there are n)."""
+    out, s = [None] * len(xs), 0.0
+    for i, x in enumerate(xs):
+        s += x
+        if i >= n:
+            s -= xs[i - n]
+        if i >= n - 1:
+            out[i] = s / n
+    return out
+
+
+def study_bench(rows_by_sym):
+    """{date: (close, 200-day mean, 63-session return)} of the benchmark, or {} when it is not cached."""
+    rows = rows_by_sym.get(STUDY_BENCH) or []
+    c = [r[4] for r in rows]
+    sma = rolling_mean(c, 200)
+    return {r[0]: (c[i], sma[i], c[i] / c[i - 63] - 1 if i >= 63 and c[i - 63] else None) for i, r in enumerate(rows)}
+
+
+def study_features(rows, c, v, sma200, s, bench):
+    """What was known at the close of signal day s, for the filters: trend (over a rising 200-day mean), relative
+    strength (3-month return over the benchmark's), market regime (benchmark over its 200-day mean), and the
+    signal day's volume against the 50 before it. None where the history is too short to say."""
+    trend = (c[s] > sma200[s] > sma200[s - 20]) if s >= 219 and sma200[s - 20] is not None else None
+    b = bench.get(rows[s][0])
+    ret = c[s] / c[s - 63] - 1 if s >= 63 and c[s - 63] else None
+    rs = (ret > b[2]) if b and b[2] is not None and ret is not None else None
+    regime = (b[0] > b[1]) if b and b[1] is not None else None
+    base = sum(v[s - 50:s]) / 50.0 if s >= 50 else 0
+    return {"trend": trend, "rs": rs, "regime": regime, "vol_x": v[s] / base if base > 0 else None}
+
+
 def study_patterns(rows_by_sym, symbols, params=None, only=None, min_price=20.0, min_volume=100000, opts=None):
     """Replay every pattern through history with no look-ahead and score what followed in R (1 R = entry - stop).
     A setup is the first day a (symbol, pattern, anchor) shows; it triggers on the first close at or over its level
     within trigger_bars, buys the next open, and exits at the stop, the target or the close `horizon` bars on.
-    Controls: for each trade, `controls` entries on random days of the same stock with the same risk percent and
-    target multiple, so the edge is measured against luck, not against zero. Setups are split by date at `split`
-    of the span: rules are tuned on the first part and judged on the rest. Survivorship: today's list of stocks."""
+    Controls: for each trade, `controls` other stocks picked at random that traded on the same signal day, bought
+    at the same next open with the same risk percent and target multiple. Same day, so the market is the same;
+    other stocks, so the controls do not borrow the run-up that made the pattern (random days of the pattern's own
+    stock near the signal do, and flatter luck). The edge is measured against that, not against zero. Each trade
+    and each control carries the features of its signal day (study_features), so a filter is scored against
+    controls that pass the same filter. Setups are split by date at `split` of the span: tune on the first part,
+    judge on the rest. Survivorship: today's list of stocks."""
     o = dict(STUDY, **(opts or {}))
     p = dict(PAT, **(params or {}))
     rng = random.Random(o["seed"])
+    bench = study_bench(rows_by_sym)
+    pool = {}                              # every liquid-enough stock's rows, closes, volumes, 200-day mean, day index
+    for s in symbols:
+        rws = rows_by_sym.get(s) or []
+        if rws:
+            c_ = [r[4] for r in rws]
+            pool[s] = (rws, c_, [r[5] for r in rws], rolling_mean(c_, 200), {r[0]: i for i, r in enumerate(rws)})
+    names = sorted(pool)
     trades, pending, seen = [], 0, set()
     for sym in symbols:
-        rows = rows_by_sym.get(sym) or []
+        if sym not in pool:
+            continue
+        rows, cl, vo, sma200, _ = pool[sym]
         n = len(rows)
         for end in range(p["min_bars"] - 1, n - 1):
             liquid = rows[end][4] >= min_price and sum(r[5] for r in rows[max(0, end - 19):end + 1]) / 20.0 >= min_volume
@@ -1700,26 +1751,59 @@ def study_patterns(rows_by_sym, symbols, params=None, only=None, min_price=20.0,
                 r = study_r(entry, stop, exit_px, o["cost_pct"])
                 risk_frac = (entry - stop) / entry
                 mult = (target - entry) / (entry - stop) if target is not None else None
-                ctrl = []
-                for _ in range(o["controls"]):
-                    k = rng.randrange(p["min_bars"], n - o["horizon"] - 1)
-                    e2 = rows[k][1]
+                ctrl, day, tries = [], rows[t][0], 0
+                while len(ctrl) < o["controls"] and tries < o["controls"] * 4 and len(names) > 1:
+                    tries += 1
+                    other = names[rng.randrange(len(names))]
+                    if other == sym:
+                        continue
+                    rows2, c2, v2, sma2, at = pool[other]
+                    s = at.get(day)
+                    if s is None or s + 1 + o["horizon"] >= len(rows2) or rows2[s][4] < min_price:
+                        continue                   # not trading that day, too new, or under the price floor
+                    e2 = rows2[s + 1][1]
                     s2 = e2 * (1 - risk_frac)
                     t2 = e2 + mult * (e2 - s2) if mult is not None else None
-                    x2, _ = study_exit(rows, k, e2, s2, t2, o["horizon"])
-                    ctrl.append(study_r(e2, s2, x2, o["cost_pct"]))
+                    x2, _ = study_exit(rows2, s + 1, e2, s2, t2, o["horizon"])
+                    ctrl.append({"r": study_r(e2, s2, x2, o["cost_pct"]),
+                                 "f": study_features(rows2, c2, v2, sma2, s, bench)})
                 trades.append({"symbol": sym, "pattern": h["pattern"], "setup": rows[end][0], "r": r, "how": how,
-                               "risk_pct": risk_frac * 100, "control_r": sum(ctrl) / len(ctrl) if ctrl else None})
+                               "risk_pct": risk_frac * 100, "f": study_features(rows, cl, vo, sma200, t, bench),
+                               "controls": ctrl,
+                               "control_r": sum(x["r"] for x in ctrl) / len(ctrl) if ctrl else None})
     return trades, pending
 
 
-def study_summary(trades, split):
-    """Per pattern and segment (in-sample / out-of-sample by setup date): count, win rate, expectancy with its
-    standard error, profit factor, the controls' expectancy and the lift over them."""
-    if not trades:
-        return {}, None
+def study_filter(trades, require=(), min_vol_x=None, max_risk=None):
+    """Keep the trades whose signal day passed every filter, each with only the controls that pass the same
+    filters (risk is the trade's own, so it gates the trade, not its controls). A trade left with no matching
+    control keeps control_r None and drops out of the lift."""
+    def ok(f):
+        if any(f.get(k) is not True for k in require):
+            return False
+        return min_vol_x is None or (f.get("vol_x") is not None and f["vol_x"] >= min_vol_x)
+    out = []
+    for t in trades:
+        if not ok(t["f"]) or (max_risk is not None and t["risk_pct"] > max_risk):
+            continue
+        cs = [c["r"] for c in t.get("controls") or [] if ok(c["f"])]
+        out.append(dict(t, control_r=sum(cs) / len(cs) if cs else None))
+    return out
+
+
+def study_cut(trades, split):
     days = sorted(t["setup"] for t in trades)
-    cut = days[0] + (days[-1] - days[0]) * split
+    return days[0] + (days[-1] - days[0]) * split if days else None
+
+
+def study_summary(trades, split, cut=None):
+    """Per pattern and segment (in-sample / out-of-sample by setup date): count, win rate, expectancy with its
+    standard error, profit factor, the controls' expectancy, and the lift over them as the mean of each trade's
+    difference from its own controls, with that difference's standard error (lift_se): a lift under two of its
+    standard errors is not told apart from luck. `cut` fixes the split date (for filtered runs to share one)."""
+    if not trades:
+        return {}, cut
+    cut = cut or study_cut(trades, split)
     out = {}
     for t in trades:
         for seg in ("all", "in" if t["setup"] < cut else "out"):
@@ -1731,11 +1815,15 @@ def study_summary(trades, split):
         mean = sum(rs) / n
         sd = (sum((x - mean) ** 2 for x in rs) / (n - 1)) ** 0.5 if n > 1 else 0.0
         win, loss = sum(x for x in rs if x > 0), -sum(x for x in rs if x < 0)
-        ctrl = [t["control_r"] for t in ts if t["control_r"] is not None]
-        cmean = sum(ctrl) / len(ctrl) if ctrl else None
+        paired = [(t["r"], t["control_r"]) for t in ts if t["control_r"] is not None]
+        cmean = sum(c for _, c in paired) / len(paired) if paired else None
+        diffs = [r - c for r, c in paired]
+        lift = sum(diffs) / len(diffs) if diffs else None
+        lsd = (sum((d - lift) ** 2 for d in diffs) / (len(diffs) - 1)) ** 0.5 if len(diffs) > 1 else None
         rows[(pat, seg)] = {"trades": n, "win_pct": 100.0 * sum(1 for x in rs if x > 0) / n, "exp_r": mean,
                             "se_r": sd / n ** 0.5 if n > 1 else None, "pf": win / loss if loss else None,
-                            "control_r": cmean, "lift_r": mean - cmean if cmean is not None else None,
+                            "control_r": cmean, "lift_r": lift,
+                            "lift_se": lsd / len(diffs) ** 0.5 if lsd is not None else None,
                             "median_risk_pct": median([t["risk_pct"] for t in ts]),
                             "exits": {k: sum(1 for t in ts if t["how"] == k) for k in ("target", "stop", "time")}}
     return rows, cut
@@ -3169,14 +3257,45 @@ def parse_params(items):
     return out
 
 
+STUDY_FILTERS = ("trend", "rs", "regime")
+
+
+def save_study_trades(path, trades):
+    write_json(path, [dict(t, setup=t["setup"].isoformat()) for t in trades])
+
+
+def load_study_trades(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        return [dict(t, setup=datetime.date.fromisoformat(t["setup"])) for t in raw]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise ScanError("%s is not a saved study (%s). Next: patterns --study --study-trades FILE" % (fwd(path), e))
+
+
 def cmd_patterns_study(a, rows, symbols, only):
     t0 = time.time()
     params = parse_params(a.param)
-    opts = {"horizon": a.horizon, "trigger_bars": a.trigger_bars, "cost_pct": a.cost_pct, "split": a.split}
-    trades, pending = study_patterns(rows, symbols, params, only, a.min_price, a.min_volume, opts)
-    table, cut = study_summary(trades, a.split)
+    require = [x.strip() for x in (a.require or "").split(",") if x.strip()]
+    bad = [x for x in require if x not in STUDY_FILTERS]
+    if bad:
+        raise ScanError("--require takes %s (not %s)" % (", ".join(STUDY_FILTERS), ", ".join(bad)))
+    opts = {"horizon": a.horizon, "trigger_bars": a.trigger_bars, "cost_pct": a.cost_pct, "split": a.split,
+            "controls": a.controls}
+    if a.from_trades:
+        trades, pending = load_study_trades(a.from_trades), 0
+    else:
+        trades, pending = study_patterns(rows, symbols, params, only, a.min_price, a.min_volume, opts)
+        if a.study_trades:
+            save_study_trades(a.study_trades, trades)
+    cut = study_cut(trades, a.split)          # one split date for every filter on the same trades
+    kept = study_filter(trades, require, a.min_vol_x, a.max_risk)
+    table, cut = study_summary(kept, a.split, cut)
+    filters = {"require": require, "min_vol_x": a.min_vol_x, "max_risk_pct": a.max_risk}
+    trades_all, trades = trades, kept
     order = [k for k, _ in PATTERNS if any(p == k for p, _ in table)]
     doc = {"created_by": "trader-scanner", "mode": "pattern-study", "symbols": len(rows), "params": params,
+           "filters": filters, "trades_before_filters": len(trades_all),
            "options": dict(STUDY, **opts), "split_date": cut.isoformat() if cut else None, "pending": pending,
            "patterns": {p: {seg: table[(p, seg)] for seg in ("all", "in", "out") if (p, seg) in table}
                         for p in order},
@@ -3192,19 +3311,26 @@ def cmd_patterns_study(a, rows, symbols, only):
         return 1
     print("Pattern study: %s stocks, %s trades; buy the next open after a close over the level, out at the stop, "
           "the target or %d sessions; %.2f%% costs." % (indian(len(rows)), indian(len(trades)), a.horizon, a.cost_pct))
+    if require or a.min_vol_x or a.max_risk:
+        print("Filters: %s%s%s; %s of %s trades kept, each scored against controls that pass the same filters." % (
+            "require " + "+".join(require) if require else "no trend/rs/regime filter",
+            ", volume >= %.1fx" % a.min_vol_x if a.min_vol_x else "", ", risk <= %.1f%%" % a.max_risk if a.max_risk else "",
+            indian(len(trades)), indian(len(trades_all))))
     print("In-sample before %s, out-of-sample after (tune on the first, judge on the second). Expectancy in R "
-          "(1 R = entry - stop), +/- one standard error; lift = over random entries with the same risk." % cut.isoformat())
-    print("  %-23s %-4s %6s %6s %13s %6s %8s %8s %7s %s" % ("PATTERN", "SEG", "TRADES", "WIN%", "EXPECT R", "PF",
-                                                             "RANDOM", "LIFT", "RISK%", "EXITS t/s/time"))
+          "(1 R = entry - stop), +/- one standard error; lift = each trade minus random entries on its own stock with "
+          "the same risk, +/- its standard error (under 2 SE is not told apart from luck)." % cut.isoformat())
+    print("  %-23s %-4s %6s %6s %13s %6s %8s %14s %7s %s" % ("PATTERN", "SEG", "TRADES", "WIN%", "EXPECT R", "PF",
+                                                              "RANDOM", "LIFT R", "RISK%", "EXITS t/s/time"))
     for p in order:
         for seg in ("in", "out", "all"):
             s = table.get((p, seg))
             if not s:
                 continue
             se = " +/-%.2f" % s["se_r"] if s["se_r"] is not None else ""
-            print("  %-23s %-4s %6d %5.1f%% %+6.2f%-7s %6s %+8.2f %+8.2f %6.1f%% %d/%d/%d" % (
+            lse = " +/-%.2f" % s["lift_se"] if s.get("lift_se") is not None else ""
+            print("  %-23s %-4s %6d %5.1f%% %+6.2f%-7s %6s %+8.2f %+6.2f%-8s %6.1f%% %d/%d/%d" % (
                 p if seg == "in" else "", seg, s["trades"], s["win_pct"], s["exp_r"], se,
-                "%.2f" % s["pf"] if s["pf"] else "-", s["control_r"] or 0.0, s["lift_r"] or 0.0,
+                "%.2f" % s["pf"] if s["pf"] else "-", s["control_r"] or 0.0, s["lift_r"] or 0.0, lse,
                 s["median_risk_pct"], s["exits"]["target"], s["exits"]["stop"], s["exits"]["time"]))
     if pending:
         print("%d setup(s) too recent to score (fewer than %d sessions after them): left out." % (pending, a.horizon))
@@ -3212,6 +3338,32 @@ def cmd_patterns_study(a, rows, symbols, only):
     if not a.no_write:
         print("Wrote %s (%.0f s)." % (fwd(a.study_out), time.time() - t0))
     return 0
+
+
+def study_verdicts(path):
+    """{pattern: evidence} from a saved pattern study (patterns --study), or {} without one. The verdict needs the
+    lift to clear two standard errors in BOTH the in-sample and the out-of-sample half: "worse than random",
+    "edge over random", else "no measured edge"."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        pats = doc["patterns"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+    out = {}
+    for name, segs in pats.items():
+        halves = [segs.get(k) or {} for k in ("in", "out")]
+        allx = segs.get("all") or {}
+        if any(h.get("lift_r") is None or not h.get("lift_se") for h in halves) or not allx:
+            continue
+        z = [h["lift_r"] / h["lift_se"] for h in halves]
+        verdict = ("worse than random" if all(x < -2 for x in z) else
+                   "edge over random" if all(x > 2 for x in z) else "no measured edge")
+        out[name] = {"verdict": verdict, "lift_r": round(allx["lift_r"], 2),
+                     "lift_se": round(allx["lift_se"], 2) if allx.get("lift_se") else None,
+                     "trades": allx.get("trades"), "split_date": doc.get("split_date"),
+                     "filters": doc.get("filters") or {}}
+    return out
 
 
 def cmd_patterns(a):
@@ -3242,6 +3394,10 @@ def cmd_patterns(a):
         except (OSError, ValueError):
             previous = None
     carry_first_seen(hits, previous)
+    evidence = study_verdicts(a.study_out)
+    for h in hits:
+        if h["pattern"] in evidence:
+            h["evidence"] = evidence[h["pattern"]]
     lasts = [r[-1][0] for r in rows.values() if r]
     cnote = cache_note("daily", len(rows), lasts)
     stale = last_date and (to_ist(now).date() - last_date).days > 5
@@ -3280,6 +3436,13 @@ def cmd_patterns(a):
         print("%s had under %d sessions in the cache." % (indian(counts["short"]), PAT["min_bars"]))
     print("Pivots need %d bars on each side, so a turn in the last %d sessions is not visible yet. The VCP needs 200 "
           "sessions." % (PAT["L"], PAT["R"]))
+    if evidence:
+        print("Measured in history (%s, patterns --study: lift over random same-day entries, both halves): %s." % (
+            fwd(a.study_out), "; ".join("%s %s (%+.2f R +/-%.2f, %s trades)" % (
+                PAT_LABEL.get(k, k), v["verdict"], v["lift_r"], v["lift_se"] or 0, v["trades"])
+                for k, v in sorted(evidence.items()))))
+    else:
+        print("No pattern study yet: run `patterns --study` to see whether these patterns beat random entries.")
     if hits:
         per = [(k, sum(1 for h in hits if k in h["setups"])) for k, _ in PATTERNS]
         print("%d matched: %s." % (len(hits), ", ".join("%d %s" % (n, PAT_LABEL[k]) for k, n in per if n)))
@@ -3463,6 +3626,15 @@ def main(argv=None):
     p.add_argument("--param", action="append", metavar="KEY=VALUE",
                    help="--study or a scan: override a pattern threshold, e.g. db_gap=[10,80] (repeatable)")
     p.add_argument("--study-out", default="trader/data/pattern-study.json")
+    p.add_argument("--controls", type=int, default=STUDY["controls"],
+                   help="--study: random-entry controls per trade (%d)" % STUDY["controls"])
+    p.add_argument("--require", help="--study: keep trades whose signal day passed these, comma list of "
+                                     "trend (over a rising 200-day mean), rs (3-month return over NIFTYBEES), "
+                                     "regime (NIFTYBEES over its 200-day mean)")
+    p.add_argument("--min-vol-x", type=float, help="--study: signal-day volume at least this many times its 50-day mean")
+    p.add_argument("--max-risk", type=float, help="--study: entry-to-stop risk at most this percent")
+    p.add_argument("--study-trades", metavar="FILE", help="--study: also save every scored trade with its features")
+    p.add_argument("--from-trades", metavar="FILE", help="--study: re-score a saved --study-trades file (no replay)")
     p.add_argument("--intraday", action="store_true",
                    help="intraday double bottom and flag on today's 5-minute bars (orb's fetch path; needs the "
                         "session open, or --offline with --at / --now)")

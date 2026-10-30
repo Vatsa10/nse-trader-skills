@@ -1275,6 +1275,71 @@ class PatternStudy(unittest.TestCase):
         self.assertEqual(table[("flag", "all")]["trades"], 1)
         self.assertIsNotNone(cut)
 
+    def test_controls_are_other_stocks_on_the_same_day(self):
+        # X makes the flag and rallies to its target; Y is flat on the same days. Each control is Y bought at the same
+        # next open with X's risk: it neither stops nor hits the target, so it gives back only the costs.
+        closes = FLAG + [127, 130, 140, 150, 160] + [160] * 45
+        rows = {"X": prows(closes), "Y": prows([100.0] * len(closes))}
+        trades, _ = scan.study_patterns(rows, ["X", "Y"], dict(P2, flag_min_bars=0), ["flag"], 0, 0,
+                                        {"horizon": 40, "controls": 3})
+        self.assertEqual(len(trades), 1)
+        t = trades[0]
+        self.assertEqual(len(t["controls"]), 3)
+        risk_frac = t["risk_pct"] / 100.0
+        want = -0.25 / 100.0 / risk_frac                     # costs only, in R: 0.25 % of the entry over the risk
+        for c in t["controls"]:
+            self.assertAlmostEqual(c["r"], want, places=6)
+
+    def test_filters_judge_trades_and_controls_alike(self):
+        up, down = {"trend": True, "rs": True, "regime": True, "vol_x": 2.0}, {"trend": False, "rs": None,
+                                                                             "regime": True, "vol_x": 0.5}
+        t1 = {"pattern": "flag", "setup": D(2024, 1, 1), "r": 1.0, "how": "target", "risk_pct": 6.0, "f": up,
+              "controls": [{"r": 0.5, "f": up}, {"r": -1.0, "f": down}]}
+        t2 = {"pattern": "flag", "setup": D(2025, 1, 1), "r": -1.0, "how": "stop", "risk_pct": 14.0, "f": up,
+              "controls": [{"r": 0.0, "f": up}]}
+        t3 = dict(t1, f=down)
+        kept = scan.study_filter([t1, t2, t3], ["trend"], 1.4, None)
+        self.assertEqual([k["r"] for k in kept], [1.0, -1.0])              # t3 failed the trend filter
+        self.assertEqual(kept[0]["control_r"], 0.5)                        # only the control that passed it
+        self.assertEqual(len(scan.study_filter([t1, t2], (), None, 10.0)), 1)   # the risk cap gates the trade
+        # paired lift: mean of (r - control_r) = ((1 - 0.5) + (-1 - 0)) / 2, with a standard error
+        table, cut = scan.study_summary(kept, 0.6, D(2024, 6, 1))
+        s = table[("flag", "all")]
+        self.assertAlmostEqual(s["lift_r"], -0.25)
+        self.assertAlmostEqual(s["lift_se"], 0.75)
+        self.assertEqual((table[("flag", "in")]["trades"], table[("flag", "out")]["trades"]), (1, 1))
+
+    def test_features_use_only_the_signal_day_and_before(self):
+        closes = [100 + i * 0.5 for i in range(260)]
+        rows = prows(closes)
+        c, v = [r[4] for r in rows], [r[5] for r in rows]
+        f = scan.study_features(rows, c, v, scan.rolling_mean(c, 200), 250, {})
+        self.assertIs(f["trend"], True)                     # a steady climb: over a rising 200-day mean
+        self.assertIsNone(f["rs"])                          # no benchmark cached: unknown, never True
+        self.assertAlmostEqual(f["vol_x"], 1.0)
+        self.assertIsNone(scan.study_features(rows, c, v, scan.rolling_mean(c, 200), 100, {})["trend"])
+
+    def test_verdicts_need_both_halves(self):
+        d = tempfile.mkdtemp()
+        try:
+            seg = lambda l, s: {"lift_r": l, "lift_se": s, "trades": 100}
+            doc = {"split_date": "2024-10-20", "patterns": {
+                "flag": {"in": seg(-0.06, 0.04), "out": seg(0.04, 0.06), "all": seg(-0.03, 0.03)},
+                "inverse_head_shoulders": {"in": seg(-0.21, 0.08), "out": seg(-0.30, 0.07), "all": seg(-0.25, 0.06)},
+                "vcp": {"in": seg(0.5, 0.1), "out": seg(0.1, 0.1), "all": seg(0.3, 0.07)},     # in-sample only
+                "double_bottom": {"in": seg(0.3, 0.1), "out": seg(0.3, 0.1), "all": seg(0.3, 0.07)}}}
+            path = os.path.join(d, "s.json")
+            with open(path, "w") as fh:
+                json.dump(doc, fh)
+            v = scan.study_verdicts(path)
+            self.assertEqual(v["flag"]["verdict"], "no measured edge")
+            self.assertEqual(v["inverse_head_shoulders"]["verdict"], "worse than random")
+            self.assertEqual(v["vcp"]["verdict"], "no measured edge")      # an edge that does not hold out is none
+            self.assertEqual(v["double_bottom"]["verdict"], "edge over random")
+            self.assertEqual(scan.study_verdicts(os.path.join(d, "missing.json")), {})
+        finally:
+            shutil.rmtree(d)
+
     def test_params_are_checked(self):
         self.assertEqual(scan.parse_params(["db_gap=[10,60]", "vcp_max_risk_pct=8"]),
                          {"db_gap": (10, 60), "vcp_max_risk_pct": 8})

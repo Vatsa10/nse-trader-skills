@@ -340,7 +340,37 @@ first completed 5-minute bar that closes over it, inside the entry window.
 for days, not intraday trades: the stop can be far under price and trader-exit's
 intraday plan will flat the position by the close. For an intraday trade use
 `patterns --intraday` (next) or the opening-range scan. The detectors'
-thresholds are constants in `scan.py` (`PAT`), marked repo or ours.
+thresholds are constants in `scan.py` (`PAT`), marked repo or ours; `--param
+KEY=VALUE` overrides one for a scan or a study.
+
+### Does a pattern work? (`patterns --study`)
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/scan.py" patterns --study --study-trades trader/data/study-trades.json
+python3 "${CLAUDE_SKILL_DIR}/scan.py" patterns --study --from-trades trader/data/study-trades.json --require trend,rs --min-vol-x 1.4
+```
+
+Replays every pattern through the cached history day by day (no look-ahead):
+a setup triggers on a close over its level, buys the next open and leaves at
+the stop, the target or after `--horizon` sessions (40); a gap through the
+stop or target fills at the open, a bar touching both counts as the stop, and
+`--cost-pct` (0.25) comes off. Each trade is scored in R (1 R = entry - stop)
+against `--controls` (20) random OTHER stocks bought the same day with the same
+risk and target: the lift is the trade minus its controls, with a standard
+error. Setups are split by date (`--split` 0.6): tune on the first part, judge
+on the second; a lift that does not clear two standard errors in both halves is
+"no measured edge". `--require trend,rs,regime`, `--min-vol-x` and `--max-risk`
+re-score saved trades (`--from-trades`) against controls that pass the same
+filters. `patterns` then prints each pattern's verdict from the study file
+(`--study-out`, default trader/data/pattern-study.json) and puts it on every hit
+as `evidence`.
+
+The 5-year Nifty 500 study (2021-10 to 2026-10, 7,411 trades): no pattern beat
+random same-day entries; inverse head and shoulders did worse (-0.25 R, about
+4 standard errors), and no trend, relative-strength, regime, volume or
+risk-cap filter made any pattern clear two standard errors. Say so whenever a
+pattern hit is shown: a pattern is a place to look, not an edge. Today's list of
+stocks (survivorship bias), one exit design, one 40-session horizon.
 
 ### Intraday patterns (`patterns --intraday`, during the session)
 

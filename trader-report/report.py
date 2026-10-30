@@ -699,18 +699,20 @@ def section_study(c):
                 rows.append([pat, {"in": "in-sample", "out": "out-of-sample", "all": "all"}[seg], s.get("trades"),
                              numcell(s.get("win_pct")), numcell(s.get("exp_r")), numcell(s.get("se_r")),
                              numcell(s.get("pf")), numcell(s.get("control_r")), numcell(s.get("lift_r")),
+                             numcell(s.get("lift_se")),
                              numcell(s.get("median_risk_pct")),
                              "%s/%s/%s" % (ex.get("target", 0), ex.get("stop", 0), ex.get("time", 0))])
     opts = doc.get("options") or {}
     head = ('<p class="src">%s stocks; buy the next open after a close over the level; out at the stop, the target or '
             '%s sessions; %s%% costs. Split at %s: tune on in-sample, judge on out-of-sample. Expectancy in R '
-            '(1 R = entry - stop); lift is over random entries with the same risk.</p>' % (
+            '(1 R = entry - stop); lift is each trade against random other stocks bought the same day with the same risk; '
+            'a lift under two of its standard errors is not told apart from luck.</p>' % (
                 esc(fmt(doc.get("symbols"))), esc(fmt(opts.get("horizon"))), esc(fmt(opts.get("cost_pct"))),
                 esc(str(doc.get("split_date") or "?"))))
     if doc.get("params"):
         head += '<p class="src">Overrides: %s</p>' % esc(json.dumps(doc["params"]))
     return head + data_table(["pattern", "segment", "trades", "win %", "expect R", "+/- SE", "PF", "random R", "lift R",
-                              "median risk %", "target/stop/time"], rows) + '<p class="src">%s</p>' % esc(doc.get("note") or "")
+                              "lift +/- SE", "median risk %", "target/stop/time"], rows) + '<p class="src">%s</p>' % esc(doc.get("note") or "")
 
 
 def section_portfolio(c):
