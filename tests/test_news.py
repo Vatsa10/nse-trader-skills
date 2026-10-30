@@ -546,6 +546,53 @@ class Calendar(unittest.TestCase):
         self.assertIsNone(news.apply_calendar("bad.json"))      # unreadable means the built-in tables
         self.assertEqual(news.sessions_between(d(2026, 10, 14), d(2026, 10, 16)), 2)
 
+    def write_flows(self, days, name="flows.csv"):
+        with open(name, "w", newline="") as fh:
+            fh.write("date,category,buy_cr,sell_cr,net_cr\n")
+            for i, d in enumerate(days):
+                fh.write("%s,FII/FPI,1000.00,%.2f,%.2f\n" % (d, 1000 + 10 * (i + 1), -10.0 * (i + 1)))
+                fh.write("%s,DII,2000.00,%.2f,%.2f\n" % (d, 2000 - 100 * (i + 1), 100.0 * (i + 1)))
+        return name
+
+    def test_flows_line_follows_the_results_dates(self):
+        days = ["2026-10-07", "2026-10-08", "2026-10-09", "2026-10-12", "2026-10-13"]
+        path = self.write_flows(days)
+        code, out, err = run(["--tickers", "HINDCOPPER", "TCS", "--flows", path] + self.base)
+        lines = out.splitlines()
+        self.assertTrue(lines[0].startswith("RESULTS SOON  TCS"))
+        self.assertTrue(lines[1].startswith("RESULTS SOON  HINDCOPPER"))
+        self.assertEqual(lines[2], "FII/DII 2026-10-13 (Rs crore): FII/FPI net -50.00, DII net +500.00; "
+                                   "5 sessions: FII/FPI -150.00, DII +1,500.00. Market context, not a signal.")
+        self.assertEqual(lines[3], "")
+        data = json.loads(run(["--tickers", "TCS", "--json", "--flows", path] + self.base)[1])
+        self.assertEqual(data["flows"], {"date": "2026-10-13", "fii_net_cr": -50.0, "dii_net_cr": 500.0,
+                                         "sessions": 5, "fii_net_cr_5d": -150.0, "dii_net_cr_5d": 1500.0})
+
+    def test_flows_with_fewer_than_five_sessions_have_no_window(self):
+        path = self.write_flows(["2026-10-12", "2026-10-13"])
+        flows = news.load_flows(path)
+        self.assertEqual((flows["fii_net_cr"], flows["dii_net_cr"]), (-20.0, 200.0))
+        self.assertEqual((flows["fii_net_cr_5d"], flows["dii_net_cr_5d"]), (None, None))
+        out = run(["--tickers", "TCS", "--flows", path] + self.base)[1]
+        self.assertIn("FII/DII 2026-10-13 (Rs crore): FII/FPI net -20.00, DII net +200.00. Market context", out)
+        self.assertNotIn("sessions:", out)
+
+    def test_missing_or_corrupt_flows_print_nothing(self):
+        data = json.loads(run(["--tickers", "TCS", "--json", "--flows", "none.csv"] + self.base)[1])
+        self.assertIsNone(data["flows"])
+        for body in ("", "date,category,net\n2026-10-13,DII,5\n", "date,category,buy_cr,sell_cr,net_cr\n",
+                     "date,category,buy_cr,sell_cr,net_cr\nnot-a-date,DII,1,2,3\n",
+                     "date,category,buy_cr,sell_cr,net_cr\n2026-10-13,DII,1,2,abc\n",
+                     "date,category,buy_cr,sell_cr,net_cr\n2026-10-13,DII\n"):
+            with open("bad.csv", "w") as fh:
+                fh.write(body)
+            self.assertIsNone(news.load_flows("bad.csv"), body)
+            code, out, err = run(["--tickers", "TCS", "--flows", "bad.csv"] + self.base)
+            self.assertNotIn("FII/DII", out)
+        with open("bad.csv", "wb") as fh:
+            fh.write(b"\xff\xfe\x00garbage")
+        self.assertIsNone(news.load_flows("bad.csv"))
+
     def test_parse_meetings(self):
         rows = news.parse_meetings(raw(os.path.join("calendar", "meetings-HINDCOPPER.json")), "HINDCOPPER")
         self.assertEqual([(m["date"].isoformat(), m["results"], m["dividend"]) for m in rows],

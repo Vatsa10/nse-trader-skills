@@ -54,6 +54,13 @@ excluded: the built-in 2024 to 2026 tables, with trader/data/calendar.json laid
 on top when it exists) prints RESULTS SOON at the top: an overnight gap can jump
 past an intraday stop. --no-calendar skips it.
 
+FII/DII flows: when trader/data/flows.csv exists (trader-data writes it; header
+date,category,buy_cr,sell_cr,net_cr, rupees crore, category FII/FPI or DII) the
+briefing prints one line after the results dates: the latest day's FII/FPI and
+DII net, and the 5-session net when there are 5 sessions on file. It is market
+context, not a signal. A missing or unreadable file prints nothing. --flows PATH
+reads another file; --json has it as "flows".
+
 Both ride the NSE session above (one re-prime on a 401/403 or a non-JSON block
 page, then a one-line note; the other sources still print).
 
@@ -100,6 +107,9 @@ DEAL_DAYS = 30      # the window the deals are fetched and netted over (NSE allo
 DEAL_PCT = 1.0      # a deal this big, as a percent of the 20-day average volume, is flagged LARGE
 DEAL_CLOSE = (15, 30)   # deals carry a date only; they are stamped at the close, IST
 RESULTS_SOON = 2    # results this many NSE sessions away (or fewer) are a gap risk
+FLOWS_HEADER = ["date", "category", "buy_cr", "sell_cr", "net_cr"]
+FLOW_CATEGORIES = ("FII/FPI", "DII")
+FLOW_SESSIONS = 5   # the longer net window on the flows line
 CALENDAR_DAYS = 30  # board-meeting dates further out than this are left off the briefing
 DATA_DIR = os.path.join("trader", "data")
 DATA_HINT = ("run `python3 trader-data/data.py doctor`; or call Kite MCP get_historical_data and "
@@ -743,6 +753,55 @@ def render_calendar(events):
     return out
 
 
+def load_flows(path):
+    """trader/data/flows.csv (date,category,buy_cr,sell_cr,net_cr; rupees crore) -> {"date",
+    "fii_net_cr", "dii_net_cr", "sessions", "fii_net_cr_5d", "dii_net_cr_5d"} for the latest day, or
+    None when the file is missing, unreadable or has no usable row. The 5-session nets are None until
+    each category has 5 days on file. Never raises: this line is context, not a signal."""
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            rows = list(csv.reader(fh))
+        if not rows or [c.strip() for c in rows[0]] != FLOWS_HEADER:
+            return None
+        net = {c: {} for c in FLOW_CATEGORIES}
+        for r in rows[1:]:
+            if not r:
+                continue
+            day, cat = _dt.date.fromisoformat(r[0].strip()).isoformat(), r[1].strip()
+            if cat in net:
+                value = float(r[4])
+                if value != value or value in (float("inf"), float("-inf")):
+                    return None
+                net[cat][day] = value
+    except (OSError, ValueError, IndexError, UnicodeError, csv.Error):
+        return None
+    days = sorted(set(net["FII/FPI"]) | set(net["DII"]))
+    if not days:
+        return None
+    last = days[-1]
+    out = {"date": last, "fii_net_cr": net["FII/FPI"].get(last), "dii_net_cr": net["DII"].get(last),
+           "sessions": FLOW_SESSIONS}
+    for key, cat in (("fii_net_cr_5d", "FII/FPI"), ("dii_net_cr_5d", "DII")):
+        recent = sorted(net[cat])[-FLOW_SESSIONS:]
+        out[key] = round(sum(net[cat][d] for d in recent), 2) if len(recent) == FLOW_SESSIONS else None
+    return out
+
+
+def render_flows(flows):
+    """One context line: the latest day's FII/FPI and DII net, then the 5-session net."""
+    if not flows:
+        return []
+
+    def cr(v):
+        return "n/a" if v is None else format(v, "+,.2f")
+    line = "FII/DII %s (Rs crore): FII/FPI net %s, DII net %s" % (
+        flows["date"], cr(flows["fii_net_cr"]), cr(flows["dii_net_cr"]))
+    if flows["fii_net_cr_5d"] is not None or flows["dii_net_cr_5d"] is not None:
+        line += "; %d sessions: FII/FPI %s, DII %s" % (
+            flows["sessions"], cr(flows["fii_net_cr_5d"]), cr(flows["dii_net_cr_5d"]))
+    return [line + ". Market context, not a signal."]
+
+
 def manual_links(ticker):
     q = urllib.parse.quote(ticker)
     return ("open by hand: %s (NSE announcements), https://finance.yahoo.com/quote/%s.NS/news, "
@@ -982,8 +1041,8 @@ def render_flow(flow):
     return out
 
 
-def render(items, errors, now, moves=None, move_pct=MOVE_PCT, flow=None, calendar=None):
-    out = render_calendar(calendar or [])
+def render(items, errors, now, moves=None, move_pct=MOVE_PCT, flow=None, calendar=None, flows=None):
+    out = render_calendar(calendar or []) + render_flows(flows)
     if out:
         out.append("")
     moved = render_moves(moves or [], move_pct)
@@ -1041,6 +1100,8 @@ def main(argv=None):
     ap.add_argument("--no-calendar", action="store_true", help="skip NSE board meetings (results dates)")
     ap.add_argument("--calendar", default=os.path.join(DATA_DIR, "calendar.json"),
                     help="trader-data holiday calendar, laid over the built-in tables to count sessions")
+    ap.add_argument("--flows", default=os.path.join(DATA_DIR, "flows.csv"),
+                    help="trader-data FII/DII flows (rupees crore), printed as one context line when it exists")
     ap.add_argument("--cache", action="store_true",
                     help="moves from the trader-data cache (trader/data/intraday, then daily), not Yahoo")
     ap.add_argument("--now", help="ISO time, for reproducible runs (no offset = IST)")
@@ -1083,15 +1144,16 @@ def main(argv=None):
         if apply_calendar(args.calendar) is None and os.path.exists(args.calendar):
             errors.append("%s is not valid JSON; using the built-in holiday tables" % args.calendar)
         events = collect_calendar(fetcher, watch, now, errors)
+    flows = load_flows(args.flows)
     if args.json:
         mv = [dict(m, time=m["time"].isoformat() if m.get("time") else None,
                    moving=abs(m["pct"]) >= args.move_pct) for m in moves]
         ev = [dict(e, date=e["date"].isoformat()) for e in events]
         print(json.dumps({"checked": now.isoformat(), "results_soon": [e["ticker"] for e in events if e["soon"]],
                           "calendar": ev, "moves": mv, "items": _json_ready(shown), "deal_flow": flow,
-                          "notes": errors}, indent=2, ensure_ascii=False))
+                          "flows": flows, "notes": errors}, indent=2, ensure_ascii=False))
     else:
-        sys.stdout.write(render(shown, errors, now, moves, args.move_pct, flow_shown, events))
+        sys.stdout.write(render(shown, errors, now, moves, args.move_pct, flow_shown, events, flows))
     if not args.dry_run:
         remember(items, state, now)
         folder = os.path.dirname(args.state)
