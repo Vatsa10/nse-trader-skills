@@ -666,6 +666,21 @@ class Calendar(unittest.TestCase):
         self.assertEqual(data["results_soon"], ["TCS"])
         self.assertEqual([e["date"] for e in data["calendar"]], ["2026-10-14", "2026-10-19"])
 
+    def test_board_dates_are_kept_for_the_other_skills(self):
+        now = news.parse_now(NOW)
+        with open("events.json", "w") as fh:
+            json.dump({"events": [{"ticker": "TCS", "date": "2026-12-01", "results": True},
+                                  {"ticker": "INFY", "date": "2026-12-02", "results": True},
+                                  {"ticker": "INFY", "date": "2026-01-02", "results": True}]}, fh)
+        events = [{"ticker": "TCS", "date": news._dt.date(2026, 10, 14), "purpose": "Financial Results",
+                   "results": True, "dividend": True}]
+        news.save_events("events.json", events, now)
+        with open("events.json") as fh:
+            kept = json.load(fh)["events"]
+        self.assertEqual([(e["ticker"], e["date"]) for e in kept],
+                         [("TCS", "2026-10-14"), ("INFY", "2026-12-02")])   # TCS replaced, INFY's past date dropped
+        self.assertTrue(kept[0]["results"] and kept[0]["dividend"])
+
     def test_holidays_from_the_calendar_file_pull_results_closer(self):
         args = ["--tickers", "RELIANCE", "--json"] + self.base
         self.assertEqual(json.loads(run(args)[1])["results_soon"], [])               # weekends only: 3 sessions

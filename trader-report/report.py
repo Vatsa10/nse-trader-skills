@@ -538,6 +538,8 @@ def rich(v):
 def section_thesis(c):
     out = []
     for p in sorted(glob.glob(os.path.join(c.trader, "thesis", "*.json"))):
+        if p.endswith("-brief.json"):
+            continue   # trader-thesis's evidence brief, not a finished thesis
         doc = c.read_json(p)
         if not isinstance(doc, dict):
             continue
@@ -635,7 +637,7 @@ def section_backtest(c):
         if isinstance(doc, dict) and isinstance(doc.get("metrics"), dict):
             break
     else:
-        raise Missing(["python3 trader-backtest/backtest.py run buy-and-hold NIFTYBEES"])
+        raise Missing(["python3 trader-backtest/backtest.py run --strategy buy_hold --symbol NIFTYBEES"])
     m = doc["metrics"]
     pairs = [("Run", doc.get("name")), ("Strategy", doc.get("strategy")), ("Symbols", doc.get("symbols")),
              ("Fill, slippage bps", "%s, %s" % (doc.get("fill"), doc.get("slippage_bps"))), ("Tax", "on" if doc.get("tax") else "off")]

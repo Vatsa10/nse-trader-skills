@@ -784,6 +784,30 @@ def collect_calendar(fetcher, watch, now, errors=None):
     return out
 
 
+def save_events(path, events, now):
+    """Keep the board-meeting dates for the other skills (trader-invest's next results date, the
+    trader-thesis brief, trader-report): {"fetched_at", "events": [{"ticker", "date", "purpose",
+    "results", "dividend"}]}. A symbol checked now replaces its old dates; past dates are dropped."""
+    today = to_ist(now).date().isoformat()
+    try:
+        old = load_json(path).get("events") or []
+    except (OSError, ValueError, AttributeError):
+        old = []
+    fresh = set(e["ticker"] for e in events)
+    keep = [e for e in old if isinstance(e, dict) and e.get("ticker") not in fresh and str(e.get("date")) >= today]
+    keep += [{"ticker": e["ticker"], "date": e["date"].isoformat(), "purpose": e.get("purpose"),
+              "results": bool(e.get("results")), "dividend": bool(e.get("dividend"))} for e in events]
+    keep.sort(key=lambda e: (e["date"], e["ticker"]))
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"fetched_at": now.isoformat(), "events": keep}, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
 def render_calendar(events):
     """RESULTS SOON lines first (gap risk), then the other dates coming up."""
     out = []
@@ -1145,6 +1169,8 @@ def main(argv=None):
     ap.add_argument("--deal-days", type=int, default=DEAL_DAYS,
                     help="deals window in days, also the net buy/sell window (max 365)")
     ap.add_argument("--no-calendar", action="store_true", help="skip NSE board meetings (results dates)")
+    ap.add_argument("--events", default=os.path.join(DATA_DIR, "events.json"),
+                    help="where the board-meeting dates are kept for the other skills")
     ap.add_argument("--calendar", default=os.path.join(DATA_DIR, "calendar.json"),
                     help="trader-data holiday calendar, laid over the built-in tables to count sessions")
     ap.add_argument("--flows", default=os.path.join(DATA_DIR, "flows.csv"),
@@ -1191,6 +1217,8 @@ def main(argv=None):
         if apply_calendar(args.calendar) is None and os.path.exists(args.calendar):
             errors.append("%s is not valid JSON; using the built-in holiday tables" % show_path(args.calendar))
         events = collect_calendar(fetcher, watch, now, errors)
+        if events and not args.dry_run:
+            save_events(args.events, events, now)
     flows = load_flows(args.flows)
     if args.json:
         mv = [dict(m, time=m["time"].isoformat() if m.get("time") else None,

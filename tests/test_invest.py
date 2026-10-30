@@ -244,6 +244,16 @@ class Analyse(Base):
         self.assertLess(a["pillars"]["stability"]["score"], 40)
         self.assertTrue(any("next results due by 2026-11-14" in x for x in a["data_age"]))
 
+    def test_a_real_board_meeting_date_beats_the_sebi_guess(self):
+        os.makedirs(os.path.join(self.td, "data"), exist_ok=True)
+        with open(os.path.join(self.td, "data", "events.json"), "w", encoding="utf-8") as fh:
+            json.dump({"events": [{"ticker": "IOC", "date": "2026-10-30", "purpose": "Financial Results",
+                                   "results": True, "dividend": False}]}, fh)
+        a = self.analyse("IOC")
+        self.assertEqual(a["next_results"]["date"], "2026-10-30")
+        self.assertTrue(any("board meeting 2026-10-30" in x for x in a["data_age"]))
+        self.assertFalse(any("SEBI LODR" in x for x in a["data_age"]))
+
     def test_analyse_saves_the_analysis_for_thesis_and_report(self):
         a = self.analyse("IOC")
         path = os.path.join(self.td, "invest", "IOC.json")

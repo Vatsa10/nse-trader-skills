@@ -307,6 +307,22 @@ def read_actions(data_dir, sym, today):
     return src("actions", path, ent.get("fetched_through") or doc.get("fetched_at"), vals), None
 
 
+def read_events(data_dir, sym, today):
+    """Results and dividend board meetings ahead, from trader/data/events.json (trader-news keeps it)."""
+    path = os.path.join(data_dir, "events.json")
+    doc = read_json(path)
+    if not isinstance(doc, dict):
+        return None, "no board-meeting dates (run trader-news for %s)" % sym
+    ahead = sorted((e for e in doc.get("events") or [] if isinstance(e, dict) and e.get("ticker") == sym
+                    and str(e.get("date")) >= today.isoformat()), key=lambda e: str(e.get("date")))
+    if not ahead:
+        return None, "events.json lists no board meeting ahead for %s" % sym
+    vals = {"meetings": [{"date": e.get("date"), "purpose": e.get("purpose"), "results": e.get("results"),
+                          "dividend": e.get("dividend")} for e in ahead[:6]],
+            "next_results": next((e.get("date") for e in ahead if e.get("results")), None)}
+    return src("events", path, doc.get("fetched_at"), vals), None
+
+
 def read_index(data_dir, slug, label):
     path = os.path.join(data_dir, "index", slug + ".csv")
     rows = read_rows(path) if os.path.isfile(path) else None
@@ -383,6 +399,7 @@ def build_brief(sym, mode, data_dir, today):
                ("watchlist", lambda: read_hits(trader_dir, sym, "watchlist.json", "watchlist")),
                ("delivery", lambda: read_delivery(data_dir, sym)),
                ("actions", lambda: read_actions(data_dir, sym, today)),
+               ("events", lambda: read_events(data_dir, sym, today)),
                ("nifty_50", lambda: read_index(data_dir, "nifty-50", "nifty_50")),
                ("india_vix", lambda: read_index(data_dir, "india-vix", "india_vix")),
                ("flows", lambda: read_flows(data_dir)),

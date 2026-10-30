@@ -106,10 +106,19 @@ class Brief(unittest.TestCase):
         b2 = th.build_brief("IOC", "swing", self.data, TODAY)
         self.assertIn("plan", [m["source"] for m in b2["missing"]])
 
+    def test_board_meetings_from_trader_news(self):
+        write(os.path.join(self.data, "events.json"), json.dumps({"fetched_at": "2026-10-30T09:00:00+00:00", "events": [
+            {"ticker": "IOC", "date": "2026-10-01", "purpose": "old", "results": True, "dividend": False},
+            {"ticker": "IOC", "date": "2026-11-12", "purpose": "Financial Results", "results": True, "dividend": True},
+            {"ticker": "TCS", "date": "2026-11-05", "purpose": "Financial Results", "results": True, "dividend": False}]}))
+        ev = th.build_brief("IOC", "longterm", self.data, TODAY)["sources"]["events"]
+        self.assertEqual(ev["values"]["next_results"], "2026-11-12")      # the past meeting and TCS are left out
+        self.assertEqual(len(ev["values"]["meetings"]), 1)
+
     def test_empty_tree_does_not_crash(self):
         b = th.build_brief("IOC", "longterm", self.data, TODAY)
         self.assertEqual(b["sources"], {})
-        self.assertEqual(len(b["missing"]), 12)
+        self.assertEqual(len(b["missing"]), 13)
         self.assertTrue(b["notes"])
 
     def test_brief_command_writes_file(self):

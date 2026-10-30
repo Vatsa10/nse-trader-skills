@@ -106,7 +106,10 @@ other business (fund raising, say) are left out. `--json` has `results_soon`
 (the symbols) and `calendar` (every date, with `sessions_away`). When
 `flows.csv` exists the briefing adds one `FII/DII <date> (Rs crore): ...` line
 and `--json` has `flows`; read it as the day's backdrop, never as a reason to
-buy or sell.
+buy or sell. The dates found are kept in `trader/data/events.json` (`--events
+PATH`; a symbol checked now replaces its old dates, past dates drop off), so
+trader-invest shows the real results date instead of the SEBI deadline guess
+and the trader-thesis brief and trader-report can use it.
 
 What to do with it: tell the user before `/trader-entry` that an intraday
 trade in a RESULTS SOON stock can gap past its stop at the open, and that a

@@ -868,6 +868,22 @@ def read_market_valuation(trader_dir):
             "expensive_at": NIFTY_PE_EXPENSIVE, "cheap_at": NIFTY_PE_CHEAP}
 
 
+def read_next_results(trader_dir, symbol, today):
+    """The next results board meeting from trader/data/events.json (trader-news keeps it from NSE's
+    board-meeting list) -> {"date", "purpose", "source"}, or None. Better than the SEBI deadline guess."""
+    path = os.path.join(trader_dir, "data", "events.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            events = json.load(fh).get("events") or []
+    except (OSError, ValueError, AttributeError):
+        return None
+    for e in sorted((e for e in events if isinstance(e, dict)), key=lambda e: str(e.get("date"))):
+        d = parse_day(e.get("date"))
+        if e.get("ticker") == symbol and e.get("results") and d and d >= today:
+            return {"date": d.isoformat(), "purpose": e.get("purpose"), "source": shown(path)}
+    return None
+
+
 def read_delivery(trader_dir, symbol):
     """Rows of trader/data/delivery/<SYM>.csv ascending, as dicts (date, deliv_qty, qty_per_trade, series); an
     empty cell is None. None when there is no file."""
@@ -1047,7 +1063,7 @@ def growth_numbers(annual):
 
 
 def analyse(f, card, daily=None, gsec=None, today=None, horizon_years=5, daily_meta=None, swing=None,
-            market=None, delivery=None):
+            market=None, delivery=None, next_results=None):
     symbol = f.get("symbol")
     today = today or ist_today()
     gsec = card.get("gsec_10y_pct", 6.5) if gsec is None else gsec
@@ -1189,7 +1205,10 @@ def analyse(f, card, daily=None, gsec=None, today=None, horizon_years=5, daily_m
         ages.append("fundamentals have no as_of date")
     if g.get("latest_fy"):
         ages.append("latest annual %s" % g["latest_fy"])
-    if lq:
+    if lq and next_results:
+        ages.append("latest quarter %s (next results board meeting %s, from NSE via trader-news)" % (
+            lq["q"], next_results["date"]))
+    elif lq:
         due = results_due(next_quarter(lq["q"]))
         ages.append("latest quarter %s (next results due by %s per SEBI LODR)" % (
             lq["q"], due.isoformat() if due else "?"))
@@ -1214,7 +1233,7 @@ def analyse(f, card, daily=None, gsec=None, today=None, horizon_years=5, daily_m
             "flags": flags, "data_age": ages, "missing_metrics": missing, "missing_fields": missing_fields,
             "scorecard": card.get("_override") or "scorecard.example.json",
             "latest_quarter": lq, "horizon_years": horizon_years,
-            "market_valuation": market, "delivery": delivery,
+            "market_valuation": market, "delivery": delivery, "next_results": next_results,
             "disclaimer": "Education and tooling, not financial advice."}
 
 
@@ -1302,7 +1321,10 @@ def plan(f, analysis, ch, amount, tranches=3, every_days=30, today=None, price=N
                     "Plus 4%% health and education cess (and surcharge if it applies). Dividends are taxed at "
                     "your slab rate; the company deducts 10%% TDS above %s a year." % inr(10000)]}
     checklist = []
-    if due:
+    if analysis.get("next_results"):
+        checklist.append("next results: board meeting %s (NSE, via trader-news); an overnight gap can move a "
+                         "tranche bought the day before" % analysis["next_results"]["date"])
+    elif due:
         checklist.append("next results: %s due by %s (SEBI LODR deadline; check NSE corporate announcements "
                          "for the board meeting date)" % (next_quarter(lq["q"]), due.isoformat()))
     else:
@@ -1563,7 +1585,8 @@ def load_for_analysis(args, symbol, card):
     bars = read_daily_bars(args.trader_dir, symbol)[0] if rows else []
     return f, analyse(f, card, rows, args.gsec, today, horizon, {"path": shown(path) if path else None, "adjusted": adj},
                       swing_numbers(bars) if bars else None, read_market_valuation(args.trader_dir),
-                      delivery_im_days(read_delivery(args.trader_dir, symbol)))
+                      delivery_im_days(read_delivery(args.trader_dir, symbol)),
+                      read_next_results(args.trader_dir, symbol, today))
 
 
 def analysis_path(trader_dir, symbol):
