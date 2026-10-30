@@ -1234,6 +1234,54 @@ IHS = [120, 110, 100, 108, 115, 105, 95, 90, 97, 105, 115, 108, 102, 106, 110]
 SUPPORT = [108, 104, 100, 105, 110, 112, 110, 108, 106, 110, 114, 116, 115, 113, 112, 114, 117, 118, 116]
 
 
+def bar(o, h, l, c, i=0):
+    return (D(2026, 1, 1) + datetime.timedelta(days=i), o, h, l, c, 1000.0)
+
+
+class PatternStudy(unittest.TestCase):
+    """The scoring engine behind patterns --study: an exit rule that is wrong would mislead more than a weak pattern."""
+
+    def test_exits(self):
+        ex = scan.study_exit
+        # bought at 100 (stop 95, target 110): the target touched on the 2nd bar fills at the target
+        self.assertEqual(ex([bar(100, 104, 99, 103), bar(103, 111, 102, 108)], 0, 100, 95, 110, 40), (110, "target"))
+        # a gap down through the stop fills at the open, not at the stop
+        self.assertEqual(ex([bar(100, 101, 99, 100), bar(90, 92, 88, 91)], 0, 100, 95, 110, 40), (90, "stop"))
+        # a gap up over the target fills at the open
+        self.assertEqual(ex([bar(100, 101, 99, 100), bar(115, 118, 114, 116)], 0, 100, 95, 110, 40), (115, "target"))
+        # a bar touching both is read as the stop (cautious)
+        self.assertEqual(ex([bar(100, 112, 94, 105)], 0, 100, 95, 110, 40), (95, "stop"))
+        # no exit within the horizon: out at the close of the last bar of it
+        rows = [bar(100, 102, 98, 100 + i, i) for i in range(5)]
+        self.assertEqual(ex(rows, 0, 100, 95, None, 3), (102, "time"))
+
+    def test_r_includes_costs(self):
+        self.assertAlmostEqual(scan.study_r(100, 95, 110, 0.0), 2.0)
+        self.assertAlmostEqual(scan.study_r(100, 95, 95, 0.0), -1.0)
+        self.assertAlmostEqual(scan.study_r(100, 95, 110, 0.25), 2.0 - 0.05)     # 0.25 rupees of 100 is 0.05 R
+
+    def test_no_look_ahead_and_the_split(self):
+        # a flag that triggers, then rallies to its target: one trade, +R, setup and trigger from the past only
+        closes = FLAG + [127, 130, 140, 150, 160] + [160] * 45
+        rows = {"X": prows(closes)}
+        trades, pending = scan.study_patterns(rows, ["X"], dict(P2, flag_min_bars=0), ["flag"], 0, 0,
+                                              {"horizon": 40, "controls": 2})
+        self.assertEqual(len(trades), 1)
+        t = trades[0]
+        self.assertEqual((t["pattern"], t["how"]), ("flag", "target"))
+        self.assertGreater(t["r"], 0)
+        self.assertLess(t["setup"], rows["X"][len(FLAG) + 1][0])     # seen before the breakout bar
+        table, cut = scan.study_summary(trades, 0.6)
+        self.assertEqual(table[("flag", "all")]["trades"], 1)
+        self.assertIsNotNone(cut)
+
+    def test_params_are_checked(self):
+        self.assertEqual(scan.parse_params(["db_gap=[10,60]", "vcp_max_risk_pct=8"]),
+                         {"db_gap": (10, 60), "vcp_max_risk_pct": 8})
+        with self.assertRaises(scan.ScanError):
+            scan.parse_params(["no_such_key=1"])
+
+
 class Patterns(unittest.TestCase):
     """Chart patterns on hand-made series (stock-pattern.md section 5): L = R = 2, high = close + 0.5."""
 

@@ -183,6 +183,7 @@ import gzip
 import io
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -1633,6 +1634,113 @@ def carry_first_seen(hits, previous):
     return hits
 
 
+# ---------------------------------------------------------------- pattern study (does a rule have an edge?)
+
+STUDY = {"horizon": 40, "trigger_bars": 20, "cost_pct": 0.25, "split": 0.6, "controls": 5, "seed": 7}
+
+
+def study_exit(rows, k0, entry, stop, target, horizon):
+    """Walk a long from bar k0 (bought at its open) -> (exit price, "stop" | "target" | "time"). A gap through the
+    stop or the target fills at the open; a bar touching both counts as the stop (the cautious reading)."""
+    last = min(len(rows) - 1, k0 + horizon - 1)
+    for k in range(k0, last + 1):
+        _, o, h, l, c, _ = rows[k]
+        if k > k0 and o <= stop:
+            return o, "stop"
+        if l <= stop:
+            return stop, "stop"
+        if target is not None and k > k0 and o >= target:
+            return o, "target"
+        if target is not None and h >= target:
+            return target, "target"
+    return rows[last][4], "time"
+
+
+def study_r(entry, stop, exit_px, cost_pct):
+    risk = entry - stop
+    return (exit_px - entry) / risk - cost_pct / 100.0 * entry / risk
+
+
+def study_patterns(rows_by_sym, symbols, params=None, only=None, min_price=20.0, min_volume=100000, opts=None):
+    """Replay every pattern through history with no look-ahead and score what followed in R (1 R = entry - stop).
+    A setup is the first day a (symbol, pattern, anchor) shows; it triggers on the first close at or over its level
+    within trigger_bars, buys the next open, and exits at the stop, the target or the close `horizon` bars on.
+    Controls: for each trade, `controls` entries on random days of the same stock with the same risk percent and
+    target multiple, so the edge is measured against luck, not against zero. Setups are split by date at `split`
+    of the span: rules are tuned on the first part and judged on the rest. Survivorship: today's list of stocks."""
+    o = dict(STUDY, **(opts or {}))
+    p = dict(PAT, **(params or {}))
+    rng = random.Random(o["seed"])
+    trades, pending, seen = [], 0, set()
+    for sym in symbols:
+        rows = rows_by_sym.get(sym) or []
+        n = len(rows)
+        for end in range(p["min_bars"] - 1, n - 1):
+            liquid = rows[end][4] >= min_price and sum(r[5] for r in rows[max(0, end - 19):end + 1]) / 20.0 >= min_volume
+            for h in find_patterns(rows[:end + 1], params, only):
+                key = (sym, h["pattern"], h["anchor_date"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                if not liquid:
+                    continue
+                level, stop, target = h["level"], h["stop"], h["target"]
+                t = next((k for k in range(end, min(n, end + o["trigger_bars"] + 1)) if rows[k][4] >= level), None)
+                if t is None:
+                    if end + o["trigger_bars"] >= n:
+                        pending += 1
+                    continue
+                if t + o["horizon"] >= n:
+                    pending += 1                       # not enough bars after it yet: left out, not guessed
+                    continue
+                entry = rows[t + 1][1]
+                if entry <= stop:
+                    continue                           # opened under its own stop: no trade
+                exit_px, how = study_exit(rows, t + 1, entry, stop, target, o["horizon"])
+                r = study_r(entry, stop, exit_px, o["cost_pct"])
+                risk_frac = (entry - stop) / entry
+                mult = (target - entry) / (entry - stop) if target is not None else None
+                ctrl = []
+                for _ in range(o["controls"]):
+                    k = rng.randrange(p["min_bars"], n - o["horizon"] - 1)
+                    e2 = rows[k][1]
+                    s2 = e2 * (1 - risk_frac)
+                    t2 = e2 + mult * (e2 - s2) if mult is not None else None
+                    x2, _ = study_exit(rows, k, e2, s2, t2, o["horizon"])
+                    ctrl.append(study_r(e2, s2, x2, o["cost_pct"]))
+                trades.append({"symbol": sym, "pattern": h["pattern"], "setup": rows[end][0], "r": r, "how": how,
+                               "risk_pct": risk_frac * 100, "control_r": sum(ctrl) / len(ctrl) if ctrl else None})
+    return trades, pending
+
+
+def study_summary(trades, split):
+    """Per pattern and segment (in-sample / out-of-sample by setup date): count, win rate, expectancy with its
+    standard error, profit factor, the controls' expectancy and the lift over them."""
+    if not trades:
+        return {}, None
+    days = sorted(t["setup"] for t in trades)
+    cut = days[0] + (days[-1] - days[0]) * split
+    out = {}
+    for t in trades:
+        for seg in ("all", "in" if t["setup"] < cut else "out"):
+            out.setdefault((t["pattern"], seg), []).append(t)
+    rows = {}
+    for (pat, seg), ts in out.items():
+        rs = [t["r"] for t in ts]
+        n = len(rs)
+        mean = sum(rs) / n
+        sd = (sum((x - mean) ** 2 for x in rs) / (n - 1)) ** 0.5 if n > 1 else 0.0
+        win, loss = sum(x for x in rs if x > 0), -sum(x for x in rs if x < 0)
+        ctrl = [t["control_r"] for t in ts if t["control_r"] is not None]
+        cmean = sum(ctrl) / len(ctrl) if ctrl else None
+        rows[(pat, seg)] = {"trades": n, "win_pct": 100.0 * sum(1 for x in rs if x > 0) / n, "exp_r": mean,
+                            "se_r": sd / n ** 0.5 if n > 1 else None, "pf": win / loss if loss else None,
+                            "control_r": cmean, "lift_r": mean - cmean if cmean is not None else None,
+                            "median_risk_pct": median([t["risk_pct"] for t in ts]),
+                            "exits": {k: sum(1 for t in ts if t["how"] == k) for k in ("target", "stop", "time")}}
+    return rows, cut
+
+
 # ---------------------------------------------------------------- intraday chart patterns
 
 # The double bottom and the pole and flag on the current session's 5-minute bars: the same detectors as the daily
@@ -3046,6 +3154,66 @@ def cmd_patterns_intraday(a):
     return 0 if hits else 1
 
 
+def parse_params(items):
+    """--param key=value (JSON value) -> overrides of PAT, unknown keys refused."""
+    out = {}
+    for it in items or []:
+        k, sep, v = it.partition("=")
+        if not sep or k not in PAT:
+            raise ScanError("--param wants KEY=VALUE with a key of the pattern table (not %r)" % it)
+        try:
+            val = json.loads(v)
+        except ValueError:
+            raise ScanError("--param %s: %r is not a JSON value (a number, true, or [10, 80])" % (k, v))
+        out[k] = tuple(val) if isinstance(val, list) else val
+    return out
+
+
+def cmd_patterns_study(a, rows, symbols, only):
+    t0 = time.time()
+    params = parse_params(a.param)
+    opts = {"horizon": a.horizon, "trigger_bars": a.trigger_bars, "cost_pct": a.cost_pct, "split": a.split}
+    trades, pending = study_patterns(rows, symbols, params, only, a.min_price, a.min_volume, opts)
+    table, cut = study_summary(trades, a.split)
+    order = [k for k, _ in PATTERNS if any(p == k for p, _ in table)]
+    doc = {"created_by": "trader-scanner", "mode": "pattern-study", "symbols": len(rows), "params": params,
+           "options": dict(STUDY, **opts), "split_date": cut.isoformat() if cut else None, "pending": pending,
+           "patterns": {p: {seg: table[(p, seg)] for seg in ("all", "in", "out") if (p, seg) in table}
+                        for p in order},
+           "note": "Past setups on today's list of stocks (survivorship-biased), after %.2f%% round-trip costs. "
+                   "A study of history, not a forecast. Not financial advice." % a.cost_pct}
+    if not a.no_write:
+        write_json(a.study_out, doc)
+    if a.json:
+        print(json.dumps(dict(doc, seconds=round(time.time() - t0, 1)), indent=2, default=str))
+        return 0 if trades else 1
+    if not trades:
+        print("No pattern triggered in %d symbols' history." % len(rows))
+        return 1
+    print("Pattern study: %s stocks, %s trades; buy the next open after a close over the level, out at the stop, "
+          "the target or %d sessions; %.2f%% costs." % (indian(len(rows)), indian(len(trades)), a.horizon, a.cost_pct))
+    print("In-sample before %s, out-of-sample after (tune on the first, judge on the second). Expectancy in R "
+          "(1 R = entry - stop), +/- one standard error; lift = over random entries with the same risk." % cut.isoformat())
+    print("  %-23s %-4s %6s %6s %13s %6s %8s %8s %7s %s" % ("PATTERN", "SEG", "TRADES", "WIN%", "EXPECT R", "PF",
+                                                             "RANDOM", "LIFT", "RISK%", "EXITS t/s/time"))
+    for p in order:
+        for seg in ("in", "out", "all"):
+            s = table.get((p, seg))
+            if not s:
+                continue
+            se = " +/-%.2f" % s["se_r"] if s["se_r"] is not None else ""
+            print("  %-23s %-4s %6d %5.1f%% %+6.2f%-7s %6s %+8.2f %+8.2f %6.1f%% %d/%d/%d" % (
+                p if seg == "in" else "", seg, s["trades"], s["win_pct"], s["exp_r"], se,
+                "%.2f" % s["pf"] if s["pf"] else "-", s["control_r"] or 0.0, s["lift_r"] or 0.0,
+                s["median_risk_pct"], s["exits"]["target"], s["exits"]["stop"], s["exits"]["time"]))
+    if pending:
+        print("%d setup(s) too recent to score (fewer than %d sessions after them): left out." % (pending, a.horizon))
+    print(doc["note"])
+    if not a.no_write:
+        print("Wrote %s (%.0f s)." % (fwd(a.study_out), time.time() - t0))
+    return 0
+
+
 def cmd_patterns(a):
     if a.intraday:
         return cmd_patterns_intraday(a)
@@ -3062,8 +3230,10 @@ def cmd_patterns(a):
         raise ScanError("no daily cache in %s for these symbols. Next: run `python3 trader-data/data.py daily "
                         "SYMBOL [SYMBOL ...]`, or %s" % (fwd(daily_dir), DATA_HINT))
     only = [a.pattern] if a.pattern else None
+    if a.study:
+        return cmd_patterns_study(a, rows, symbols, only)
     hits, counts, last_date = scan_patterns(rows, symbols, a.min_price, a.min_volume, only,
-                                            None if a.state == "any" else a.state)
+                                            None if a.state == "any" else a.state, parse_params(a.param))
     previous = None
     if os.path.exists(a.out):
         try:
@@ -3281,6 +3451,18 @@ def main(argv=None):
     p.add_argument("--no-write", action="store_true")
     p.add_argument("--show", type=int, default=50)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--study", action="store_true",
+                   help="replay the patterns through the cached history and score what followed (no look-ahead)")
+    p.add_argument("--horizon", type=int, default=STUDY["horizon"], help="--study: sessions to hold (%d)" % STUDY["horizon"])
+    p.add_argument("--trigger-bars", type=int, default=STUDY["trigger_bars"],
+                   help="--study: sessions a setup may wait for its trigger close (%d)" % STUDY["trigger_bars"])
+    p.add_argument("--cost-pct", type=float, default=STUDY["cost_pct"],
+                   help="--study: round-trip costs in %% of the entry (%.2f)" % STUDY["cost_pct"])
+    p.add_argument("--split", type=float, default=STUDY["split"],
+                   help="--study: share of the date span that is in-sample (%.1f)" % STUDY["split"])
+    p.add_argument("--param", action="append", metavar="KEY=VALUE",
+                   help="--study or a scan: override a pattern threshold, e.g. db_gap=[10,80] (repeatable)")
+    p.add_argument("--study-out", default="trader/data/pattern-study.json")
     p.add_argument("--intraday", action="store_true",
                    help="intraday double bottom and flag on today's 5-minute bars (orb's fetch path; needs the "
                         "session open, or --offline with --at / --now)")
