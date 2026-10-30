@@ -340,6 +340,12 @@ class V4Cache(unittest.TestCase):
         for must in ("Forbidden", "No cache for HINDCOPPER", "data.py doctor", "get_historical_data", "import-kite"):
             self.assertIn(must, errors[0])
 
+    def test_printed_paths_use_forward_slashes(self):
+        code, out, err = run(["quote", "HINDCOPPER", "--cache"])
+        self.assertNotIn("\\", out + err)
+        self.assertIn("trader/data/daily/HINDCOPPER.csv", out + err)
+        self.assertEqual(alerts.shown(os.path.join("trader", "data", "x.json")), "trader/data/x.json")
+
     def test_intraday_cache_then_daily_csv(self):
         os.makedirs(os.path.join("trader", "data", "intraday"))
         os.makedirs(os.path.join("trader", "data", "daily"))
@@ -571,6 +577,16 @@ class Cli(unittest.TestCase):
         code, _, err = run(["add", "--rules", self.rules, "--from-plan", "--plan", os.path.join(self.d, "none")])
         self.assertEqual(code, 1)
         self.assertIn("no plan", err)
+
+    def test_paths_in_messages_use_forward_slashes(self):
+        code, text, err = run(["quote", "RELIANCE", "--offline", QDIR, "--write", self.prices])
+        self.assertEqual(code, 0)
+        self.assertIn("Wrote 1 price(s) to " + self.prices.replace(os.sep, "/"), text)
+        for argv in (["check", "--rules", self.rules, "--state", self.state],
+                     ["add", "--rules", self.rules, "--from-plan", "--plan", os.path.join(self.d, "none")],
+                     ["quote", "RELIANCE", "--offline", os.path.join(self.d, "nowhere")]):
+            code, out, err = run(argv)
+            self.assertNotIn("\\", out + err, argv)
 
     def test_quote_write_merges(self):
         code, text, _ = run(["quote", "RELIANCE", "TCS", "--offline", QDIR, "--write", self.prices,

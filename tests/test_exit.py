@@ -158,6 +158,26 @@ class Cli(unittest.TestCase):
         with open(os.path.join("trader", "plan.json")) as fh:
             return json.load(fh)
 
+    def test_printed_paths_use_forward_slashes(self):
+        self.write(os.path.join("trader", "entry.json"), REEL_ENTRY)
+        code, text, err = self.plan("--write")
+        self.assertIn("Wrote trader/plan.json.", text)
+        self.assertNotIn("\\", text + err)
+        missing = os.path.join("trader", "none.json")
+        for argv in (["plan", "--from", missing], ["show", "--plan", missing],
+                     ["plan", "--symbol", "RELIANCE", "--entry", "12.5", "--stop", "atr:1.5", "--cache"],
+                     ["plan", "--symbol", "RELIANCE", "--entry", "12.5", "--stop", "swing", "--product", "CNC",
+                      "--daily-dir", os.path.join("trader", "nodaily")]):
+            code, text, err = run(exitp, argv)
+            self.assertNotIn("\\", text + err, argv)
+        self.assertIn("trader/none.json", run(exitp, ["plan", "--from", missing])[2])
+        with self.assertRaises(SystemExit):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                exitp.main(["plan", "--help"])
+        self.assertNotIn("\\", out.getvalue())
+        self.assertIn("trader/charges.json", out.getvalue())
+
     def test_entry_to_plan_end_to_end(self):
         self.write(os.path.join("trader", "entry.json"), REEL_ENTRY)
         code, text, err = self.plan("--stop", "or-mid", "--target", "1R", "--write")

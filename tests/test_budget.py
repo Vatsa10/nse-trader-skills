@@ -145,6 +145,21 @@ class TheReel(unittest.TestCase):
             self.assertEqual((doc["status"], doc["paper"], doc["created_at"]), ("proposed", True, "2026-10-19T04:15:00Z"))
             self.assertEqual(doc["orders"][0]["plan"]["max_loss"], 86.12)
 
+    def test_printed_paths_use_forward_slashes(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "trader", "orders.json")
+            code, text, err = run(["--plan", PLAN, "--config", CFG, "--portfolio", os.path.join(d, "none"),
+                                   "--now", NOW, "--write", out])
+            self.assertEqual(code, 0, err)
+            self.assertIn("Wrote 1 proposed bracket order to " + out.replace(os.sep, "/"), text)
+            self.assertNotIn("\\", text + err)
+            missing = os.path.join(d, "trader", "none.json")
+            for argv in (["--plan", missing, "--config", CFG], ["--targets", missing, "--config", CFG],
+                         ["--plan", PLAN, "--config", missing + "x", "--prices", missing]):
+                code, text, err = run(argv)
+                self.assertNotIn("\\", text + err, argv)
+            self.assertIn(d.replace(os.sep, "/") + "/trader/none.json", run(["--plan", missing, "--config", CFG])[2])
+
     def test_cli_json_limit_and_product(self):
         code, text, _ = run(["--plan", PLAN, "--config", CFG, "--portfolio", "/nonexistent", "--now", NOW,
                              "--limit", "--product", "cnc", "--json"])

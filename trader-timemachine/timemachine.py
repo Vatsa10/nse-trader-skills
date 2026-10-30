@@ -276,6 +276,11 @@ class TMError(Exception):
     pass
 
 
+def shown(path):
+    """A path as printed to the user: forward slashes on every OS (files are opened as given)."""
+    return str(path).replace(os.sep, "/")
+
+
 # ---------------------------------------------------------------- time (IST: fixed UTC+05:30, no DST)
 
 IST_OFFSET = datetime.timedelta(hours=5, minutes=30)
@@ -315,7 +320,7 @@ def load_charges(path=None):
             with open(path, encoding="utf-8") as fh:
                 over = json.load(fh)
         except (OSError, ValueError) as e:
-            raise TMError("%s is not valid JSON: %s" % (path, e))
+            raise TMError("%s is not valid JSON: %s" % (shown(path), e))
         if isinstance(over, dict):
             _merge(model, over)
     return model
@@ -465,7 +470,7 @@ def fetch_chart(sym):
 
 
 def intraday_cache_path(sym):
-    return os.path.join(DATA_DIR, "intraday", "%s-5m.json" % sym.upper()).replace(os.sep, "/")   # same text on every OS
+    return shown(os.path.join(DATA_DIR, "intraday", "%s-5m.json" % sym.upper()))   # same text on every OS
 
 
 def cache_when(text, path):
@@ -486,14 +491,14 @@ def read_cache(sym, why=None):
     path = intraday_cache_path(sym)
     lead = ("%s. " % why) if why else ""
     if not os.path.exists(path):
-        raise TMError("%sNo cache at %s either. Next: %s" % (lead, path, DATA_HINT))
+        raise TMError("%sNo cache at %s either. Next: %s" % (lead, shown(path), DATA_HINT))
     try:
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
     except OSError as e:
-        raise TMError("could not read %s: %s" % (path, e))
+        raise TMError("could not read %s: %s" % (shown(path), getattr(e, "strerror", None) or e))
     note = "%susing cached data from %s (%s), run `python3 trader-data/data.py intraday %s` to refresh" % (
-        ("live fetch failed (%s); " % why) if why else "", cache_when(text, path), path, sym.upper())
+        ("live fetch failed (%s); " % why) if why else "", cache_when(text, path), shown(path), sym.upper())
     return text, note
 
 
@@ -505,15 +510,15 @@ def read_offline(path, sym):
                 path = os.path.join(path, name)
                 break
         else:
-            raise TMError("no %s-60d5m.json(.gz) in %s" % (sym.upper(), path))
+            raise TMError("no %s-60d5m.json(.gz) in %s" % (sym.upper(), shown(path)))
     if not os.path.exists(path):
-        raise TMError("no offline chart file %s" % path)
+        raise TMError("no offline chart file %s" % shown(path))
     opener = gzip.open if path.endswith(".gz") else open
     try:
         with opener(path, "rt", encoding="utf-8") as fh:
             return fh.read()
     except OSError as e:
-        raise TMError("could not read %s: %s" % (path, e))
+        raise TMError("could not read %s: %s" % (shown(path), getattr(e, "strerror", None) or e))
 
 
 def chart_result(text, sym):
@@ -903,15 +908,15 @@ def load_plan(a, now_utc):
     else:
         if not os.path.exists(a.plan):
             raise TMError("no plan at %s: run /trader-exit first, or pass --symbol --date --entry --stop "
-                          "--target --entry-time" % a.plan)
+                          "--target --entry-time" % shown(a.plan))
         try:
             with open(a.plan, encoding="utf-8") as fh:
                 raw = json.load(fh)
         except ValueError as e:
-            raise TMError("%s is not valid JSON: %s" % (a.plan, e))
+            raise TMError("%s is not valid JSON: %s" % (shown(a.plan), e))
         if not isinstance(raw, dict):
-            raise TMError("%s is not a plan" % a.plan)
-        src = a.plan
+            raise TMError("%s is not a plan" % shown(a.plan))
+        src = shown(a.plan)
     return normalize_plan(raw, src)
 
 
@@ -1375,7 +1380,7 @@ def cmd_run(a):
     else:
         print("\n".join(report(doc)))
         if a.write:
-            print("Wrote %s." % a.write)
+            print("Wrote %s." % shown(a.write))
         print("Next: /trader-budget sizes it to your budget and your max loss per trade.")
     return 0
 
@@ -1383,13 +1388,13 @@ def cmd_run(a):
 def cmd_chart(a):
     if a.from_file:
         if not os.path.exists(a.from_file):
-            raise TMError("no %s: run timemachine.py run --write first" % a.from_file)
+            raise TMError("no %s: run timemachine.py run --write first" % shown(a.from_file))
         try:
             with open(a.from_file, encoding="utf-8") as fh:
                 doc = json.load(fh)
             doc["mc"]["bands"]
         except (ValueError, KeyError, TypeError):
-            raise TMError("%s is not a time machine result" % a.from_file)
+            raise TMError("%s is not a time machine result" % shown(a.from_file))
     else:
         doc = compute(a)
     print("\n".join(render_chart(doc)))
@@ -1423,7 +1428,7 @@ def main(argv=None):
         p.add_argument("--offline", metavar="FILE", help="a saved Yahoo chart JSON (.json or .json.gz), no network")
         p.add_argument("--cache", action="store_true",
                        help="read trader/data/intraday/<SYMBOL>-5m.json (trader-data) instead of Yahoo")
-        p.add_argument("--charges", default=CHARGES_PATH, help="charges override (default %s)" % CHARGES_PATH)
+        p.add_argument("--charges", default=CHARGES_PATH, help="charges override (default %s)" % shown(CHARGES_PATH))
         p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" IST, or ISO with Z)')
 
     p = sub.add_parser("run", help="replay the plan: 10,000 simulated sessions plus the history")

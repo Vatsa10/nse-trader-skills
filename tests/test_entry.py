@@ -706,6 +706,25 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertFalse(os.path.exists("x.json"))
 
+    def test_printed_paths_use_forward_slashes(self):
+        os.makedirs(os.path.join("trader", "out"))
+        out = os.path.join("trader", "out", "e.json")
+        code, text, err = run(["check", "RELIANCE", "--offline", RELIANCE, "--now", "2026-10-19 10:00", "--write", out])
+        self.assertIn("Wrote trader/out/e.json (status triggered).", text)
+        code, text, err = run(["check", "RELIANCE", "--cache", "--now", "2026-10-19 10:00"])
+        self.assertEqual(code, 1)
+        self.assertIn("No cache at trader/data/intraday/RELIANCE-5m.json", err)
+        os.mkdir("charts")
+        with open(os.path.join("trader", "wl.json"), "w") as fh:
+            json.dump({"hits": [{"symbol": "ZZZZ", "setups": ["orb"]}]}, fh)
+        wl = os.path.join("trader", "wl.json")
+        for argv in (["watchlist", "--watchlist", wl, "--offline", "charts"],
+                     ["watchlist", "--watchlist", os.path.join("trader", "none.json")],
+                     ["check", "RELIANCE", "--offline", os.path.join("charts", "none.json")]):
+            code, text, err = run(argv)
+            self.assertNotIn("\\", text + err, argv)
+        self.assertIn("trader/none.json", run(["watchlist", "--watchlist", os.path.join("trader", "none.json")])[2])
+
     def test_watchlist(self):
         os.mkdir("charts")
         shutil.copy(RELIANCE, os.path.join("charts", "RELIANCE.json"))

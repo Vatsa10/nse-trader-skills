@@ -279,6 +279,11 @@ class NewsError(Exception):
     pass
 
 
+def show_path(path):
+    """A path as printed to the user: forward slashes on every OS (files are opened as given)."""
+    return str(path).replace(os.sep, "/")
+
+
 class NseWall(NewsError):
     """NSE's bot wall: HTTP 401/403. One fresh session is worth a try."""
 
@@ -335,7 +340,7 @@ class Fetcher(object):
         if self.offline:
             path = os.path.join(self.offline, name)
             if not os.path.isfile(path):
-                raise NewsError("offline: no file %s" % path)
+                raise NewsError("offline: no file %s" % show_path(path))
             with open(path, "rb") as fh:
                 return fh.read()
         gap = time.time() - self._last
@@ -845,8 +850,8 @@ def cached_move(ticker, why=None):
                     "pct": round((price / prev - 1) * 100, 2), "time": None,
                     "note": "%susing cached data from the %s daily close, run `python3 trader-data/data.py daily "
                             "%s` to refresh" % (fail, rows[-1]["date"], ticker)}
-    raise NewsError("%sNo cache at %s or %s either. Next: %s" % (("%s. " % why) if why else "", ipath, dpath,
-                                                                 DATA_HINT))
+    raise NewsError("%sNo cache at %s or %s either. Next: %s" % (("%s. " % why) if why else "", show_path(ipath),
+                                                                 show_path(dpath), DATA_HINT))
 
 
 def fetch_move(fetcher, t):
@@ -1142,7 +1147,7 @@ def main(argv=None):
     events = []
     if not args.no_calendar:
         if apply_calendar(args.calendar) is None and os.path.exists(args.calendar):
-            errors.append("%s is not valid JSON; using the built-in holiday tables" % args.calendar)
+            errors.append("%s is not valid JSON; using the built-in holiday tables" % show_path(args.calendar))
         events = collect_calendar(fetcher, watch, now, errors)
     flows = load_flows(args.flows)
     if args.json:

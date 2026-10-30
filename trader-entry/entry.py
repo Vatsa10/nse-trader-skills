@@ -244,6 +244,11 @@ class EntryError(Exception):
     pass
 
 
+def shown(path):
+    """A path as printed to the user: forward slashes on every OS (files are opened as given)."""
+    return str(path).replace(os.sep, "/")
+
+
 # ---------------------------------------------------------------- time
 
 def ist_offset(utc=None):
@@ -500,14 +505,14 @@ def offline_file(path, sym):
             p = os.path.join(path, name)
             if os.path.exists(p):
                 return p
-        raise EntryError("no offline file for %s in %s (want %s.json)" % (sym, path, sym))
+        raise EntryError("no offline file for %s in %s (want %s.json)" % (sym, shown(path), sym))
     if not os.path.exists(path):
-        raise EntryError("no offline file %s" % path)
+        raise EntryError("no offline file %s" % shown(path))
     return path
 
 
 def intraday_cache_path(sym):
-    return os.path.join(DATA_DIR, "intraday", "%s-5m.json" % sym).replace(os.sep, "/")   # same text on every OS
+    return shown(os.path.join(DATA_DIR, "intraday", "%s-5m.json" % sym))   # same text on every OS
 
 
 def cache_when(text, path):
@@ -540,13 +545,13 @@ def read_cache(sym, interval, why=None):
     if interval != "5m":
         raise EntryError("%sThe cache holds 5-minute bars only: use --interval 5m, or %s" % (lead, DATA_HINT))
     if not os.path.exists(path):
-        raise EntryError("%sNo cache at %s either. Next: %s" % (lead, path, DATA_HINT))
+        raise EntryError("%sNo cache at %s either. Next: %s" % (lead, shown(path), DATA_HINT))
     try:
         text = read_text(path)
     except (OSError, ValueError) as e:
-        raise EntryError("could not read %s: %s" % (path, e))
+        raise EntryError("could not read %s: %s" % (shown(path), getattr(e, "strerror", None) or e))
     note("%susing cached data from %s (%s), run `python3 trader-data/data.py intraday %s` to refresh"
-         % (("live fetch failed (%s); " % why) if why else "", cache_when(text, path), path, sym))
+         % (("live fetch failed (%s); " % why) if why else "", cache_when(text, path), shown(path), sym))
     return text
 
 
@@ -589,7 +594,7 @@ def read_config(path):
             with open(path, encoding="utf-8") as fh:
                 doc = json.load(fh)
         except ValueError as e:
-            raise EntryError("%s is not valid JSON: %s" % (path, e))
+            raise EntryError("%s is not valid JSON: %s" % (shown(path), e))
         for k in DEFAULTS:
             if doc.get(k):
                 cfg[k] = doc[k]
@@ -1024,7 +1029,7 @@ def cmd_check(a):
         for line in describe(res):
             print(line)
         if a.write:
-            print("Wrote %s (status %s)." % (a.write, res["status"]))
+            print("Wrote %s (status %s)." % (shown(a.write), res["status"]))
     return 0 if res["status"] == "triggered" else 1
 
 
@@ -1054,7 +1059,7 @@ def cmd_watch(a):
 
     def on_trigger(res, now):
         write_json(a.out, entry_doc(res, now))
-        print("Wrote %s." % a.out, flush=True)
+        print("Wrote %s." % shown(a.out), flush=True)
 
     def emit(line):
         print(line, flush=True)
@@ -1068,15 +1073,15 @@ def cmd_watchlist(a):
     cfg = read_config(a.config)
     opts = _opts(a, cfg)
     if not os.path.exists(a.watchlist):
-        raise EntryError("no watchlist at %s: run /trader-scanner first (it writes the hits there)" % a.watchlist)
+        raise EntryError("no watchlist at %s: run /trader-scanner first (it writes the hits there)" % shown(a.watchlist))
     try:
         with open(a.watchlist, encoding="utf-8") as fh:
             doc = json.load(fh)
     except ValueError as e:
-        raise EntryError("%s is not valid JSON: %s" % (a.watchlist, e))
+        raise EntryError("%s is not valid JSON: %s" % (shown(a.watchlist), e))
     hits = [h for h in (doc.get("hits") or []) if isinstance(h, dict) and h.get("symbol")]
     if not hits:
-        raise EntryError("no hits in %s: the scanner found nothing to watch" % a.watchlist)
+        raise EntryError("no hits in %s: the scanner found nothing to watch" % shown(a.watchlist))
     if a.offline and not os.path.isdir(a.offline):
         raise EntryError("watchlist --offline wants a folder of <SYMBOL>.json files")
     now = parse_now(a.now) if a.now else None

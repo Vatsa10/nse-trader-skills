@@ -81,6 +81,11 @@ class TicketError(Exception):
     pass
 
 
+def shown(path):
+    """A path as printed to the user: forward slashes on every OS (files are opened as given)."""
+    return str(path).replace(os.sep, "/")
+
+
 # ---------------------------------------------------------------- time (IST, fixed +05:30)
 
 def to_ist(utc):
@@ -115,13 +120,13 @@ def ist_iso(now_utc):
 def read_json(path, what, required=True):
     if not path or not os.path.exists(path):
         if required:
-            raise TicketError("no %s at %s" % (what, path))
+            raise TicketError("no %s at %s" % (what, shown(path)))
         return None
     try:
         with open(path, encoding="utf-8") as fh:
             return json.load(fh)
     except json.JSONDecodeError as e:
-        raise TicketError("%s is not valid JSON: %s" % (path, e))
+        raise TicketError("%s is not valid JSON: %s" % (shown(path), e))
 
 
 def write_json(path, data):
@@ -742,7 +747,7 @@ def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date):
     if pf is None:
         budget = cfg.get("budget")
         if not budget:
-            raise TicketError("no %s yet and no budget in the config to start it from" % portfolio_path)
+            raise TicketError("no %s yet and no budget in the config to start it from" % shown(portfolio_path))
         pf = {"cash": float(budget), "positions": []}
     symbol = norm_symbol(symbol)
     side = str(side).lower()
@@ -811,7 +816,7 @@ def _load(a):
     doc = read_json(a.orders, "orders file (run trader-budget, or ticket.py flatten, first)")
     orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
     if not isinstance(orders, list) or not orders:
-        raise TicketError("no orders in %s" % a.orders)
+        raise TicketError("no orders in %s" % shown(a.orders))
     orders = [to_kite(o) for o in orders]
     for o in orders:
         check_shape(o)
@@ -920,7 +925,7 @@ def cmd_result(a):
     if a.status in ("placed", "paper") and a.filled_qty and a.filled_price:
         apply_fill(a.portfolio, cfg, rec["symbol"], rec["side"], a.filled_qty, a.filled_price, today)
         log_fill(a.state, now, today, rec["symbol"], rec["side"], a.filled_qty, a.filled_price)
-        print("Added the fill to %s." % a.portfolio)
+        print("Added the fill to %s." % shown(a.portfolio))
     elif a.status in ("placed", "paper"):
         print("When it fills, record it: ticket.py fill --symbol %s --side %s --qty Q --price P"
               % (rec["symbol"], rec["side"]))
@@ -941,7 +946,7 @@ def cmd_fill(a):
     pf = apply_fill(a.portfolio, cfg, a.symbol, a.side, a.qty, a.price, date)
     log_fill(a.state, now, date, norm_symbol(a.symbol), a.side, a.qty, a.price)
     print("Recorded %s %s %s at %s on %s in %s. Cash now %s." % (
-        a.side, a.qty, norm_symbol(a.symbol), inr(a.price, True), date, a.portfolio, inr(pf["cash"], True)))
+        a.side, a.qty, norm_symbol(a.symbol), inr(a.price, True), date, shown(a.portfolio), inr(pf["cash"], True)))
     return 0
 
 
@@ -958,10 +963,10 @@ def cmd_flatten(a):
         pf = read_json(a.portfolio, "portfolio", required=False) or {}
         qty = sum(_f(p.get("shares", p.get("qty"))) or 0 for p in pf.get("positions", [])
                   if str(p.get("ticker") or p.get("symbol") or "").upper() == sym)
-        source = a.portfolio
+        source = shown(a.portfolio)
         if qty <= 0:
             raise TicketError("nothing to flatten: no %s shares in %s. Check the broker (get_positions) and "
-                              "pass --qty if you do hold some" % (sym, a.portfolio))
+                              "pass --qty if you do hold some" % (sym, shown(a.portfolio)))
     plan = read_json(a.plan, "plan", required=False) or {}
     flat_by = (plan.get("flat_by") if str(plan.get("symbol", "")).upper() == sym else None) \
         or cfg.get("flat_by") or FLAT_BY
@@ -978,7 +983,7 @@ def cmd_flatten(a):
            "source": "ticket.py flatten %s on %s" % (sym, today), "orders": [order]}
     write_json(a.orders, doc)
     print("Flatten %s: %s (flat by %s IST)." % (sym, plain(to_kite(order)), flat_by))
-    print("Wrote it to %s%s." % (a.orders, (" (it replaced %d earlier proposal%s)"
+    print("Wrote it to %s%s." % (shown(a.orders), (" (it replaced %d earlier proposal%s)"
                                              % (replaced, "" if replaced == 1 else "s")) if replaced else ""))
     if a.qty is None:
         print("The qty comes from %s. Check it against get_positions before you say yes." % source)
@@ -1046,11 +1051,11 @@ def read_tradebook(path):
     """Zerodha Console tradebook CSV -> (trades, notes). A trade is {date, symbol, exchange,
     side, qty, price, order_id, product}; F&O, currency and commodity rows are skipped."""
     if not path or not os.path.exists(path):
-        raise TicketError("no tradebook at %s (Console > Reports > Tradebook > download CSV)" % path)
+        raise TicketError("no tradebook at %s (Console > Reports > Tradebook > download CSV)" % shown(path))
     try:
         rows = _rows_csv(path)
     except (OSError, csv.Error, UnicodeDecodeError) as e:
-        raise TicketError("cannot read the tradebook %s: %s" % (path, e))
+        raise TicketError("cannot read the tradebook %s: %s" % (shown(path), getattr(e, "strerror", None) or e))
     trades, notes, skipped = [], [], 0
     for n, r in enumerate(rows, 2):
         seg = (r.get("segment") or "EQ").upper()
@@ -1074,7 +1079,7 @@ def read_tradebook(path):
         notes.append("%d non-equity row%s skipped (F&O, currency, commodity are out of scope)"
                      % (skipped, "" if skipped == 1 else "s"))
     if not trades:
-        raise TicketError("no equity trades in %s" % path)
+        raise TicketError("no equity trades in %s" % shown(path))
     return trades, notes
 
 
@@ -1123,7 +1128,7 @@ def read_actual(path):
     """Contract-note charges -> {date: total}. CSV or JSON rows with date plus total or the
     parts (brokerage, stt, exchange_txn, sebi, stamp, gst, dp), or a JSON {date: total}."""
     if not path or not os.path.exists(path):
-        raise TicketError("no contract-note charges at %s" % path)
+        raise TicketError("no contract-note charges at %s" % shown(path))
     if path.lower().endswith(".json"):
         doc = read_json(path, "contract-note charges")
         if isinstance(doc, dict) and doc and all(_f(v) is not None for v in doc.values()):
@@ -1133,13 +1138,13 @@ def read_actual(path):
         else:
             rows = doc
         if not isinstance(rows, list):
-            raise TicketError("%s: want rows of {date, total} or {date: total}" % path)
+            raise TicketError("%s: want rows of {date, total} or {date: total}" % shown(path))
         rows = [{str(k).strip().lower(): v for k, v in r.items()} for r in rows if isinstance(r, dict)]
     else:
         try:
             rows = _rows_csv(path)
         except (OSError, csv.Error, UnicodeDecodeError) as e:
-            raise TicketError("cannot read %s: %s" % (path, e))
+            raise TicketError("cannot read %s: %s" % (shown(path), getattr(e, "strerror", None) or e))
     out = {}
     for r in rows:
         day = parse_day(r.get("date") or r.get("trade_date"))
@@ -1154,7 +1159,7 @@ def read_actual(path):
             total = sum(vals)
         out[day] = out.get(day, 0.0) + total
     if not out:
-        raise TicketError("no dated charges in %s (want date plus total, or the charge columns)" % path)
+        raise TicketError("no dated charges in %s (want date plus total, or the charge columns)" % shown(path))
     return out
 
 
@@ -1209,7 +1214,7 @@ def cmd_reconcile(a):
         cal = model.get("calibration") or {}
         print("Charges model (%s): %s rates, verified %s." % (charges_label(model), model.get("broker"),
                                                              model.get("verified")))
-        print("  file: %s (%s)" % (path, "found, merged over the defaults" if os.path.exists(path)
+        print("  file: %s (%s)" % (shown(path), "found, merged over the defaults" if os.path.exists(path)
                                    else "not there: the embedded defaults"))
         i, d = model.get("intraday") or {}, model.get("delivery") or {}
         print("  intraday (MIS): brokerage %s%% capped at %s an order, STT %s%% on the sell, stamp %s%% on the buy"
@@ -1267,7 +1272,7 @@ def cmd_reconcile(a):
     if cal:
         print("Calibration: factor %.4f (median of actual/estimated over %d contract note%s; was %.4f), "
               "written to %s. Every charge estimate in trader-budget, trader-risk and trader-broker now uses it."
-              % (cal["factor"], cal["samples"], "" if cal["samples"] == 1 else "s", res["old_factor"], path))
+              % (cal["factor"], cal["samples"], "" if cal["samples"] == 1 else "s", res["old_factor"], shown(path)))
     elif actual is None:
         print("No contract-note charges given, so nothing was calibrated. Add --actual FILE with each day's "
               "total charges from the contract note (CSV or JSON).")

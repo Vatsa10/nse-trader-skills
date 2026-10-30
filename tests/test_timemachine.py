@@ -677,7 +677,7 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("target first   26.9 %", text)
         self.assertIn("Leans toward the target: target first 26.9 % vs stop first 22.0 %.", text)
-        self.assertIn("Wrote %s." % self.out, text)
+        self.assertIn("Wrote %s." % self.out.replace(os.sep, "/"), text)
         self.assertIn("/trader-budget", text)
         with open(self.out) as fh:
             doc = json.load(fh)
@@ -687,7 +687,7 @@ class Cli(unittest.TestCase):
         self.assertEqual((doc["mc"]["p_target"], doc["mc"]["avg_R"]), (0.2693, 0.051))
         self.assertEqual(sha(doc["mc"]["sample_paths"]), SIM_PATHS)
         self.assertEqual((doc["history"]["triggered"], doc["history"]["avg_R"]), (32, -0.076))
-        self.assertEqual(doc["plan"]["from"], self.plan)
+        self.assertEqual(doc["plan"]["from"], self.plan.replace(os.sep, "/"))
 
     def test_json_output(self):
         code, text, _ = run(["run", "--plan", self.plan, "--offline", RIL, "--now", NOW, "--json"])
@@ -726,6 +726,20 @@ class Cli(unittest.TestCase):
                 self.assertEqual(json.load(fh)["mc"]["replays"], 500)
         finally:
             os.chdir(cwd)
+
+    def test_printed_paths_use_forward_slashes(self):
+        code, text, err = run(["run", "--plan", self.plan, "--offline", RIL, "--now", NOW, "--write", self.out])
+        self.assertIn("Wrote " + self.out.replace(os.sep, "/") + ".", text)
+        self.assertNotIn("\\", text + err)
+        for argv in (["run", "--plan", os.path.join(self.d, "trader", "nope.json")],
+                     ["run", "--plan", self.plan, "--offline", os.path.join(self.d, "missing.json.gz")],
+                     ["run", "--plan", self.plan, "--offline", self.d],
+                     ["chart", "--from", os.path.join(self.d, "trader", "nope.json")]):
+            code, text, err = run(argv)
+            self.assertEqual(code, 1, argv)
+            self.assertNotIn("\\", text + err, argv)
+        self.assertIn(self.d.replace(os.sep, "/") + "/trader/nope.json",
+                      run(["chart", "--from", os.path.join(self.d, "trader", "nope.json")])[2])
 
     def test_errors_are_one_plain_line(self):
         for argv in (["run", "--plan", os.path.join(self.d, "nope.json")],

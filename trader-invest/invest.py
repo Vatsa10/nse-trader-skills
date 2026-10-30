@@ -102,6 +102,11 @@ class InvestError(Exception):
     pass
 
 
+def shown(path):
+    """A path as printed to the user: forward slashes on every OS (files are opened as given)."""
+    return str(path).replace(os.sep, "/")
+
+
 # ---------------------------------------------------------------- small helpers
 
 def ist_today():
@@ -176,13 +181,13 @@ def deep_merge(base, over):
 def read_json(path, what, required=True):
     if not path or not os.path.exists(path):
         if required:
-            raise InvestError("no %s at %s" % (what, path))
+            raise InvestError("no %s at %s" % (what, shown(path)))
         return None
     try:
         with open(path, encoding="utf-8") as fh:
             return json.load(fh)
     except json.JSONDecodeError as e:
-        raise InvestError("%s is not valid JSON: %s" % (path, e))
+        raise InvestError("%s is not valid JSON: %s" % (shown(path), e))
 
 
 def write_json(path, data):
@@ -749,7 +754,7 @@ def read_daily(trader_dir, symbol):
             with open(path, encoding="utf-8") as fh:
                 header = fh.readline().strip().split(",")
                 if header[:1] != ["date"] or "close" not in header:
-                    raise InvestError("%s: header must be date,open,high,low,close,volume" % path)
+                    raise InvestError("%s: header must be date,open,high,low,close,volume" % shown(path))
                 ci = header.index("close")
                 for line in fh:
                     parts = line.strip().split(",")
@@ -774,7 +779,7 @@ def read_daily_bars(trader_dir, symbol):
             with open(path, encoding="utf-8") as fh:
                 header = fh.readline().strip().split(",")
                 if header[:1] != ["date"] or "close" not in header:
-                    raise InvestError("%s: header must be date,open,high,low,close,volume" % path)
+                    raise InvestError("%s: header must be date,open,high,low,close,volume" % shown(path))
                 ci = header.index("close")
                 hi = header.index("high") if "high" in header else None
                 li = header.index("low") if "low" in header else None
@@ -938,7 +943,7 @@ def load_scorecard(trader_dir, path=None):
     over = read_json(user, "scorecard", required=False)
     if over:
         card = deep_merge(card, over)
-        card["_override"] = user
+        card["_override"] = shown(user)
     return card
 
 
@@ -1452,9 +1457,10 @@ def cmd_fetch(args):
         try:
             with open(args.screener_html, encoding="utf-8") as fh:
                 scr = parse_screener(fh.read(), symbol)
-            sources.append({"name": "screener.in (saved html)", "ok": True, "path": args.screener_html})
+            sources.append({"name": "screener.in (saved html)", "ok": True, "path": shown(args.screener_html)})
         except (OSError, InvestError) as e:
-            sources.append({"name": "screener.in (saved html)", "ok": False, "error": str(e)})
+            err = ("could not read %s: %s" % (shown(args.screener_html), e.strerror)) if isinstance(e, OSError) else str(e)
+            sources.append({"name": "screener.in (saved html)", "ok": False, "error": err})
     elif not args.no_net:
         scr, err = fetch_screener(symbol)
         sources.append({"name": "screener.in", "ok": scr is not None, "error": err,
@@ -1462,7 +1468,7 @@ def cmd_fetch(args):
     if args.nse_json:
         try:
             nse = parse_nse_quote(read_json(args.nse_json, "NSE quote JSON"))
-            sources.append({"name": "nse quote api (saved json)", "ok": True, "path": args.nse_json})
+            sources.append({"name": "nse quote api (saved json)", "ok": True, "path": shown(args.nse_json)})
         except InvestError as e:
             sources.append({"name": "nse quote api (saved json)", "ok": False, "error": str(e)})
     elif not args.no_net:
@@ -1473,13 +1479,13 @@ def cmd_fetch(args):
             manual = read_json(args.from_file, "manual fundamentals JSON")
             if not isinstance(manual, dict):
                 raise InvestError("manual JSON must be an object in the fundamentals shape")
-            sources.append({"name": "manual json", "ok": True, "path": args.from_file})
+            sources.append({"name": "manual json", "ok": True, "path": shown(args.from_file)})
         except InvestError as e:
             sources.append({"name": "manual json", "ok": False, "error": str(e)})
     if args.kite_quotes:
         try:
             kite = parse_kite_quotes(read_json(args.kite_quotes, "Kite quotes JSON"), symbol)
-            sources.append({"name": "kite get_quotes", "ok": True, "path": args.kite_quotes})
+            sources.append({"name": "kite get_quotes", "ok": True, "path": shown(args.kite_quotes)})
         except InvestError as e:
             sources.append({"name": "kite get_quotes", "ok": False, "error": str(e)})
     if not (scr or nse or manual):
@@ -1511,7 +1517,7 @@ def cmd_fetch(args):
             f["source"]))
         print("  missing: %s" % (", ".join(missing) or "none"))
         if not args.no_write:
-            print("  wrote %s" % path)
+            print("  wrote %s" % shown(path))
     return 0
 
 
@@ -1523,7 +1529,7 @@ def load_for_analysis(args, symbol, card):
     today = parse_day(args.today) if args.today else ist_today()
     horizon = int(re.sub(r"[^0-9]", "", args.horizon or "5") or 5)
     bars = read_daily_bars(args.trader_dir, symbol)[0] if rows else []
-    return f, analyse(f, card, rows, args.gsec, today, horizon, {"path": path, "adjusted": adj},
+    return f, analyse(f, card, rows, args.gsec, today, horizon, {"path": shown(path) if path else None, "adjusted": adj},
                       swing_numbers(bars) if bars else None, read_market_valuation(args.trader_dir),
                       delivery_im_days(read_delivery(args.trader_dir, symbol)))
 
@@ -1565,13 +1571,13 @@ def cmd_plan(args):
     if args.orders:
         write_json(args.orders, {"source": "trader-invest plan", "created": today.isoformat(),
                                  "orders": [p["tranches"][0]["order"]]})
-        p["orders_written"] = args.orders
+        p["orders_written"] = shown(args.orders)
     if args.json:
         print(json.dumps(p, indent=2, ensure_ascii=False))
     else:
         print_plan(p)
         if args.orders:
-            print("  wrote tranche 1 to %s for trader-risk (nothing is placed without the user's yes)" % args.orders)
+            print("  wrote tranche 1 to %s for trader-risk (nothing is placed without the user's yes)" % shown(args.orders))
     return 0
 
 

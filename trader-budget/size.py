@@ -95,6 +95,11 @@ class SizeError(Exception):
     pass
 
 
+def shown(path):
+    """A path as printed to the user: forward slashes on every OS (files are opened as given)."""
+    return str(path).replace(os.sep, "/")
+
+
 # ---------------------------------------------------------------- time (IST, fixed +05:30, no DST)
 
 def to_ist(utc):
@@ -144,9 +149,9 @@ def read_json(path, what):
         with open(path, encoding="utf-8") as fh:
             return json.load(fh)
     except FileNotFoundError:
-        raise SizeError("no %s at %s" % (what, path))
+        raise SizeError("no %s at %s" % (what, shown(path)))
     except json.JSONDecodeError as e:
-        raise SizeError("%s is not valid JSON: %s" % (path, e))
+        raise SizeError("%s is not valid JSON: %s" % (shown(path), e))
 
 
 def load_config(path):
@@ -932,7 +937,7 @@ def run_plan(a, cfg):
                                                           _price(plan.get("entry")), _price(p)))
         elif p is not None:
             notes.append("%s in %s is %s: not used (older than %d minutes). Sized at the plan's entry."
-                         % (sym, ppath, ("from " + to_ist(t).strftime("%Y-%m-%d %H:%M") + " IST")
+                         % (sym, shown(ppath), ("from " + to_ist(t).strftime("%Y-%m-%d %H:%M") + " IST")
                             if t else "undated", FRESH_MINUTES))
     cash = None
     if a.portfolio and os.path.exists(a.portfolio):
@@ -948,7 +953,7 @@ def run_plan(a, cfg):
     else:
         print(plan_report(s, order, notes))
         if order and a.write:
-            print("Wrote 1 proposed bracket order to %s" % a.write)
+            print("Wrote 1 proposed bracket order to %s" % shown(a.write))
     return 0 if order else 1
 
 
@@ -973,7 +978,7 @@ def run_weights(a, cfg):
     else:
         print(report(result, orders, source))
         if a.write:
-            print("Wrote %d proposed orders to %s" % (len(orders), a.write))
+            print("Wrote %d proposed orders to %s" % (len(orders), shown(a.write)))
     return 0
 
 

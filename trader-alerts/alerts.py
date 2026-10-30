@@ -238,6 +238,11 @@ class AlertError(Exception):
     pass
 
 
+def shown(path):
+    """A path as printed to the user: forward slashes on every OS (files are opened as given)."""
+    return str(path).replace(os.sep, "/")
+
+
 # ---------------------------------------------------------------- time (IST, fixed +05:30, no DST)
 
 def to_ist(utc):
@@ -444,7 +449,7 @@ def cache_quote(sym, why=None):
             pairs = [(t, c) for t, c in zip(ts, closes) if t is not None and c is not None]
         except (ValueError, KeyError, TypeError, IndexError, AttributeError):
             raise AlertError("%s%s is not a Yahoo v8 chart: refresh it with python3 trader-data/data.py "
-                             "intraday %s" % (lead, ipath, sym))
+                             "intraday %s" % (lead, shown(ipath), sym))
         if pairs:
             t, price = pairs[-1]
             utc = datetime.datetime(1970, 1, 1) + datetime.timedelta(seconds=int(t))
@@ -454,7 +459,7 @@ def cache_quote(sym, why=None):
                     "time": utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "currency": meta.get("currency") or "INR",
                     "source": "cache",
                     "note": "%susing cached data from %s (%s), run `python3 trader-data/data.py intraday %s` "
-                            "to refresh" % (fail, _ist_text(utc), ipath, sym)}
+                            "to refresh" % (fail, _ist_text(utc), shown(ipath), sym)}
     if os.path.exists(dpath):
         with open(dpath, encoding="utf-8") as fh:
             rows = [r for r in csv.DictReader(fh) if (r.get("close") or "").strip()]
@@ -465,8 +470,8 @@ def cache_quote(sym, why=None):
                     "high": float(last["high"] or 0) or None, "low": float(last["low"] or 0) or None,
                     "prev_close": prev, "time": last["date"] + "T10:00:00Z", "currency": "INR", "source": "cache",
                     "note": "%susing cached data from the %s daily close (%s), run `python3 trader-data/data.py "
-                            "daily %s` to refresh" % (fail, last["date"], dpath, sym)}
-    raise AlertError("%sNo cache for %s at %s or %s either. Next: %s" % (lead, sym, ipath, dpath, DATA_HINT))
+                            "daily %s` to refresh" % (fail, last["date"], shown(dpath), sym)}
+    raise AlertError("%sNo cache for %s at %s or %s either. Next: %s" % (lead, sym, shown(ipath), shown(dpath), DATA_HINT))
 
 
 def _offline_text(folder, source, sym):
@@ -477,7 +482,7 @@ def _offline_text(folder, source, sym):
     if os.path.exists(base + ".gz"):
         with gzip.open(base + ".gz", "rt", encoding="utf-8") as fh:
             return fh.read()
-    raise AlertError("no offline quote file %s" % base)
+    raise AlertError("no offline quote file %s" % shown(base))
 
 
 def get_quotes(symbols, source="yahoo", offline=None, pause=PAUSE, cache=False):
@@ -547,7 +552,7 @@ def _read(path, default):
         with open(path, encoding="utf-8") as fh:
             return json.load(fh)
     except ValueError as e:
-        raise AlertError("%s is not valid JSON: %s" % (path, e))
+        raise AlertError("%s is not valid JSON: %s" % (shown(path), e))
 
 
 # ---------------------------------------------------------------- rules
@@ -761,7 +766,7 @@ def cmd_quote(a):
         for e in errors:
             print("error: " + e)
         if a.write and quotes:
-            print("Wrote %d price(s) to %s." % (len(quotes), a.write))
+            print("Wrote %d price(s) to %s." % (len(quotes), shown(a.write)))
         print("Quotes are free, delayed and unofficial: for alerts only. Your broker's price is the one that fills.")
     return 0 if quotes else 1
 
@@ -769,7 +774,7 @@ def cmd_quote(a):
 def cmd_check(a):
     doc = _read(a.rules, None)
     if not doc or not doc.get("rules"):
-        raise AlertError("no rules in %s: add some with alerts.py add --from-plan" % a.rules)
+        raise AlertError("no rules in %s: add some with alerts.py add --from-plan" % shown(a.rules))
     rules = doc["rules"]
     now = parse_now(a.now)
     status = market_status(now)
@@ -812,7 +817,7 @@ def cmd_add(a):
     if a.from_plan:
         plan = _read(a.plan, None)
         if plan is None:
-            raise AlertError("no plan at %s (run trader-exit first)" % a.plan)
+            raise AlertError("no plan at %s (run trader-exit first)" % shown(a.plan))
         cfg = _read(a.config, {}) if a.config else {}
         new = rules_from_plan(plan, (cfg or {}).get("flat_by"))
         ids = {r["id"] for r in new}

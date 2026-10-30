@@ -67,6 +67,11 @@ class PortfolioError(Exception):
     pass
 
 
+def shown(path):
+    """A path as printed to the user: forward slashes on every OS (files are opened as given)."""
+    return str(path).replace(os.sep, "/")
+
+
 # ---------------------------------------------------------------- small helpers
 
 def ist_today():
@@ -149,13 +154,13 @@ def clean_symbol(s):
 def read_json(path, what, required=True):
     if not path or not os.path.exists(path):
         if required:
-            raise PortfolioError("no %s at %s" % (what, path))
+            raise PortfolioError("no %s at %s" % (what, shown(path)))
         return None
     try:
         with open(path, encoding="utf-8-sig") as fh:
             return json.load(fh)
     except json.JSONDecodeError as e:
-        raise PortfolioError("%s is not valid JSON: %s" % (path, e))
+        raise PortfolioError("%s is not valid JSON: %s" % (shown(path), e))
 
 
 def write_json(path, doc):
@@ -305,7 +310,7 @@ def read_table(path):
     with open(path, encoding="utf-8-sig", newline="") as fh:
         text = fh.read()
     if text[:2] == "PK":
-        raise PortfolioError("%s looks like an .xlsx file: open it and save as CSV, then import the CSV" % path)
+        raise PortfolioError("%s looks like an .xlsx file: open it and save as CSV, then import the CSV" % shown(path))
     rows = list(csv.reader(io.StringIO(text)))
     for i, r in enumerate(rows):
         n = [_norm(c) for c in r]
@@ -313,13 +318,13 @@ def read_table(path):
             header = n
             body = [x for x in rows[i + 1:] if any(c.strip() for c in x)]
             return header, [dict(zip(header, x)) for x in body]
-    raise PortfolioError("%s has no header row with a Symbol column" % path)
+    raise PortfolioError("%s has no header row with a Symbol column" % shown(path))
 
 
 def detect(path):
     low = path.lower()
     if low.endswith(".xlsx") or low.endswith(".xls"):
-        raise PortfolioError("%s: save the Console XLSX as CSV first (File > Save As > CSV)" % path)
+        raise PortfolioError("%s: save the Console XLSX as CSV first (File > Save As > CSV)" % shown(path))
     if low.endswith(".json"):
         return "kite"
     header, _ = read_table(path)
@@ -327,7 +332,7 @@ def detect(path):
         return "tradebook"
     if "quantity available" in header or "average price" in header or "avg cost" in header:
         return "console"
-    raise PortfolioError("%s: not a Console holdings or tradebook CSV (header %s)" % (path, ", ".join(header)))
+    raise PortfolioError("%s: not a Console holdings or tradebook CSV (header %s)" % (shown(path), ", ".join(header)))
 
 
 def _unwrap_kite(data):
@@ -1332,7 +1337,7 @@ def main(argv=None):
             if a.cash is not None:
                 doc["cash"] = a.cash
             write_json(path, doc)
-            out = {"written": path, "holdings": len(doc["holdings"]), "lots": sum(len(h.get("lots") or [])
+            out = {"written": shown(path), "holdings": len(doc["holdings"]), "lots": sum(len(h.get("lots") or [])
                                                                                   for h in doc["holdings"]),
                    "realised": len(doc["realised"]), "source": doc["source"], "notes": doc["notes"]}
             emit(out, lambda o: "Wrote %s: %d holdings, %d lots, %d realised sales (%s)%s" % (
@@ -1357,7 +1362,7 @@ def main(argv=None):
                           a.tax_mode, a.limit_pct, a.slab, a.others)
             if a.write is not None and r["orders"]:
                 write_orders(orders_path, r["orders"], "trader-portfolio rebalance to %s" % os.path.basename(a.targets))
-                r["written"] = orders_path
+                r["written"] = shown(orders_path)
             emit(r, rebalance_text, as_json)
             return 0
         hold = read_json(os.path.join(tdir, "holdings.json"), "holdings", required=False) or {"holdings": []}
@@ -1371,7 +1376,7 @@ def main(argv=None):
                 write_orders(orders_path, s["orders"], "trader-portfolio sip %s" % s["month"])
             write_json(carry_path, {"month": s["month"], "monthly": s["monthly"], "carry": s["carry"],
                                     "targets": os.path.basename(a.targets)})
-            s["written"] = orders_path
+            s["written"] = shown(orders_path)
         emit(s, sip_text, as_json)
         return 0
     except PortfolioError as e:

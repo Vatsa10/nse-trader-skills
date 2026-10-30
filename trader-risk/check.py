@@ -253,6 +253,11 @@ class RiskError(Exception):
     pass
 
 
+def shown(path):
+    """A path as printed to the user: forward slashes on every OS (files are opened as given)."""
+    return str(path).replace(os.sep, "/")
+
+
 # ---------------------------------------------------------------- time (IST, fixed +05:30, no DST)
 
 def to_ist(utc):
@@ -518,13 +523,13 @@ def band_words(band):
 def read_json(path, what, required=True):
     if not path or not os.path.exists(path):
         if required:
-            raise RiskError("no %s at %s" % (what, path))
+            raise RiskError("no %s at %s" % (what, shown(path)))
         return None
     try:
         with open(path, encoding="utf-8") as fh:
             return json.load(fh)
     except json.JSONDecodeError as e:
-        raise RiskError("%s is not valid JSON: %s" % (path, e))
+        raise RiskError("%s is not valid JSON: %s" % (shown(path), e))
 
 
 def fingerprint(order):
@@ -1091,7 +1096,7 @@ def main(argv=None):
         doc = read_json(a.orders, "orders file (run trader-budget first)")
         orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
         if not isinstance(orders, list) or not orders:
-            raise RiskError("no orders in %s" % a.orders)
+            raise RiskError("no orders in %s" % shown(a.orders))
         cfg = read_json(a.config, "config", required=False) or {}
         portfolio = read_json(a.portfolio, "portfolio", required=False)
         pdoc = read_json(a.prices, "prices", required=False) or {}
@@ -1109,7 +1114,7 @@ def main(argv=None):
             rec = dict(res)
             rec["checked_at"] = datetime.datetime.now(datetime.timezone.utc).replace(
                 microsecond=0, tzinfo=None).strftime("%Y-%m-%dT%H:%M:%SZ")
-            rec["orders_file"] = a.orders
+            rec["orders_file"] = shown(a.orders)
             tmp = a.out + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(rec, fh, indent=2)

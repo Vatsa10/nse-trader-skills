@@ -614,6 +614,28 @@ class Cli(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(check.main(base + ["--now", "2026-10-19 10:30"]), 0)
 
+    def test_printed_paths_use_forward_slashes(self):
+        with tempfile.TemporaryDirectory() as d:
+            missing = os.path.join(d, "trader", "orders.json")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(check.main(["--orders", missing, "--no-write"]), 1)
+            self.assertIn(missing.replace(os.sep, "/"), err.getvalue())
+            self.assertNotIn("\\", err.getvalue())
+            bad = os.path.join(d, "bad.json")
+            with open(bad, "w") as fh:
+                fh.write("{not json")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(check.main(["--orders", REL_PATH, "--config", bad, "--no-write"]), 1)
+            self.assertNotIn("\\", err.getvalue())
+            out = os.path.join(d, "state", "risk.json")
+            with redirect_stdout(io.StringIO()):
+                check.main(["--orders", REL_PATH, "--config", CFG_PATH, "--portfolio", missing, "--prices", missing,
+                            "--state", missing, "--now", "2026-10-19 10:30", "--out", out])
+            with open(out) as fh:
+                self.assertNotIn("\\", json.load(fh)["orders_file"])
+
     def test_errors_are_one_line(self):
         for argv, want in ((["--orders", "/nonexistent.json"], "no orders file"),
                            (["--orders", REL_PATH, "--now", "noon"], "--now wants"),

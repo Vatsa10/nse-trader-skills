@@ -52,6 +52,28 @@ class Base(unittest.TestCase):
 
 
 class Import(Base):
+    def test_printed_paths_use_forward_slashes(self):
+        code, out, err = self.cli("import", KITE, TRADEBOOK)
+        self.assertEqual(code, 0, err)
+        self.assertIn("Wrote %s:" % os.path.join(self.dir, "holdings.json").replace(os.sep, "/"), out)
+        self.assertNotIn("\\", out + err)
+        orders = os.path.join(self.dir, "out", "orders.json")
+        code, out, err = self.cli("rebalance", "--targets", TARGETS, "--prices", PRICES, "--cash", "5000",
+                                  "--write", orders)
+        self.assertEqual(code, 0, err)
+        code, out, err = self.cli("rebalance", "--targets", TARGETS, "--prices", PRICES, "--cash", "5000",
+                                  "--write", orders, "--json")
+        self.assertEqual(json.loads(out)["written"], orders.replace(os.sep, "/"))
+        code, out, err = run(["show", "--dir", os.path.join(self.dir, "none")])
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(self.dir.replace(os.sep, "/") + "/none/holdings.json", err)
+        self.assertNotIn("\\", out + err)
+        csvp = os.path.join(self.dir, "bad.csv")
+        with open(csvp, "w") as fh:
+            fh.write("a,b\n1,2\n")
+        code, out, err = self.cli("import", csvp)
+        self.assertNotIn("\\", out + err)
+
     def test_kite_get_holdings_with_t1(self):
         doc = self.imported(KITE)
         h = self.by_sym(doc)

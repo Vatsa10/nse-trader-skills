@@ -247,6 +247,24 @@ class V4Fallbacks(unittest.TestCase):
         self.assertIn("data.py doctor", joined)
         self.assertIn("import-kite", joined)
 
+    def test_printed_paths_use_forward_slashes(self):
+        def blocked(self_, url, name):
+            raise news.NewsError("HTTP 403 for %s" % url)
+
+        def nse_blocked(self_, ticker):
+            raise news.NewsError("NSE answered HTTP 401")
+        news.Fetcher.get, news.Fetcher.get_nse = blocked, nse_blocked
+        args = ["--tickers", "RELIANCE", "--state", "s.json", "--now", NOW, "--portfolio", "x", "--watchlist", "x",
+                "--plan", "x"]
+        code, out, err = run(args)
+        self.assertIn("No cache at trader/data/intraday/RELIANCE-5m.json or trader/data/daily/RELIANCE.csv", out)
+        self.assertNotIn("\\", out + err)
+        news.Fetcher.get = self.saved[0]
+        code, out, err = run(args + ["--offline", os.path.join("nowhere", "feeds"), "--no-moves", "--json"])
+        self.assertIn("nowhere/feeds/yahoo-RELIANCE.xml", out)
+        self.assertNotIn("\\", err)
+        self.assertEqual(news.show_path(os.path.join("trader", "data")), "trader/data")
+
     def test_live_blocked_uses_nse_and_the_cache(self):
         def blocked(self_, url, name):
             raise news.NewsError("HTTP 403 for %s" % url)

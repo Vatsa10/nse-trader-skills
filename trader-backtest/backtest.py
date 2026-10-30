@@ -89,6 +89,11 @@ class BTError(Exception):
     pass
 
 
+def shown(path):
+    """A path as printed to the user: forward slashes on every OS (files are opened as given)."""
+    return str(path).replace(os.sep, "/")
+
+
 # ---------------------------------------------------------------- small helpers
 
 def inr(x):
@@ -226,7 +231,7 @@ def read_csv_bars(path):
         rd = csv.DictReader(fh)
         need = {"date", "open", "high", "low", "close"}
         if not rd.fieldnames or not need.issubset(set(h.strip().lower() for h in rd.fieldnames)):
-            raise BTError("%s: header must be date,open,high,low,close,volume" % path)
+            raise BTError("%s: header must be date,open,high,low,close,volume" % shown(path))
         for row in rd:
             row = {k.strip().lower(): v for k, v in row.items() if k}
             try:
@@ -301,11 +306,11 @@ def load_symbol(data_dir, sym, auto_adjust=False):
         path, adjusted = raw, False
     else:
         raise BTError("no daily bars for %s in %s. Fetch them first with trader-data (daily cache "
-                      "trader/data/daily/%s.csv)." % (sym, data_dir, sym))
+                      "trader/data/daily/%s.csv)." % (sym, shown(data_dir), sym))
     bars = read_csv_bars(path)
     if len(bars) < 2:
-        raise BTError("%s has fewer than 2 usable rows" % path)
-    info = {"symbol": sym, "file": path, "adjusted": adjusted, "rows": len(bars),
+        raise BTError("%s has fewer than 2 usable rows" % shown(path))
+    info = {"symbol": sym, "file": shown(path), "adjusted": adjusted, "rows": len(bars),
             "first": bars[0]["date"].isoformat(), "last": bars[-1]["date"].isoformat(),
             "corporate_action_flags": [], "auto_adjusted": False}
     if not adjusted:
@@ -1221,7 +1226,7 @@ def build_config(a):
         if not a.name:
             raise BTError("--config needs --name (one of: %s)" % ", ".join(sorted(named)))
         if a.name not in named:
-            raise BTError("no strategy %r in %s (have: %s)" % (a.name, path, ", ".join(sorted(named))))
+            raise BTError("no strategy %r in %s (have: %s)" % (a.name, shown(path), ", ".join(sorted(named))))
         s = named[a.name]
         cfg["strategy"] = s.get("type") or s.get("strategy")
         cfg["symbols"] = [x.upper() for x in (s.get("symbols") or ([s["symbol"]] if s.get("symbol") else []))]
@@ -1597,7 +1602,7 @@ def cmd_run(a):
             safe = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in result["name"])
             out = os.path.join(os.path.abspath(a.root), "trader", "backtests", "%s-%s" % (safe, stamp))
         write_outputs(result, out)
-        result["output_dir"] = out
+        result["output_dir"] = shown(out)
     if a.json:
         print(json.dumps(summary_doc(result), indent=2, default=str))
     else:
@@ -1649,7 +1654,7 @@ def cmd_strategies(a):
     if os.path.isfile(path):
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
-        print("Named strategies in %s:" % path)
+        print("Named strategies in %s:" % shown(path))
         for k, v in sorted((doc.get("strategies") or {}).items()):
             print("  %-22s %s %s %s" % (k, v.get("type"), ",".join(v.get("symbols") or []), json.dumps(v.get("params") or {})))
     return 0

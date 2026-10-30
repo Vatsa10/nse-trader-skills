@@ -263,6 +263,11 @@ class PlanError(Exception):
     pass
 
 
+def shown(path):
+    """A path as printed to the user: forward slashes on every OS (files are opened as given)."""
+    return str(path).replace(os.sep, "/")
+
+
 # ---------------------------------------------------------------- time
 
 def to_ist(utc):
@@ -432,7 +437,7 @@ def load_charges(path=None):
             with open(path, encoding="utf-8") as fh:
                 over = json.load(fh)
         except (OSError, ValueError) as e:
-            raise PlanError("%s is not valid JSON: %s" % (path, e))
+            raise PlanError("%s is not valid JSON: %s" % (shown(path), e))
         if isinstance(over, dict):
             _merge(model, over)
     return model
@@ -486,7 +491,7 @@ def load_bands(path=None):
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
     except (OSError, ValueError) as e:
-        raise PlanError("%s is not valid JSON: %s" % (path, e))
+        raise PlanError("%s is not valid JSON: %s" % (shown(path), e))
     return doc if isinstance(doc, dict) and isinstance(doc.get("bands"), dict) else None
 
 
@@ -679,7 +684,7 @@ def read_text(path):
 
 
 def intraday_cache_path(sym):
-    return os.path.join(DATA_DIR, "intraday", "%s-5m.json" % sym).replace(os.sep, "/")   # same text on every OS
+    return shown(os.path.join(DATA_DIR, "intraday", "%s-5m.json" % sym))   # same text on every OS
 
 
 def warn(msg):
@@ -706,13 +711,13 @@ def read_intraday_cache(sym, interval="5m", why=None):
     if interval != "5m":
         raise PlanError("%sThe cache holds 5-minute bars only: use --interval 5m, or %s" % (lead, DATA_HINT))
     if not os.path.exists(path):
-        raise PlanError("%sNo cache at %s either. Next: %s" % (lead, path, DATA_HINT))
+        raise PlanError("%sNo cache at %s either. Next: %s" % (lead, shown(path), DATA_HINT))
     try:
         text = read_text(path)
     except (OSError, ValueError) as e:
-        raise PlanError("could not read %s: %s" % (path, e))
+        raise PlanError("could not read %s: %s" % (shown(path), getattr(e, "strerror", None) or e))
     warn("%susing cached data from %s (%s), run `python3 trader-data/data.py intraday %s` to refresh"
-         % (("live fetch failed (%s); " % why) if why else "", cache_when(text, path), path, sym))
+         % (("live fetch failed (%s); " % why) if why else "", cache_when(text, path), shown(path), sym))
     return text
 
 
@@ -725,11 +730,11 @@ def load_chart(sym, interval, day, offline=None, cache=False):
             if not os.path.exists(path):
                 path += ".gz"
         if not os.path.exists(path):
-            raise PlanError("no offline file %s" % path)
+            raise PlanError("no offline file %s" % shown(path))
         try:
             text = read_text(path)
         except (OSError, ValueError) as e:
-            raise PlanError("could not read %s: %s" % (path, e))
+            raise PlanError("could not read %s: %s" % (shown(path), getattr(e, "strerror", None) or e))
     elif cache:
         text = read_intraday_cache(sym, interval)
     else:
@@ -914,7 +919,7 @@ def read_daily_bars(sym, before, daily_dir=None):
             break
     if path is None:
         raise PlanError("no daily bars for %s in %s: a CNC swing stop reads the daily cache. Next: %s"
-                        % (sym, base, DATA_HINT))
+                        % (sym, shown(base), DATA_HINT))
     rows = []
     try:
         with open(path, encoding="utf-8", newline="") as fh:
@@ -928,7 +933,7 @@ def read_daily_bars(sym, before, daily_dir=None):
                 if d < before:
                     rows.append((d, {"h": h, "l": lo, "c": cl}))
     except (OSError, UnicodeDecodeError) as e:
-        raise PlanError("could not read %s: %s" % (path, e))
+        raise PlanError("could not read %s: %s" % (shown(path), getattr(e, "strerror", None) or e))
     rows.sort(key=lambda r: r[0])
     return [b for _, b in rows], path
 
@@ -958,12 +963,12 @@ def swing_stop(bars, retrace=0.0, min_bars=0, what="session"):
 
 def read_json(path, what):
     if not path or not os.path.exists(path):
-        raise PlanError("no %s at %s" % (what, path))
+        raise PlanError("no %s at %s" % (what, shown(path)))
     try:
         with open(path, encoding="utf-8") as fh:
             return json.load(fh)
     except ValueError as e:
-        raise PlanError("%s is not valid JSON: %s" % (path, e))
+        raise PlanError("%s is not valid JSON: %s" % (shown(path), e))
 
 
 def read_config(path):
@@ -1012,10 +1017,10 @@ def gather(a):
         path = a.from_path or "trader/entry.json"
         doc = read_json(path, "entry (run /trader-entry first, or give --symbol and --entry)")
         if str(doc.get("side") or "buy").lower() not in ("buy", "long"):
-            raise PlanError("%s is a %s: v2 plans longs only" % (path, doc.get("side")))
+            raise PlanError("%s is a %s: v2 plans longs only" % (shown(path), doc.get("side")))
         if doc.get("status") != "triggered" and a.entry is None:
             raise PlanError("%s says %s is %s, not triggered: plan once it triggers, or give --entry PRICE to plan ahead"
-                            % (path, doc.get("symbol"), doc.get("status") or "unknown"))
+                            % (shown(path), doc.get("symbol"), doc.get("status") or "unknown"))
         orr = doc.get("opening_range") or {}
         info = {"symbol": str(doc.get("symbol") or "").upper(), "entry": a.entry if a.entry is not None else doc.get("price"),
                 "setup": a.setup or doc.get("setup") or "orb", "date": a.date or doc.get("date"),
@@ -1024,10 +1029,10 @@ def gather(a):
                 "interval": a.interval or doc.get("interval") or "5m",
                 "or_high": a.or_high if a.or_high is not None else orr.get("high"),
                 "or_low": a.or_low if a.or_low is not None else orr.get("low"),
-                "or_minutes": orr.get("minutes") or a.or_minutes, "source": path,
+                "or_minutes": orr.get("minutes") or a.or_minutes, "source": shown(path),
                 "level": getattr(a, "level", None) if getattr(a, "level", None) is not None else doc.get("level")}
         if not info["symbol"] or info["entry"] is None:
-            raise PlanError("%s has no symbol or price" % path)
+            raise PlanError("%s has no symbol or price" % shown(path))
         info["symbol"] = nse_symbol(info["symbol"])
     if info["interval"] not in INTERVALS:
         raise PlanError("interval is 5m or 1m")
@@ -1063,7 +1068,7 @@ def build_plan(a, now_utc):
     if stop_rule == "swing" and product == "CNC":
         dbars, dpath = read_daily_bars(info["symbol"], day, getattr(a, "daily_dir", None))
         swing = swing_stop(dbars, SWING_DAILY_RETRACE, SWING_DAILY_MIN_BARS, "daily")
-        swing["source"] = dpath
+        swing["source"] = shown(dpath)
     elif stop_rule in ("atr", "swing"):
         chart = load_chart(info["symbol"], info["interval"], day, a.offline, getattr(a, "cache", False))
         bars = session_bars(chart, day, info["interval"], info["entry_bar"], parse_now(a.now) if a.now else None)
@@ -1244,20 +1249,20 @@ def cmd_plan(a):
     for w in warnings:
         print("Note: " + w)
     if a.write:
-        print("Wrote %s." % a.write)
+        print("Wrote %s." % shown(a.write))
     print("Next: /trader-timemachine replays it, then /trader-budget sizes it to your max loss. Nothing was placed.")
     return 0
 
 
 def cmd_show(a):
     if not os.path.exists(a.plan):
-        print("No plan at %s yet. Make one: exit.py plan --write" % a.plan)
+        print("No plan at %s yet. Make one: exit.py plan --write" % shown(a.plan))
         return 1
     plan = read_json(a.plan, "plan")
     need = ("symbol", "date", "entry", "stop", "target", "risk_per_share", "reward_risk")
     for k in need + (() if plan.get("product") == "CNC" else ("flat_by",)):
         if plan.get(k) is None:
-            raise PlanError("%s is missing %r: make a new plan with exit.py plan --write" % (a.plan, k))
+            raise PlanError("%s is missing %r: make a new plan with exit.py plan --write" % (shown(a.plan), k))
     if a.json:
         print(json.dumps(plan, indent=2))
         return 0
@@ -1289,7 +1294,7 @@ def main(argv=None):
     p.add_argument("--product", type=str.upper, default="MIS", choices=["MIS", "CNC"],
                    help="MIS intraday (default, flat by 15:15) or CNC delivery (no flat-by, delivery charges)")
     p.add_argument("--level", type=float, help="the price a level setup closes above (kept in plan.json for the replay)")
-    p.add_argument("--daily-dir", default=DAILY_DIR, help="daily bars for a CNC swing stop (default %s)" % DAILY_DIR)
+    p.add_argument("--daily-dir", default=DAILY_DIR, help="daily bars for a CNC swing stop (default %s)" % shown(DAILY_DIR))
     p.add_argument("--target", help="2R (default), 1R, 1.5R, price:X")
     p.add_argument("--flat-by", help="HH:MM IST (default: config flat_by, 15:15; MIS square-off is about 15:20)")
     p.add_argument("--qty", type=int, help="shares, for the cost estimate (default: about Rs 1 lakh worth)")
@@ -1298,8 +1303,8 @@ def main(argv=None):
     p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON for an atr stop")
     p.add_argument("--cache", action="store_true",
                    help="read trader/data/intraday/<SYMBOL>-5m.json (trader-data) instead of Yahoo")
-    p.add_argument("--bands", default=BANDS_PATH, help="price bands file (default %s)" % BANDS_PATH)
-    p.add_argument("--charges", default=CHARGES_PATH, help="charges override (default %s)" % CHARGES_PATH)
+    p.add_argument("--bands", default=BANDS_PATH, help="price bands file (default %s)" % shown(BANDS_PATH))
+    p.add_argument("--charges", default=CHARGES_PATH, help="charges override (default %s)" % shown(CHARGES_PATH))
     p.add_argument("--now", help='pretend it is this IST time, e.g. "2026-10-19 10:15"')
     p.add_argument("--write", nargs="?", const="trader/plan.json", metavar="PATH",
                    help="save the plan (default trader/plan.json)")
