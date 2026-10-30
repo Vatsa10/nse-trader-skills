@@ -96,7 +96,7 @@ Every command takes `--data DIR` (default `trader/data`) and `--now
 | `trader/data/flows.csv` | `date,category,buy_cr,sell_cr,net_cr`: FII/FPI and DII cash-market flows in rupee crore, one row per date and category (contract below) | scanner, invest |
 | `trader/data/preopen.json` | the latest pre-open book: advances, declines and one entry per stock with its indicative price (contract below) | scanner, entry |
 | `trader/data/nse_cookies.txt` | the NSE cookie jar (Mozilla format), reused between runs | data.py only |
-| `trader/data/calendar.json` | NSE holidays and special sessions (contract below) | data, alerts, and the skills that load alerts |
+| `trader/data/calendar.json` | NSE holidays and special sessions (contract below) | data, alerts, and every script with the calendar block |
 
 `band_pct` is `null` for a stock with no band (F&O stocks; they still have
 dynamic circuit limits in `lower` / `upper`). A symbol whose band could not
@@ -194,7 +194,7 @@ stops the import unless `--drop-bad`; `--adjusted` files it in `.adj.csv`;
 - Errors (the write is refused): low above open/close, high below them, a
   price at or below 0, a duplicate date, dates not ascending.
 - Warnings: NSE trading days missing (calendar 2024, 2025, 2026 built in: NSE
-  circulars CMTR/59722, CMTR/65587, the 2026 list in trader-alerts plus the
+  circulars CMTR/59722, CMTR/65587, the 2026 list plus the
   15 Jan 2026 BMC election closure; any other year from `calendar.json`, see
   below), a bar on a closed day, a 1/2, 1/5 or 1/10 overnight
   gap (a split or bonus: refresh `.adj.csv` from Yahoo). Muhurat, budget-day
@@ -469,8 +469,10 @@ counts and NSE's timestamp on top. It overwrites `trader/data/preopen.json`
 The built-in holiday tables stop at 2026. `data.py calendar` keeps a cache,
 `trader/data/calendar.json`, so 2027 and later work without a code change.
 Run it once now and then once a day (or whenever `status` says "no holiday
-list for <year>"). It is also the file trader-alerts reads, and through
-trader-alerts the skills that load it by path.
+list for <year>"). The calendar logic is one canonical block (kept
+byte-identical in every script that has it, see `reference/specs/nse_calendar.py`):
+the built-in tables for 2024 to 2026 with `calendar.json` laid on top, read from
+`--data DIR` on every run. It is also the file trader-alerts reads.
 
 ```json
 {"fetched_at": "2027-03-08T04:30:00Z",
@@ -488,8 +490,10 @@ trader-alerts the skills that load it by path.
   evening session.
 - Is NSE open on date d: a special session means open; Saturday and Sunday
   mean closed; a date in `holidays` means closed; a year in `years` means
-  open; any other year falls back to the built-in tables. A missing or
-  corrupt file means the built-in tables, never an error.
+  open (its holidays replace the built-in ones); any other year falls back to
+  the built-in tables. A missing or corrupt file means the built-in tables,
+  never an error. For data bars a Muhurat day counts as a day with a bar even
+  though the regular market is shut.
 - Sources: `GET /api/holiday-master?type=trading` (the `CM` list: weekend
   rows are dropped), and `GET /api/circulars?from_date=DD-MM-YYYY&to_date=DD-MM-YYYY&dept=CMTR`
   since the last check (first run: 5 days back, then at most once a day).

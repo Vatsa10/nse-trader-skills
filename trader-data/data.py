@@ -58,7 +58,6 @@ import email.utils
 import gzip
 import http.client
 import http.cookiejar
-import importlib.util
 import io
 import json
 import os
@@ -158,70 +157,147 @@ VIX_ELEVATED, VIX_CALM = 1.15, 0.85   # India VIX against its recent average
 VIX_AVG_ROWS = 20
 REPORT_KEYS = {"sec_bhavdata_full": "CM-BHAVDATA-FULL", "BhavCopy_NSE_CM": "CM-UDIFF-BHAVCOPY-CSV"}
 
-# ---------------------------------------------------------------- NSE trading calendar
-# 2026 comes from trader-alerts/alerts.py (loaded below, with this copy as the fallback).
-NSE_HOLIDAYS_2026_COPY = {
-    "2026-01-15": "Maharashtra municipal elections (special holiday)",
-    "2026-01-26": "Republic Day", "2026-03-03": "Holi", "2026-03-26": "Shri Ram Navami",
-    "2026-03-31": "Shri Mahavir Jayanti", "2026-04-03": "Good Friday",
-    "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti", "2026-05-01": "Maharashtra Day",
-    "2026-05-28": "Bakri Id", "2026-06-26": "Muharram", "2026-09-14": "Ganesh Chaturthi",
-    "2026-10-02": "Mahatma Gandhi Jayanti", "2026-10-20": "Dussehra",
-    "2026-11-10": "Diwali Balipratipada", "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
-    "2026-12-25": "Christmas",
-}
-# Special closure announced later: NSE circular CMTR72260 (Jan 2026), Maharashtra municipal elections.
-NSE_EXTRA_2026 = {"2026-01-15": "Maharashtra municipal elections (special holiday)"}
-# 2025: NSE circular 170/2024, NSE/CMTR/65587, 13 Dec 2024
-# (https://nsearchives.nseindia.com/content/circulars/CMTR65587.pdf). Oct 21 is a holiday
-# with a Muhurat session, listed in SPECIAL_SESSIONS so its bar is accepted.
-NSE_HOLIDAYS_2025 = {
-    "2025-02-26": "Mahashivratri", "2025-03-14": "Holi", "2025-03-31": "Id-Ul-Fitr (Ramadan Eid)",
-    "2025-04-10": "Shri Mahavir Jayanti", "2025-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
-    "2025-04-18": "Good Friday", "2025-05-01": "Maharashtra Day", "2025-08-15": "Independence Day",
-    "2025-08-27": "Ganesh Chaturthi", "2025-10-02": "Mahatma Gandhi Jayanti/Dussehra",
-    "2025-10-21": "Diwali Laxmi Pujan (Muhurat session)", "2025-10-22": "Diwali-Balipratipada",
-    "2025-11-05": "Prakash Gurpurb Sri Guru Nanak Dev", "2025-12-25": "Christmas",
-}
-# 2024: NSE circular 154/2023, NSE/CMTR/59722, 12 Dec 2023, plus three special closures
-# announced during the year (Jan 22, May 20, Nov 20). Cross-checked against bhavcopy history.
-NSE_HOLIDAYS_2024 = {
+# --- nse calendar: keep byte-identical in every script that has it (tests/test_repo.py checks) ---
+# The NSE equity-segment trading calendar. Built-in tables for 2024 to 2026 (NSE circulars), then
+# trader/data/calendar.json (trader-data: data.py calendar, from NSE's holiday master and its trading
+# circulars) laid on top: for a year the file lists, its holidays replace the built-in ones. A missing or
+# unreadable file means the built-in tables; nothing here raises.
+BUILTIN_HOLIDAYS = {   # weekday closures of the regular 09:15-15:30 market
     "2024-01-22": "Special holiday (Ram Mandir)", "2024-01-26": "Republic Day",
     "2024-03-08": "Mahashivratri", "2024-03-25": "Holi", "2024-03-29": "Good Friday",
     "2024-04-11": "Id-Ul-Fitr (Ramadan Eid)", "2024-04-17": "Shri Ram Navmi",
     "2024-05-01": "Maharashtra Day", "2024-05-20": "Lok Sabha election (Mumbai)",
     "2024-06-17": "Bakri Id", "2024-07-17": "Moharram", "2024-08-15": "Independence Day",
-    "2024-10-02": "Mahatma Gandhi Jayanti", "2024-11-01": "Diwali Laxmi Pujan (Muhurat session)",
+    "2024-10-02": "Mahatma Gandhi Jayanti", "2024-11-01": "Diwali Laxmi Pujan",
     "2024-11-15": "Gurunanak Jayanti", "2024-11-20": "Maharashtra assembly election",
     "2024-12-25": "Christmas",
+    "2025-02-26": "Mahashivratri", "2025-03-14": "Holi", "2025-03-31": "Id-Ul-Fitr (Ramadan Eid)",
+    "2025-04-10": "Shri Mahavir Jayanti", "2025-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2025-04-18": "Good Friday", "2025-05-01": "Maharashtra Day", "2025-08-15": "Independence Day",
+    "2025-08-27": "Ganesh Chaturthi", "2025-10-02": "Mahatma Gandhi Jayanti/Dussehra",
+    "2025-10-21": "Diwali Laxmi Pujan", "2025-10-22": "Diwali-Balipratipada",
+    "2025-11-05": "Prakash Gurpurb Sri Guru Nanak Dev", "2025-12-25": "Christmas",
+    "2026-01-15": "Maharashtra municipal elections (special holiday)", "2026-01-26": "Republic Day",
+    "2026-03-03": "Holi", "2026-03-26": "Shri Ram Navami", "2026-03-31": "Shri Mahavir Jayanti",
+    "2026-04-03": "Good Friday", "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2026-05-01": "Maharashtra Day", "2026-05-28": "Bakri Id", "2026-06-26": "Muharram",
+    "2026-09-14": "Ganesh Chaturthi", "2026-10-02": "Mahatma Gandhi Jayanti", "2026-10-20": "Dussehra",
+    "2026-11-10": "Diwali-Balipratipada", "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
+    "2026-12-25": "Christmas",
 }
-# Sessions on a weekend or a holiday: a bar on these dates is real, not an error.
-SPECIAL_SESSIONS = {
-    "2023-11-12": "Muhurat (Sunday)", "2024-01-20": "Saturday special session",
-    "2024-03-02": "Saturday DR session", "2024-05-18": "Saturday DR session",
-    "2024-11-01": "Muhurat", "2025-02-01": "Budget day (Saturday)", "2025-10-21": "Muhurat",
-    "2026-02-01": "Budget day (Sunday)", "2026-11-08": "Muhurat (Sunday)",
+BUILTIN_YEARS = (2024, 2025, 2026)
+BUILTIN_SPECIAL = {    # normal-hours sessions on a weekend or a holiday
+    "2024-01-20": "Saturday special session", "2024-03-02": "Saturday DR session",
+    "2024-05-18": "Saturday DR session", "2025-02-01": "Union Budget (Saturday)",
+    "2026-02-01": "Union Budget (Sunday)",
 }
+BUILTIN_MUHURAT = {    # one evening hour at times set by circular: the regular market is closed that day
+    "2023-11-12": "Diwali Laxmi Pujan (Muhurat), Sunday", "2024-11-01": "Diwali Laxmi Pujan (Muhurat)",
+    "2025-10-21": "Diwali Laxmi Pujan (Muhurat)", "2026-11-08": "Diwali Laxmi Pujan (Muhurat), Sunday",
+}
+NSE_HOLIDAYS = dict(BUILTIN_HOLIDAYS)    # these four hold the built-in tables plus calendar.json
+SPECIAL_SESSIONS = dict(BUILTIN_SPECIAL)
+MUHURAT_SESSIONS = dict(BUILTIN_MUHURAT)
+CALENDAR_YEARS = BUILTIN_YEARS
+CALENDAR_PATH = os.path.join("trader", "data", "calendar.json")
 
 
-def _alerts_holidays():
-    path = os.path.join(os.path.dirname(HERE), "trader-alerts", "alerts.py")
+def _cal_dates(m):
+    """{"2027-01-26": "Republic Day"} with bad keys dropped; anything but an object is corrupt."""
+    if m is None:
+        return {}
+    if not isinstance(m, dict):
+        raise ValueError("not an object")
+    out = {}
+    for k, v in m.items():
+        try:
+            datetime.date.fromisoformat(k)
+        except (TypeError, ValueError):
+            continue
+        out[k] = str(v)
+    return out
+
+
+def load_calendar(path=None):
+    """trader/data/calendar.json -> {"years", "holidays", "special_sessions", "fetched_at",
+    "last_circular_check", "warnings"}, or None when it is missing or unreadable."""
     try:
-        spec = importlib.util.spec_from_file_location("trader_alerts_for_data", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        got = {k: v for k, v in getattr(mod, "BUILTIN_HOLIDAYS", mod.NSE_HOLIDAYS).items()
-               if k.startswith("2026-")}
-        return got or dict(NSE_HOLIDAYS_2026_COPY)
-    except Exception:
-        return dict(NSE_HOLIDAYS_2026_COPY)
+        with open(path or CALENDAR_PATH, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        if not isinstance(doc, dict):
+            return None
+        warns = doc.get("warnings")
+        return {"years": sorted(set(int(y) for y in (doc.get("years") or []))),
+                "holidays": _cal_dates(doc.get("holidays")),
+                "special_sessions": _cal_dates(doc.get("special_sessions")),
+                "fetched_at": doc.get("fetched_at"), "last_circular_check": doc.get("last_circular_check"),
+                "warnings": [str(w) for w in warns] if isinstance(warns, list) else []}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
 
 
-NSE_HOLIDAYS_2026 = _alerts_holidays()
-HOLIDAYS = {}
-for _h in (NSE_HOLIDAYS_2024, NSE_HOLIDAYS_2025, NSE_HOLIDAYS_2026, NSE_EXTRA_2026):
-    HOLIDAYS.update(_h)
-CALENDAR_YEARS = (2024, 2025, 2026)
+def is_muhurat(name):
+    low = str(name).lower()
+    return "muhurat" in low or "laxmi pujan" in low
+
+
+def apply_calendar(path=None):
+    """Rebuild NSE_HOLIDAYS, SPECIAL_SESSIONS, MUHURAT_SESSIONS and CALENDAR_YEARS from the built-in
+    tables plus calendar.json (path None = CALENDAR_PATH). Returns the file's contents, or None."""
+    global CALENDAR_YEARS
+    cal = load_calendar(path)
+    for table, base in ((NSE_HOLIDAYS, BUILTIN_HOLIDAYS), (SPECIAL_SESSIONS, BUILTIN_SPECIAL),
+                        (MUHURAT_SESSIONS, BUILTIN_MUHURAT)):
+        table.clear()
+        table.update(base)
+    CALENDAR_YEARS = BUILTIN_YEARS
+    if not cal:
+        return None
+    for y in cal["years"]:
+        for iso in [k for k in NSE_HOLIDAYS if k.startswith("%04d-" % y)]:
+            del NSE_HOLIDAYS[iso]
+    NSE_HOLIDAYS.update(cal["holidays"])
+    for iso, name in cal["special_sessions"].items():
+        SPECIAL_SESSIONS.pop(iso, None)
+        MUHURAT_SESSIONS.pop(iso, None)
+        (MUHURAT_SESSIONS if is_muhurat(name) else SPECIAL_SESSIONS)[iso] = name
+    CALENDAR_YEARS = tuple(sorted(set(BUILTIN_YEARS) | set(cal["years"])))
+    return cal
+
+
+def years_text():
+    return ", ".join(str(y) for y in CALENDAR_YEARS)
+
+
+def trading_day(d):
+    """(open, reason) for the regular 09:15-15:30 market on date d. A normal-hours special session is
+    open; a weekend, a listed holiday and a Muhurat day are closed. Outside CALENDAR_YEARS the weekday
+    rule is a guess, which calendar_known says."""
+    iso = d.isoformat()
+    if iso in MUHURAT_SESSIONS:
+        return False, ("special session: %s, about an hour in the evening at times set by NSE; "
+                       "no normal 09:15-15:30 market" % MUHURAT_SESSIONS[iso])
+    if iso in SPECIAL_SESSIONS:
+        return True, ""
+    if d.weekday() >= 5:
+        return False, "weekend"
+    name = NSE_HOLIDAYS.get(iso)
+    if name:
+        return False, "NSE holiday: " + name
+    return True, ""
+
+
+def calendar_known(d):
+    return d.year in CALENDAR_YEARS
+
+
+def bars_expected(d):
+    """Does NSE publish a daily bar for d? Every regular trading day, and a Muhurat session too."""
+    return trading_day(d)[0] or d.isoformat() in MUHURAT_SESSIONS
+
+
+apply_calendar()   # at import, from trader/data/calendar.json in the working directory when it exists
+# --- end nse calendar ---
 
 
 class DataError(Exception):
@@ -238,70 +314,17 @@ class SourceError(DataError):
         return msg + (" (%s)" % self.hint if self.hint else "")
 
 
-_CAL = None    # calendar.json as load_calendar reads it; None means the built-in tables only
-
-
-def _iso_map(m):
-    """{"2027-01-26": "Republic Day"} with bad keys dropped; a non-object is corrupt."""
-    if m is None:
-        return {}
-    if not isinstance(m, dict):
-        raise ValueError("not an object")
-    out = {}
-    for k, v in m.items():
-        try:
-            datetime.date.fromisoformat(k)
-        except (TypeError, ValueError):
-            continue
-        out[k] = str(v)
-    return out
-
-
-def load_calendar(data_dir):
-    """<data_dir>/calendar.json -> dict, or None when it is missing or corrupt (never raises)."""
-    doc = _read_json(os.path.join(data_dir, CALENDAR_FILE), None)
-    if not isinstance(doc, dict):
-        return None
-    try:
-        warns = doc.get("warnings")
-        return {"years": sorted(set(int(y) for y in (doc.get("years") or []))),
-                "holidays": _iso_map(doc.get("holidays")),
-                "special_sessions": _iso_map(doc.get("special_sessions")),
-                "fetched_at": doc.get("fetched_at"), "last_circular_check": doc.get("last_circular_check"),
-                "warnings": [str(w) for w in warns] if isinstance(warns, list) else []}
-    except (TypeError, ValueError, AttributeError):
-        return None
-
-
-def calendar_known(year):
-    return year in CALENDAR_YEARS or bool(_CAL and year in _CAL["years"])
+_CAL = None    # calendar.json as apply_calendar read it for this run; None means the built-in tables only
 
 
 def closed_name(iso):
-    return (_CAL and _CAL["holidays"].get(iso)) or HOLIDAYS.get(iso, "weekend")
-
-
-def trading_day(d):
-    """Is NSE open on d? A special session is open, a weekend is closed, then calendar.json (a listed
-    holiday is closed, any other day of a year it covers is open), then the built-in tables."""
-    iso = d.isoformat()
-    cal = _CAL
-    if iso in SPECIAL_SESSIONS or (cal and iso in cal["special_sessions"]):
-        return True
-    if d.weekday() >= 5:
-        return False
-    if cal:
-        if iso in cal["holidays"]:
-            return False
-        if d.year in cal["years"]:
-            return True
-    return iso not in HOLIDAYS
+    return NSE_HOLIDAYS.get(iso, "weekend")
 
 
 def trading_days(start, end):
     out, d = [], start
     while d <= end:
-        if trading_day(d):
+        if bars_expected(d):
             out.append(d)
         d += datetime.timedelta(days=1)
     return out
@@ -309,7 +332,7 @@ def trading_days(start, end):
 
 def prev_trading_day(d):
     d -= datetime.timedelta(days=1)
-    while not trading_day(d):
+    while not bars_expected(d):
         d -= datetime.timedelta(days=1)
     return d
 
@@ -345,7 +368,7 @@ def ist_to_ts(dt):
 def last_complete_session(now_ist):
     """The latest session whose EOD data should exist (bhavcopy appears in the evening)."""
     d = now_ist.date()
-    if trading_day(d) and d.weekday() < 5 and now_ist.time() >= datetime.time(18, 0):
+    if bars_expected(d) and d.weekday() < 5 and now_ist.time() >= datetime.time(18, 0):
         return d
     return prev_trading_day(d)
 
@@ -473,13 +496,13 @@ def validate_daily(rows):
             errors.append("%s: %s" % (d, p))
         if r.get("volume") is not None and r["volume"] < 0:
             errors.append("%s: negative volume" % d)
-        if not trading_day(day) and calendar_known(day.year):
+        if not bars_expected(day) and calendar_known(day):
             warnings.append("%s has a bar but NSE was closed (%s)" % (d, closed_name(d)))
     if rows and not errors:
         first = datetime.date.fromisoformat(rows[0]["date"])
         last = datetime.date.fromisoformat(rows[-1]["date"])
-        known = [x for x in trading_days(first, last) if calendar_known(x.year) and x.isoformat() not in seen]
-        unknown = [x for x in trading_days(first, last) if not calendar_known(x.year)
+        known = [x for x in trading_days(first, last) if calendar_known(x) and x.isoformat() not in seen]
+        unknown = [x for x in trading_days(first, last) if not calendar_known(x)
                    and x.isoformat() not in seen]
         if known:
             warnings.append("gap: %d NSE trading day(s) missing: %s" % (len(known), compress(known)))
@@ -1319,7 +1342,7 @@ def window(rows, years, now_ist, fill_gaps):
         have = set(r["date"] for r in rows)
         if fill_gaps:
             first = datetime.date.fromisoformat(rows[0]["date"])
-            miss = [d for d in trading_days(first, end) if d.isoformat() not in have and calendar_known(d.year)]
+            miss = [d for d in trading_days(first, end) if d.isoformat() not in have and calendar_known(d)]
         else:
             miss = trading_days(last + datetime.timedelta(days=1), end)
         return miss, end
@@ -1939,7 +1962,7 @@ def import_kite_quotes(a, doc, kind):
             when = now
         last = num(q.get("last_price"))
         o, h, low = num(ohlc.get("open")), num(ohlc.get("high")), num(ohlc.get("low"))
-        if when.time() >= CLOSE_T and trading_day(when.date()) and None not in (o, h, low, last):
+        if when.time() >= CLOSE_T and bars_expected(when.date()) and None not in (o, h, low, last):
             raw_p = data_paths(a.data, sym)[0]
             row = bar(when.date(), o, h, low, last, num(q.get("volume")) or num(q.get("volume_traded")) or 0)
             p = ohlc_problem(o, h, low, last)
@@ -2193,9 +2216,9 @@ def calendar_changes(old, new):
 def builtin_disagreement(new, years):
     """Where NSE's list and the built-in tables differ, for the years both cover."""
     out = []
-    for y in sorted(set(years) & set(CALENDAR_YEARS)):
+    for y in sorted(set(years) & set(BUILTIN_YEARS)):
         pre = "%04d-" % y
-        built = {k for k in HOLIDAYS if k.startswith(pre) and k not in SPECIAL_SESSIONS}
+        built = {k for k in BUILTIN_HOLIDAYS if k.startswith(pre) and k not in BUILTIN_MUHURAT}
         live = {k for k in new["holidays"] if k.startswith(pre)}
         if built - live:
             out.append("%d: closed in the built-in table only: %s" % (y, compress(sorted(built - live))))
@@ -2230,7 +2253,7 @@ def cmd_calendar(a):
     now = parse_now(a.now)
     today = now.date()
     path = os.path.join(a.data, CALENDAR_FILE)
-    old = load_calendar(a.data)
+    old = load_calendar(path)
     if old is None and os.path.exists(path):
         print("calendar.json is unreadable; building it again from NSE.")
     need_master, need_circ = calendar_needs(old, today, now, a.refresh)
@@ -3603,8 +3626,8 @@ def cmd_status(a):
             ", ".join(str(y) for y in cal["years"]) or "none", len(cal["holidays"]), cal["fetched_at"],
             cal["last_circular_check"]))
     else:
-        print("calendar.json: none (built-in tables cover %s)" % ", ".join(str(y) for y in CALENDAR_YEARS))
-    if not calendar_known(now.year):
+        print("calendar.json: none (built-in tables cover %s)" % years_text())
+    if not calendar_known(now.date()):
         print("  no holiday list for %d: run data.py calendar" % now.year)
     b = _read_json(os.path.join(a.data, "bands.json"), None)
     if b:
@@ -3721,12 +3744,13 @@ def main(argv=None):
         ap.print_help()
         return 1
     global _CAL
-    saved, _CAL = _CAL, load_calendar(a.data)
+    saved, _CAL = _CAL, apply_calendar(os.path.join(a.data, CALENDAR_FILE))
     try:
         return {"daily": cmd_daily, "intraday": cmd_intraday, "bands": cmd_bands, "import-kite": cmd_import_kite,
                 "import-csv": cmd_import_csv, "calendar": cmd_calendar, "delivery": cmd_delivery,
                 "actions": cmd_actions, "adjust": cmd_adjust, "index": cmd_index, "chain": cmd_chain,
-                "flows": cmd_flows, "preopen": cmd_preopen, "doctor": cmd_doctor, "record": cmd_record, "status": cmd_status}[a.cmd](a)
+                "flows": cmd_flows, "preopen": cmd_preopen, "doctor": cmd_doctor, "record": cmd_record,
+                "status": cmd_status}[a.cmd](a)
     except DataError as e:
         print("data.py: %s" % e, file=sys.stderr)
         return 1
@@ -3735,6 +3759,7 @@ def main(argv=None):
         return 1
     finally:
         _CAL = saved
+        apply_calendar()      # back to the built-in tables plus the working directory's calendar.json
 
 
 if __name__ == "__main__":
