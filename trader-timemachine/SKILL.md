@@ -195,7 +195,7 @@ setup, and it is what the user should hear before `/trader-budget` sizes it.
   them, do not rewrite them. Never judge a 2R or 3R plan by target first vs
   stop first alone: the verdict already weighs the target's R.
 - Simulated odds are not predictions and not promises. Say it once, plainly.
-- NSE holidays are flagged (the built-in 2026 list plus `trader/data/calendar.json`;
+- NSE holidays are flagged (the built-in 2024 to 2026 lists plus `trader/data/calendar.json`;
   check nseindia.com for a year in neither).
 - Free Yahoo data is unofficial and can lag. Bars are 5-minute bars, checked
   bar by bar, never tick by tick and never real time.

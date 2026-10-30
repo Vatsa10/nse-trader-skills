@@ -626,7 +626,7 @@ class CalendarFile(unittest.TestCase):
         self.assertIn("NSE holiday: Republic Day", self.warnings(t, "2026-10-13", 105))      # 2027-01-26
         w = self.warnings(t, "2026-10-14", 105)                                              # 2027-01-27
         self.assertFalse(any("holiday" in x or "covers" in x for x in w), w)
-        self.assertIn(2027, t.HOLIDAY_YEARS)
+        self.assertIn(2027, t.CALENDAR_YEARS)
         self.assertNotIn("2027-01-26", tm.NSE_HOLIDAYS)                  # the module loaded at import is untouched
 
     def test_muhurat_is_not_a_regular_session(self):
@@ -639,23 +639,24 @@ class CalendarFile(unittest.TestCase):
     def test_a_special_session_is_not_a_holiday(self):
         t = self.fresh(dict(CAL_2027, holidays={"2027-01-26": "Republic Day"},
                             special_sessions={"2027-01-26": "Budget session"}))
-        self.assertEqual(t.SPECIAL_SESSIONS, {"2026-02-01": "Union Budget (Sunday)", "2027-01-26": "Budget session"})
+        self.assertEqual(t.SPECIAL_SESSIONS["2027-01-26"], "Budget session")
+        self.assertEqual(t.SPECIAL_SESSIONS["2026-02-01"], "Union Budget (Sunday)")
         w = self.warnings(t, "2026-10-13", 105)                                              # 2027-01-26
         self.assertFalse(any("holiday" in x for x in w), w)
 
     def test_builtin_2026_still_holds_and_other_years_still_warn(self):
         t = self.fresh(CAL_2027)
         self.assertIn("NSE holiday: Dussehra", self.warnings(t, "2026-10-13", 7))            # 2026-10-20
-        self.assertIn("holiday list covers 2026, 2027 only: check nseindia.com",
+        self.assertIn("holiday list covers 2024, 2025, 2026, 2027 only: check nseindia.com",
                       self.warnings(t, "2026-10-16", 448))                                   # 2028-01-07
 
     def test_missing_or_corrupt_file_falls_back_to_the_builtin_table(self):
-        self.assertEqual(load("trader-timemachine", "timemachine").HOLIDAY_YEARS, (2026,))  # no file at all
+        self.assertEqual(load("trader-timemachine", "timemachine").CALENDAR_YEARS, (2024, 2025, 2026))  # no file at all
         for bad in ("{not json", "[1, 2]", "", '{"years": "x", "holidays": []}'):
             t = self.fresh(bad)
-            self.assertEqual(t.HOLIDAY_YEARS, (2026,), bad)
+            self.assertEqual(t.CALENDAR_YEARS, (2024, 2025, 2026), bad)
             w = self.warnings(t, "2026-10-13", 105)                                          # 2027-01-26
-            self.assertIn("holiday list covers 2026 only: check nseindia.com", w, bad)
+            self.assertIn("holiday list covers 2024, 2025, 2026 only: check nseindia.com", w, bad)
             self.assertFalse(any("Republic Day" in x for x in w), bad)
 
 
@@ -676,7 +677,7 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("target first   26.9 %", text)
         self.assertIn("Leans toward the target: target first 26.9 % vs stop first 22.0 %.", text)
-        self.assertIn("Wrote %s." % self.out, text)
+        self.assertIn("Wrote %s." % self.out.replace(os.sep, "/"), text)
         self.assertIn("/trader-budget", text)
         with open(self.out) as fh:
             doc = json.load(fh)
@@ -686,7 +687,7 @@ class Cli(unittest.TestCase):
         self.assertEqual((doc["mc"]["p_target"], doc["mc"]["avg_R"]), (0.2693, 0.051))
         self.assertEqual(sha(doc["mc"]["sample_paths"]), SIM_PATHS)
         self.assertEqual((doc["history"]["triggered"], doc["history"]["avg_R"]), (32, -0.076))
-        self.assertEqual(doc["plan"]["from"], self.plan)
+        self.assertEqual(doc["plan"]["from"], self.plan.replace(os.sep, "/"))
 
     def test_json_output(self):
         code, text, _ = run(["run", "--plan", self.plan, "--offline", RIL, "--now", NOW, "--json"])
@@ -725,6 +726,20 @@ class Cli(unittest.TestCase):
                 self.assertEqual(json.load(fh)["mc"]["replays"], 500)
         finally:
             os.chdir(cwd)
+
+    def test_printed_paths_use_forward_slashes(self):
+        code, text, err = run(["run", "--plan", self.plan, "--offline", RIL, "--now", NOW, "--write", self.out])
+        self.assertIn("Wrote " + self.out.replace(os.sep, "/") + ".", text)
+        self.assertNotIn("\\", text + err)
+        for argv in (["run", "--plan", os.path.join(self.d, "trader", "nope.json")],
+                     ["run", "--plan", self.plan, "--offline", os.path.join(self.d, "missing.json.gz")],
+                     ["run", "--plan", self.plan, "--offline", self.d],
+                     ["chart", "--from", os.path.join(self.d, "trader", "nope.json")]):
+            code, text, err = run(argv)
+            self.assertEqual(code, 1, argv)
+            self.assertNotIn("\\", text + err, argv)
+        self.assertIn(self.d.replace(os.sep, "/") + "/trader/nope.json",
+                      run(["chart", "--from", os.path.join(self.d, "trader", "nope.json")])[2])
 
     def test_errors_are_one_plain_line(self):
         for argv in (["run", "--plan", os.path.join(self.d, "nope.json")],

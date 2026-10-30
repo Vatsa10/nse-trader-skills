@@ -258,7 +258,7 @@ class DayTradeChecks(unittest.TestCase):
                  ("2026-10-19 15:35", "the market is closed"),
                  ("2026-10-17 10:15", "the market is closed today (weekend"),
                  ("2026-10-20 10:15", "the market is closed today (NSE holiday: Dussehra"),
-                 ("2026-11-10 10:15", "the market is closed today (NSE holiday: Diwali Balipratipada"),
+                 ("2026-11-10 10:15", "the market is closed today (NSE holiday: Diwali-Balipratipada"),
                  ("2026-10-19T03:55:00Z", "no new entries before 09:30 IST (it is 09:25)")]
         for now, want in cases:
             self.assertIn("window: " + want, reasons(self.one(rel(), now=now)), now)
@@ -271,7 +271,7 @@ class DayTradeChecks(unittest.TestCase):
 
     def test_holidays_outside_2026_warn(self):
         res = self.one(rel(), now="2027-01-04 10:00")
-        self.assertIn("holiday list covers 2026 only: check nseindia.com", " ".join(res["warnings"]))
+        self.assertIn("holiday list covers 2024, 2025, 2026 only: check nseindia.com", " ".join(res["warnings"]))
 
     def test_ist_is_a_fixed_offset(self):
         self.assertEqual(at("2026-10-19 09:45"), datetime.datetime(2026, 10, 19, 4, 15))
@@ -385,17 +385,17 @@ class CalendarFile(unittest.TestCase):
     def test_builtin_2026_still_holds_and_other_years_still_warn(self):
         c = self.fresh(CAL_2027)
         self.assertIn("NSE holiday: Dussehra", reasons(self.one(c, "2026-10-20 10:15")))
-        self.assertIn("holiday list covers 2026, 2027 only: check nseindia.com",
+        self.assertIn("holiday list covers 2024, 2025, 2026, 2027 only: check nseindia.com",
                       " ".join(self.one(c, "2028-01-03 10:15")["warnings"]))
 
     def test_missing_or_corrupt_file_falls_back_to_the_builtin_table(self):
-        self.assertEqual(load("trader-risk", "check").CALENDAR_YEARS, (2026,))   # no file at all
+        self.assertEqual(load("trader-risk", "check").CALENDAR_YEARS, (2024, 2025, 2026))   # no file at all
         for bad in ("{not json", "[1, 2]", "", '{"years": "x", "holidays": []}'):
             c = self.fresh(bad)
-            self.assertEqual(c.CALENDAR_YEARS, (2026,), bad)
+            self.assertEqual(c.CALENDAR_YEARS, (2024, 2025, 2026), bad)
             res = self.one(c, "2027-01-26 10:15")
             self.assertEqual(verdicts(res), ["PASS"], bad)
-            self.assertIn("holiday list covers 2026 only: check nseindia.com", " ".join(res["warnings"]), bad)
+            self.assertIn("holiday list covers 2024, 2025, 2026 only: check nseindia.com", " ".join(res["warnings"]), bad)
             self.assertIn("NSE holiday: Dussehra", reasons(self.one(c, "2026-10-20 10:15")), bad)
 
 
@@ -613,6 +613,28 @@ class Cli(unittest.TestCase):
             self.assertIn("= ₹108.93 at the stop", buf.getvalue())
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(check.main(base + ["--now", "2026-10-19 10:30"]), 0)
+
+    def test_printed_paths_use_forward_slashes(self):
+        with tempfile.TemporaryDirectory() as d:
+            missing = os.path.join(d, "trader", "orders.json")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(check.main(["--orders", missing, "--no-write"]), 1)
+            self.assertIn(missing.replace(os.sep, "/"), err.getvalue())
+            self.assertNotIn("\\", err.getvalue())
+            bad = os.path.join(d, "bad.json")
+            with open(bad, "w") as fh:
+                fh.write("{not json")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(check.main(["--orders", REL_PATH, "--config", bad, "--no-write"]), 1)
+            self.assertNotIn("\\", err.getvalue())
+            out = os.path.join(d, "state", "risk.json")
+            with redirect_stdout(io.StringIO()):
+                check.main(["--orders", REL_PATH, "--config", CFG_PATH, "--portfolio", missing, "--prices", missing,
+                            "--state", missing, "--now", "2026-10-19 10:30", "--out", out])
+            with open(out) as fh:
+                self.assertNotIn("\\", json.load(fh)["orders_file"])
 
     def test_errors_are_one_line(self):
         for argv, want in ((["--orders", "/nonexistent.json"], "no orders file"),

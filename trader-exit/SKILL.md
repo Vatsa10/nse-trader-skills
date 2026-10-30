@@ -137,7 +137,7 @@ to a delivery hold; for an intraday trade it is usually far from price.
   `get_historical_data`, save the JSON and run `python3 trader-data/data.py
   import-kite FILE --kind historical --symbol SYMBOL`.
 - **Holidays.** A plan for an NSE holiday says so ("NSE holiday: Dussehra").
-  The list is the built-in 2026 table plus `trader/data/calendar.json` (`python3
+  The list is the built-in 2024 to 2026 tables plus `trader/data/calendar.json` (`python3
   trader-data/data.py calendar` writes it). For a year in neither, check
   nseindia.com.
 

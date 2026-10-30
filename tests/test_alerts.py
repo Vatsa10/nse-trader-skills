@@ -43,7 +43,7 @@ def plan_rules():
 
 class Calendar(unittest.TestCase):
     def test_holidays_match_the_spec(self):
-        self.assertEqual(sorted(alerts.NSE_HOLIDAYS), NSE_2026)
+        self.assertEqual([k for k in sorted(alerts.NSE_HOLIDAYS) if k.startswith("2026")], NSE_2026)
         self.assertEqual(alerts.NSE_EARLY_CLOSE, {})
         for d in alerts.NSE_HOLIDAYS:
             self.assertLess(datetime.date.fromisoformat(d).weekday(), 5, d)
@@ -106,7 +106,7 @@ class CalendarFile(unittest.TestCase):
         self.assertEqual(alerts.trading_day(D(2026, 10, 20)), (False, "NSE holiday: Dussehra"))
         # 2026 is listed in the file, so the file replaces the built-in 2026 table for that year
         self.assertEqual(alerts.trading_day(D(2026, 1, 26)), (True, ""))
-        self.assertEqual(alerts.CALENDAR_YEARS, (2026, 2027))
+        self.assertEqual(alerts.CALENDAR_YEARS, (2024, 2025, 2026, 2027))
         st = alerts.market_status(ist("2027-03-08T10:00"))
         self.assertTrue(st["open"])
         self.assertTrue(st["calendar_known"])
@@ -120,7 +120,7 @@ class CalendarFile(unittest.TestCase):
         self.assertIn("NSE holiday: Republic Day", text)
         self.assertNotIn("holiday list covers", text)
         code, text, _ = run(["clock", "--now", "2028-01-04T10:00"])
-        self.assertIn("holiday list covers 2026, 2027 only: check nseindia.com", text)
+        self.assertIn("holiday list covers 2024, 2025, 2026, 2027 only: check nseindia.com", text)
         self.assertIn("data.py calendar", text)
 
     def test_normal_hours_special_session(self):
@@ -165,14 +165,14 @@ class CalendarFile(unittest.TestCase):
 
     def test_missing_or_corrupt_file_is_the_builtin_table(self):
         self.assertIsNone(alerts.apply_calendar(self.none))
-        self.assertEqual(sorted(alerts.NSE_HOLIDAYS), NSE_2026)
+        self.assertEqual([k for k in sorted(alerts.NSE_HOLIDAYS) if k.startswith("2026")], NSE_2026)
         for text in ("", "{nope", "[]", '{"years": ["x"]}', '{"years": [2027], "holidays": ["a"]}', "null"):
             path = os.path.join(self.tmp, "bad.json")
             with open(path, "w") as fh:
                 fh.write(text)
             self.assertIsNone(alerts.apply_calendar(path), text)
-            self.assertEqual(sorted(alerts.NSE_HOLIDAYS), NSE_2026, text)
-            self.assertEqual(alerts.CALENDAR_YEARS, (2026,))
+            self.assertEqual([k for k in sorted(alerts.NSE_HOLIDAYS) if k.startswith("2026")], NSE_2026, text)
+            self.assertEqual(alerts.CALENDAR_YEARS, (2024, 2025, 2026))
             self.assertEqual(alerts.trading_day(datetime.date(2026, 10, 20)), (False, "NSE holiday: Dussehra"))
         self.assertEqual(alerts.NSE_HOLIDAYS, alerts.BUILTIN_HOLIDAYS)
 
@@ -339,6 +339,12 @@ class V4Cache(unittest.TestCase):
         self.assertEqual(q, {})
         for must in ("Forbidden", "No cache for HINDCOPPER", "data.py doctor", "get_historical_data", "import-kite"):
             self.assertIn(must, errors[0])
+
+    def test_printed_paths_use_forward_slashes(self):
+        code, out, err = run(["quote", "HINDCOPPER", "--cache"])
+        self.assertNotIn("\\", out + err)
+        self.assertIn("trader/data/daily/HINDCOPPER.csv", out + err)
+        self.assertEqual(alerts.shown(os.path.join("trader", "data", "x.json")), "trader/data/x.json")
 
     def test_intraday_cache_then_daily_csv(self):
         os.makedirs(os.path.join("trader", "data", "intraday"))
@@ -572,6 +578,16 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("no plan", err)
 
+    def test_paths_in_messages_use_forward_slashes(self):
+        code, text, err = run(["quote", "RELIANCE", "--offline", QDIR, "--write", self.prices])
+        self.assertEqual(code, 0)
+        self.assertIn("Wrote 1 price(s) to " + self.prices.replace(os.sep, "/"), text)
+        for argv in (["check", "--rules", self.rules, "--state", self.state],
+                     ["add", "--rules", self.rules, "--from-plan", "--plan", os.path.join(self.d, "none")],
+                     ["quote", "RELIANCE", "--offline", os.path.join(self.d, "nowhere")]):
+            code, out, err = run(argv)
+            self.assertNotIn("\\", out + err, argv)
+
     def test_quote_write_merges(self):
         code, text, _ = run(["quote", "RELIANCE", "TCS", "--offline", QDIR, "--write", self.prices,
                              "--now", "2026-10-13T10:00:01Z"])
@@ -601,7 +617,7 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("NSE holiday: Christmas", text)
         code, text, _ = run(["clock", "--now", "2027-01-04T10:00"])
-        self.assertIn("holiday list covers 2026 only: check nseindia.com", text)
+        self.assertIn("holiday list covers 2024, 2025, 2026 only: check nseindia.com", text)
 
     def test_check_without_rules(self):
         code, _, err = run(["check", "--rules", self.rules, "--offline", QDIR])

@@ -18,6 +18,9 @@ ORDER_PATH = ["trader-scanner", "trader-entry", "trader-exit", "trader-timemachi
 SWING_COPIES = [("trader-scanner", "scan.py"), ("trader-backtest", "backtest.py"),
                 ("trader-invest", "invest.py"), ("trader-exit", "exit.py"),
                 ("trader-timemachine", "timemachine.py")]
+CALENDAR_COPIES = [("trader-alerts", "alerts.py"), ("trader-data", "data.py"), ("trader-scanner", "scan.py"),
+                   ("trader-entry", "entry.py"), ("trader-exit", "exit.py"), ("trader-risk", "check.py"),
+                   ("trader-timemachine", "timemachine.py"), ("trader-news", "news.py")]
 V1_ONLY = ["trader-copycat", "trader-screener", "trader-tax", "trader-rebalance"]
 
 
@@ -157,6 +160,22 @@ class Repo(unittest.TestCase):
             self.assertTrue(0 <= a < b, "%s/%s has no swing engine block" % (s, f))
             blocks[f] = text[a:b]
         self.assertEqual(len(set(blocks.values())), 1, sorted(blocks))
+
+    def test_nse_calendar_is_the_same_everywhere(self):
+        # one calendar (built-in 2024 to 2026 tables, calendar.json on top), pasted into every script that needs it
+        marks = ("# --- nse calendar:", "# --- end nse calendar ---")
+        blocks = {}
+        for s, f in CALENDAR_COPIES:
+            with open(os.path.join(ROOT, s, f), encoding="utf-8") as fh:
+                text = fh.read()
+            a, b = text.find(marks[0]), text.find(marks[1])
+            self.assertTrue(0 <= a < b, "%s/%s has no nse calendar block" % (s, f))
+            blocks[f] = text[a:b]
+        self.assertEqual(len(blocks), len(CALENDAR_COPIES))
+        self.assertEqual(len(set(blocks.values())), 1, sorted(blocks))
+        with open(os.path.join(ROOT, "reference", "specs", "nse_calendar.py"), encoding="utf-8") as fh:
+            spec = fh.read()
+        self.assertEqual(spec[spec.find(marks[0]):spec.find(marks[1])], next(iter(blocks.values())))
 
 
 if __name__ == "__main__":

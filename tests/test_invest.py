@@ -196,6 +196,23 @@ class Fetch(Base):
         self.assertEqual(f["promoter_pledge_pct"], 0)
         self.assertNotIn("_provenance", f)
 
+    def test_printed_paths_use_forward_slashes(self):
+        fund = os.path.join(self.td, "data", "fundamentals", "IOC.json")
+        code, out, err = run(["--trader-dir", self.td, "--today", TODAY, "fetch", "IOC", "--no-net",
+                              "--screener-html", os.path.join(D, "screener-IOC.html")])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("wrote " + fund.replace(os.sep, "/"), out)
+        self.assertNotIn("\\", out + err)
+        code, out, err = run(["--trader-dir", self.td, "--today", TODAY, "fetch", "IOC", "--no-net",
+                              "--screener-html", os.path.join(D, "nope.html"),
+                              "--from", os.path.join(D, "manual-IOC.json"), "--json"])
+        self.assertNotIn("\\", out + err)
+        code, out, err = run(["--trader-dir", os.path.join(self.tmp, "none"), "analyse", "IOC"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(self.tmp.replace(os.sep, "/") + "/none/data/fundamentals/IOC.json", err + out)
+        self.assertNotIn("\\", err + out)
+        self.assertEqual(inv.shown(os.path.join("trader", "data")), "trader/data")
+
     def test_no_source_explains_the_fallback(self):
         code, out, _ = run(["--trader-dir", self.td, "fetch", "IOC", "--no-net"])
         self.assertEqual(code, 2)
@@ -330,6 +347,14 @@ class Plan(Base):
         self.assertLessEqual(p["invested_incl_charges"], 5000)
         self.assertEqual(p["charges_label"], "estimate")
         self.assertIn("2026-11-14", p["tranches"][1]["condition"])
+
+    def test_orders_path_prints_with_forward_slashes(self):
+        path = os.path.join(self.tmp, "out", "orders.json")
+        code, out, err = run(["--trader-dir", self.td, "--today", TODAY, "plan", "IOC", "--amount", "5000",
+                              "--orders", path])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("wrote tranche 1 to " + path.replace(os.sep, "/") + " for trader-risk", out)
+        self.assertNotIn("\\", out + err)
 
     def test_delivery_charges_model(self):
         ch = inv.load_charges(self.td)

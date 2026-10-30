@@ -158,6 +158,26 @@ class Cli(unittest.TestCase):
         with open(os.path.join("trader", "plan.json")) as fh:
             return json.load(fh)
 
+    def test_printed_paths_use_forward_slashes(self):
+        self.write(os.path.join("trader", "entry.json"), REEL_ENTRY)
+        code, text, err = self.plan("--write")
+        self.assertIn("Wrote trader/plan.json.", text)
+        self.assertNotIn("\\", text + err)
+        missing = os.path.join("trader", "none.json")
+        for argv in (["plan", "--from", missing], ["show", "--plan", missing],
+                     ["plan", "--symbol", "RELIANCE", "--entry", "12.5", "--stop", "atr:1.5", "--cache"],
+                     ["plan", "--symbol", "RELIANCE", "--entry", "12.5", "--stop", "swing", "--product", "CNC",
+                      "--daily-dir", os.path.join("trader", "nodaily")]):
+            code, text, err = run(exitp, argv)
+            self.assertNotIn("\\", text + err, argv)
+        self.assertIn("trader/none.json", run(exitp, ["plan", "--from", missing])[2])
+        with self.assertRaises(SystemExit):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                exitp.main(["plan", "--help"])
+        self.assertNotIn("\\", out.getvalue())
+        self.assertIn("trader/charges.json", out.getvalue())
+
     def test_entry_to_plan_end_to_end(self):
         self.write(os.path.join("trader", "entry.json"), REEL_ENTRY)
         code, text, err = self.plan("--stop", "or-mid", "--target", "1R", "--write")
@@ -266,7 +286,7 @@ class Cli(unittest.TestCase):
         self.assertIn("NSE holiday: Dussehra.", json.loads(text)["warnings"])
         self.write(os.path.join("trader", "entry.json"), dict(REEL_ENTRY, date="2027-01-04"))
         code, text, _ = run(exitp, ["plan", "--now", "2027-01-04 10:01", "--json"])
-        self.assertTrue(any("covers 2026 only" in w for w in json.loads(text)["warnings"]))
+        self.assertTrue(any("covers 2024, 2025, 2026 only" in w for w in json.loads(text)["warnings"]))
         self.write(os.path.join("trader", "entry.json"), REEL_ENTRY)
         code, text, _ = self.plan("--qty", "100", "--json")
         p = json.loads(text)
@@ -335,7 +355,7 @@ class CalendarFile(unittest.TestCase):
         w = self.warnings(x, "2027-01-27")
         self.assertFalse(any("holiday" in t or "covers" in t for t in w), w)
         self.assertEqual(x.session(datetime.date(2027, 1, 27)), (x.OPEN, x.CLOSE))
-        self.assertIn(2027, x.HOLIDAY_YEARS)
+        self.assertIn(2027, x.CALENDAR_YEARS)
         self.assertNotIn("2027-01-26", exitp.NSE_HOLIDAYS)               # the module loaded at import is untouched
 
     def test_special_saturday_opens_and_muhurat_closes_the_regular_market(self):
@@ -350,14 +370,14 @@ class CalendarFile(unittest.TestCase):
     def test_builtin_2026_still_holds_and_other_years_still_warn(self):
         x = self.fresh(CAL_2027)
         self.assertIn("NSE holiday: Dussehra.", self.warnings(x, "2026-10-20"))
-        self.assertTrue(any("covers 2026, 2027 only" in t for t in self.warnings(x, "2028-01-03")))
+        self.assertTrue(any("covers 2024, 2025, 2026, 2027 only" in t for t in self.warnings(x, "2028-01-03")))
 
     def test_missing_or_corrupt_file_falls_back_to_the_builtin_table(self):
-        self.assertEqual(load("trader-exit", "exit").HOLIDAY_YEARS, (2026,))    # no file at all
+        self.assertEqual(load("trader-exit", "exit").CALENDAR_YEARS, (2024, 2025, 2026))    # no file at all
         for bad in ("{not json", "[1, 2]", "", '{"years": "x", "holidays": []}'):
             x = self.fresh(bad)
-            self.assertEqual(x.HOLIDAY_YEARS, (2026,), bad)
-            self.assertTrue(any("covers 2026 only" in t for t in self.warnings(x, "2027-01-26")), bad)
+            self.assertEqual(x.CALENDAR_YEARS, (2024, 2025, 2026), bad)
+            self.assertTrue(any("covers 2024, 2025, 2026 only" in t for t in self.warnings(x, "2027-01-26")), bad)
             self.assertIn("NSE holiday: Dussehra.", self.warnings(x, "2026-10-20"), bad)
 
 

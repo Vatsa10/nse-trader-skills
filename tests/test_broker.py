@@ -301,6 +301,23 @@ class Flow(unittest.TestCase):
         self.assertIn("1 placed, 0 paper today", text)
         self.assertIn("max loss ₹248.00", text)
 
+    def test_printed_paths_use_forward_slashes(self):
+        self.write(self.pf, {"cash": 87428.0, "positions": [{"ticker": "HINDCOPPER", "shares": 40, "lots": [
+            {"id": "HINDCOPPER-1", "date": TODAY, "shares": 40, "cost": 12572.0}]}]})
+        code, text, err = run(["flatten", "--symbol", "hindcopper", "--orders", self.orders, "--portfolio", self.pf,
+                               "--plan", self.plan, "--config", self.cfg, "--now", "2026-10-19 15:15"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Wrote it to " + self.orders.replace(os.sep, "/"), text)
+        self.assertNotIn("\\", text + err)
+        code, text, err = run(["show", "--orders", self.none, "--state", self.state, "--config", self.cfg,
+                               "--risk", self.risk, "--now", NOW])
+        self.assertNotIn("\\", text + err)
+        self.assertIn(self.none.replace(os.sep, "/"), err)
+        code, text, err = run(["fill", "--symbol", "TCS", "--side", "buy", "--qty", "1", "--price", "3100",
+                               "--portfolio", self.pf, "--state", self.state, "--config", self.cfg, "--now", NOW])
+        self.assertIn(" in " + self.pf.replace(os.sep, "/") + ". Cash now", text)
+        self.assertNotIn("\\", text + err)
+
     def test_flatten_by_1515_ist(self):
         self.write(self.pf, {"cash": 87428.0, "positions": [{"ticker": "HINDCOPPER", "shares": 40, "lots": [
             {"id": "HINDCOPPER-1", "date": TODAY, "shares": 40, "cost": 12572.0}]}]})
@@ -491,6 +508,22 @@ class Reconcile(unittest.TestCase):
         self.assertIn("calibration: factor 1.039 from 2 contract notes, updated 2026-10-30", text)
         self.assertIn("DP ₹15.34 a scrip a sell day", text)
         self.assertIn("exchange txn NSE 0.00307%", text)
+
+    def test_printed_paths_use_forward_slashes(self):
+        code, text, err = run(["reconcile", TRADEBOOK, "--actual", NOTES_CSV, "--charges", self.charges,
+                               "--now", "2026-10-29 18:00"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("written to " + self.charges.replace(os.sep, "/") + ".", text)
+        self.assertNotIn("\\", text + err)
+        code, text, err = run(["reconcile", "--show", "--charges", self.charges])
+        self.assertIn("file: " + self.charges.replace(os.sep, "/") + " (", text)
+        self.assertNotIn("\\", text + err)
+        for argv in (["reconcile", os.path.join(self.d, "none.csv"), "--charges", self.charges],
+                     ["reconcile", TRADEBOOK, "--actual", os.path.join(self.d, "none.csv"), "--charges", self.charges]):
+            code, text, err = run(argv)
+            self.assertNotIn("\\", text + err, argv)
+        self.assertIn(self.d.replace(os.sep, "/") + "/none.csv",
+                      run(["reconcile", os.path.join(self.d, "none.csv"), "--charges", self.charges])[2])
 
     def test_a_rewrite_in_the_same_timestamp_tick_is_still_read(self):
         # reconcile writes the calibration and --show reads it straight after: on a coarse file clock

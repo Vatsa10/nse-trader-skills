@@ -610,6 +610,24 @@ class CLI(unittest.TestCase):
         self.assertIn("Walk-forward split", text)
         self.assertIn("Caveats:", text)
 
+    def test_printed_paths_use_forward_slashes(self):
+        out = os.path.join(self.tmp, "out", "run")
+        code, text, err = run_cli(["run", "--strategy", "sma_cross", "--symbol", "SYNTREND", "--root", self.tmp,
+                                   "--out", out])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Wrote %s (summary.json" % out.replace(os.sep, "/"), text)
+        self.assertNotIn("\\", text + err)
+        code, text, err = run_cli(["run", "--strategy", "sma_cross", "--symbol", "SYNTREND", "--root", self.tmp,
+                                   "--out", out, "--json"])
+        self.assertNotIn("\\", text)
+        code, text, err = run_cli(["check", "SYNTREND", "NOPE", "--root", self.tmp, "--json"])
+        self.assertNotIn("\\", text)
+        self.assertIn("trader/data/daily", text)
+        code, text, err = run_cli(["strategies", "--root", self.tmp, "--config",
+                                   os.path.join(ROOT, "trader-backtest", "strategies.example.json")])
+        self.assertIn("Named strategies in %s" % os.path.join(ROOT, "trader-backtest", "strategies.example.json").replace(os.sep, "/"), text)
+        self.assertNotIn("\\", text + err)
+
     def test_default_output_folder_and_named_config(self):
         code, text, err = run_cli(["run", "--name", "three-etf-quarterly", "--root", self.tmp, "--benchmark", "none"])
         self.assertEqual(code, 0, err)

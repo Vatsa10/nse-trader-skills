@@ -374,14 +374,14 @@ class CalendarFile(unittest.TestCase):
         self.assertFalse(ok)
         r = self.run_on(e, "2028-01-03")
         self.assertFalse(r["calendar_known"])
-        self.assertIn("covers 2026, 2027 only", "\n".join(e.describe(r)))
+        self.assertIn("covers 2024, 2025, 2026, 2027 only", "\n".join(e.describe(r)))
 
     def test_missing_or_corrupt_file_falls_back_to_the_builtin_table(self):
         e = load("trader-entry", "entry")                                    # no file at all
-        self.assertEqual(e.CALENDAR_YEARS, (2026,))
+        self.assertEqual(e.CALENDAR_YEARS, (2024, 2025, 2026))
         for bad in ("{not json", "[1, 2]", "", '{"years": "x", "holidays": []}'):
             e = self.fresh(bad)
-            self.assertEqual(e.CALENDAR_YEARS, (2026,), bad)
+            self.assertEqual(e.CALENDAR_YEARS, (2024, 2025, 2026), bad)
             self.assertEqual(e.trading_day(datetime.date(2027, 1, 26)), (True, ""), bad)
             self.assertFalse(self.run_on(e, "2027-01-26")["calendar_known"], bad)
             self.assertIn("NSE holiday: Dussehra", e.trading_day(datetime.date(2026, 10, 20))[1], bad)
@@ -705,6 +705,25 @@ class Cli(unittest.TestCase):
                              "--out", "x.json"])
         self.assertEqual(code, 1)
         self.assertFalse(os.path.exists("x.json"))
+
+    def test_printed_paths_use_forward_slashes(self):
+        os.makedirs(os.path.join("trader", "out"))
+        out = os.path.join("trader", "out", "e.json")
+        code, text, err = run(["check", "RELIANCE", "--offline", RELIANCE, "--now", "2026-10-19 10:00", "--write", out])
+        self.assertIn("Wrote trader/out/e.json (status triggered).", text)
+        code, text, err = run(["check", "RELIANCE", "--cache", "--now", "2026-10-19 10:00"])
+        self.assertEqual(code, 1)
+        self.assertIn("No cache at trader/data/intraday/RELIANCE-5m.json", err)
+        os.mkdir("charts")
+        with open(os.path.join("trader", "wl.json"), "w") as fh:
+            json.dump({"hits": [{"symbol": "ZZZZ", "setups": ["orb"]}]}, fh)
+        wl = os.path.join("trader", "wl.json")
+        for argv in (["watchlist", "--watchlist", wl, "--offline", "charts"],
+                     ["watchlist", "--watchlist", os.path.join("trader", "none.json")],
+                     ["check", "RELIANCE", "--offline", os.path.join("charts", "none.json")]):
+            code, text, err = run(argv)
+            self.assertNotIn("\\", text + err, argv)
+        self.assertIn("trader/none.json", run(["watchlist", "--watchlist", os.path.join("trader", "none.json")])[2])
 
     def test_watchlist(self):
         os.mkdir("charts")

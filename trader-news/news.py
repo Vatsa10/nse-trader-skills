@@ -49,9 +49,17 @@ https://www.nseindia.com/api/historicalOR/bulk-block-short-deals?optionType=bulk
 Results calendar: NSE's board meetings per symbol,
 https://www.nseindia.com/api/corporate-board-meetings?index=equities&symbol=<SYMBOL>
 A purpose with "financial results" is a results date, with "dividend" a dividend
-board date. A results date within 2 NSE sessions (weekends excluded, plus the
-holidays in trader/data/calendar.json when it exists) prints RESULTS SOON at the
-top: an overnight gap can jump past an intraday stop. --no-calendar skips it.
+board date. A results date within 2 NSE sessions (weekends and the NSE holidays
+excluded: the built-in 2024 to 2026 tables, with trader/data/calendar.json laid
+on top when it exists) prints RESULTS SOON at the top: an overnight gap can jump
+past an intraday stop. --no-calendar skips it.
+
+FII/DII flows: when trader/data/flows.csv exists (trader-data writes it; header
+date,category,buy_cr,sell_cr,net_cr, rupees crore, category FII/FPI or DII) the
+briefing prints one line after the results dates: the latest day's FII/FPI and
+DII net, and the 5-session net when there are 5 sessions on file. It is market
+context, not a signal. A missing or unreadable file prints nothing. --flows PATH
+reads another file; --json has it as "flows".
 
 Both ride the NSE session above (one re-prime on a 401/403 or a non-JSON block
 page, then a one-line note; the other sources still print).
@@ -68,6 +76,7 @@ nothing here as advice.
 
 import argparse
 import csv
+import datetime
 import datetime as _dt
 import http.cookiejar
 import email.utils
@@ -98,6 +107,9 @@ DEAL_DAYS = 30      # the window the deals are fetched and netted over (NSE allo
 DEAL_PCT = 1.0      # a deal this big, as a percent of the 20-day average volume, is flagged LARGE
 DEAL_CLOSE = (15, 30)   # deals carry a date only; they are stamped at the close, IST
 RESULTS_SOON = 2    # results this many NSE sessions away (or fewer) are a gap risk
+FLOWS_HEADER = ["date", "category", "buy_cr", "sell_cr", "net_cr"]
+FLOW_CATEGORIES = ("FII/FPI", "DII")
+FLOW_SESSIONS = 5   # the longer net window on the flows line
 CALENDAR_DAYS = 30  # board-meeting dates further out than this are left off the briefing
 DATA_DIR = os.path.join("trader", "data")
 DATA_HINT = ("run `python3 trader-data/data.py doctor`; or call Kite MCP get_historical_data and "
@@ -120,9 +132,156 @@ KEYWORDS = [
     ("macro", r"\bRBI policy\b|\brepo rate\b|\bMPC\b|\bCPI\b|\binflation\b|\bGDP\b|\bFII|\bFPI|\bDII|\bbudget\b|\btariffs?\b|\bcrude\b|\brupee\b|\bGIFT Nifty\b|\bFed\b"),
 ]
 
+# --- nse calendar: keep byte-identical in every script that has it (tests/test_repo.py checks) ---
+# The NSE equity-segment trading calendar. Built-in tables for 2024 to 2026 (NSE circulars), then
+# trader/data/calendar.json (trader-data: data.py calendar, from NSE's holiday master and its trading
+# circulars) laid on top: for a year the file lists, its holidays replace the built-in ones. A missing or
+# unreadable file means the built-in tables; nothing here raises.
+BUILTIN_HOLIDAYS = {   # weekday closures of the regular 09:15-15:30 market
+    "2024-01-22": "Special holiday (Ram Mandir)", "2024-01-26": "Republic Day",
+    "2024-03-08": "Mahashivratri", "2024-03-25": "Holi", "2024-03-29": "Good Friday",
+    "2024-04-11": "Id-Ul-Fitr (Ramadan Eid)", "2024-04-17": "Shri Ram Navmi",
+    "2024-05-01": "Maharashtra Day", "2024-05-20": "Lok Sabha election (Mumbai)",
+    "2024-06-17": "Bakri Id", "2024-07-17": "Moharram", "2024-08-15": "Independence Day",
+    "2024-10-02": "Mahatma Gandhi Jayanti", "2024-11-01": "Diwali Laxmi Pujan",
+    "2024-11-15": "Gurunanak Jayanti", "2024-11-20": "Maharashtra assembly election",
+    "2024-12-25": "Christmas",
+    "2025-02-26": "Mahashivratri", "2025-03-14": "Holi", "2025-03-31": "Id-Ul-Fitr (Ramadan Eid)",
+    "2025-04-10": "Shri Mahavir Jayanti", "2025-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2025-04-18": "Good Friday", "2025-05-01": "Maharashtra Day", "2025-08-15": "Independence Day",
+    "2025-08-27": "Ganesh Chaturthi", "2025-10-02": "Mahatma Gandhi Jayanti/Dussehra",
+    "2025-10-21": "Diwali Laxmi Pujan", "2025-10-22": "Diwali-Balipratipada",
+    "2025-11-05": "Prakash Gurpurb Sri Guru Nanak Dev", "2025-12-25": "Christmas",
+    "2026-01-15": "Maharashtra municipal elections (special holiday)", "2026-01-26": "Republic Day",
+    "2026-03-03": "Holi", "2026-03-26": "Shri Ram Navami", "2026-03-31": "Shri Mahavir Jayanti",
+    "2026-04-03": "Good Friday", "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2026-05-01": "Maharashtra Day", "2026-05-28": "Bakri Id", "2026-06-26": "Muharram",
+    "2026-09-14": "Ganesh Chaturthi", "2026-10-02": "Mahatma Gandhi Jayanti", "2026-10-20": "Dussehra",
+    "2026-11-10": "Diwali-Balipratipada", "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
+    "2026-12-25": "Christmas",
+}
+BUILTIN_YEARS = (2024, 2025, 2026)
+BUILTIN_SPECIAL = {    # normal-hours sessions on a weekend or a holiday
+    "2024-01-20": "Saturday special session", "2024-03-02": "Saturday DR session",
+    "2024-05-18": "Saturday DR session", "2025-02-01": "Union Budget (Saturday)",
+    "2026-02-01": "Union Budget (Sunday)",
+}
+BUILTIN_MUHURAT = {    # one evening hour at times set by circular: the regular market is closed that day
+    "2023-11-12": "Diwali Laxmi Pujan (Muhurat), Sunday", "2024-11-01": "Diwali Laxmi Pujan (Muhurat)",
+    "2025-10-21": "Diwali Laxmi Pujan (Muhurat)", "2026-11-08": "Diwali Laxmi Pujan (Muhurat), Sunday",
+}
+NSE_HOLIDAYS = dict(BUILTIN_HOLIDAYS)    # these four hold the built-in tables plus calendar.json
+SPECIAL_SESSIONS = dict(BUILTIN_SPECIAL)
+MUHURAT_SESSIONS = dict(BUILTIN_MUHURAT)
+CALENDAR_YEARS = BUILTIN_YEARS
+CALENDAR_PATH = os.path.join("trader", "data", "calendar.json")
+
+
+def _cal_dates(m):
+    """{"2027-01-26": "Republic Day"} with bad keys dropped; anything but an object is corrupt."""
+    if m is None:
+        return {}
+    if not isinstance(m, dict):
+        raise ValueError("not an object")
+    out = {}
+    for k, v in m.items():
+        try:
+            datetime.date.fromisoformat(k)
+        except (TypeError, ValueError):
+            continue
+        out[k] = str(v)
+    return out
+
+
+def load_calendar(path=None):
+    """trader/data/calendar.json -> {"years", "holidays", "special_sessions", "fetched_at",
+    "last_circular_check", "warnings"}, or None when it is missing or unreadable."""
+    try:
+        with open(path or CALENDAR_PATH, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        if not isinstance(doc, dict):
+            return None
+        warns = doc.get("warnings")
+        return {"years": sorted(set(int(y) for y in (doc.get("years") or []))),
+                "holidays": _cal_dates(doc.get("holidays")),
+                "special_sessions": _cal_dates(doc.get("special_sessions")),
+                "fetched_at": doc.get("fetched_at"), "last_circular_check": doc.get("last_circular_check"),
+                "warnings": [str(w) for w in warns] if isinstance(warns, list) else []}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def is_muhurat(name):
+    low = str(name).lower()
+    return "muhurat" in low or "laxmi pujan" in low
+
+
+def apply_calendar(path=None):
+    """Rebuild NSE_HOLIDAYS, SPECIAL_SESSIONS, MUHURAT_SESSIONS and CALENDAR_YEARS from the built-in
+    tables plus calendar.json (path None = CALENDAR_PATH). Returns the file's contents, or None."""
+    global CALENDAR_YEARS
+    cal = load_calendar(path)
+    for table, base in ((NSE_HOLIDAYS, BUILTIN_HOLIDAYS), (SPECIAL_SESSIONS, BUILTIN_SPECIAL),
+                        (MUHURAT_SESSIONS, BUILTIN_MUHURAT)):
+        table.clear()
+        table.update(base)
+    CALENDAR_YEARS = BUILTIN_YEARS
+    if not cal:
+        return None
+    for y in cal["years"]:
+        for iso in [k for k in NSE_HOLIDAYS if k.startswith("%04d-" % y)]:
+            del NSE_HOLIDAYS[iso]
+    NSE_HOLIDAYS.update(cal["holidays"])
+    for iso, name in cal["special_sessions"].items():
+        SPECIAL_SESSIONS.pop(iso, None)
+        MUHURAT_SESSIONS.pop(iso, None)
+        (MUHURAT_SESSIONS if is_muhurat(name) else SPECIAL_SESSIONS)[iso] = name
+    CALENDAR_YEARS = tuple(sorted(set(BUILTIN_YEARS) | set(cal["years"])))
+    return cal
+
+
+def years_text():
+    return ", ".join(str(y) for y in CALENDAR_YEARS)
+
+
+def trading_day(d):
+    """(open, reason) for the regular 09:15-15:30 market on date d. A normal-hours special session is
+    open; a weekend, a listed holiday and a Muhurat day are closed. Outside CALENDAR_YEARS the weekday
+    rule is a guess, which calendar_known says."""
+    iso = d.isoformat()
+    if iso in MUHURAT_SESSIONS:
+        return False, ("special session: %s, about an hour in the evening at times set by NSE; "
+                       "no normal 09:15-15:30 market" % MUHURAT_SESSIONS[iso])
+    if iso in SPECIAL_SESSIONS:
+        return True, ""
+    if d.weekday() >= 5:
+        return False, "weekend"
+    name = NSE_HOLIDAYS.get(iso)
+    if name:
+        return False, "NSE holiday: " + name
+    return True, ""
+
+
+def calendar_known(d):
+    return d.year in CALENDAR_YEARS
+
+
+def bars_expected(d):
+    """Does NSE publish a daily bar for d? Every regular trading day, and a Muhurat session too."""
+    return trading_day(d)[0] or d.isoformat() in MUHURAT_SESSIONS
+
+
+apply_calendar()   # at import, from trader/data/calendar.json in the working directory when it exists
+# --- end nse calendar ---
+
 
 class NewsError(Exception):
     pass
+
+
+def show_path(path):
+    """A path as printed to the user: forward slashes on every OS (files are opened as given)."""
+    return str(path).replace(os.sep, "/")
 
 
 class NseWall(NewsError):
@@ -181,7 +340,7 @@ class Fetcher(object):
         if self.offline:
             path = os.path.join(self.offline, name)
             if not os.path.isfile(path):
-                raise NewsError("offline: no file %s" % path)
+                raise NewsError("offline: no file %s" % show_path(path))
             with open(path, "rb") as fh:
                 return fh.read()
         gap = time.time() - self._last
@@ -532,33 +691,12 @@ def fetch_deals(fetcher, watch, now, days=DEAL_DAYS, errors=None):
     return rows
 
 
-def load_calendar(path):
-    """trader/data/calendar.json ({"years": [..], "holidays": {"YYYY-MM-DD": name},
-    "special_sessions": {..}}, from trader-data) -> {"years", "holidays", "special"} or None if absent."""
-    try:
-        doc = load_json(path)
-    except (OSError, ValueError):
-        raise NewsError("%s is not valid JSON; counting weekends only" % path)
-    if not isinstance(doc, dict):
-        return None
-    return {"years": {str(y) for y in doc.get("years") or []}, "holidays": set(doc.get("holidays") or {}),
-            "special": set(doc.get("special_sessions") or {})}
-
-
-def is_session(day, cal=None):
-    """Is NSE open that day? Weekends are shut and so are the calendar's holidays, unless
-    the calendar lists the day as a special session."""
-    if cal and day.isoformat() in cal["special"]:
-        return True
-    return day.weekday() < 5 and not (cal and day.isoformat() in cal["holidays"])
-
-
-def sessions_between(start, end, cal=None):
+def sessions_between(start, end):
     """NSE sessions after start up to and including end: 0 for the same day, 1 for the next
     session. Negative when end is before start."""
     if end < start:
-        return -sessions_between(end, start, cal)
-    return sum(1 for i in range(1, (end - start).days + 1) if is_session(start + _dt.timedelta(days=i), cal))
+        return -sessions_between(end, start)
+    return sum(1 for i in range(1, (end - start).days + 1) if trading_day(start + _dt.timedelta(days=i))[0])
 
 
 def parse_meetings(data, ticker):
@@ -577,14 +715,13 @@ def parse_meetings(data, ticker):
     return out
 
 
-def collect_calendar(fetcher, watch, now, cal=None, errors=None):
+def collect_calendar(fetcher, watch, now, errors=None):
     """Results and dividend board dates from today on, for your symbols, soonest first. A results
     date within RESULTS_SOON sessions is "soon". If NSE blocks: one note, the rest is skipped."""
     errors = [] if errors is None else errors
     today = to_ist(now).date()
-    if cal and cal["years"] and str(today.year) not in cal["years"]:
+    if not calendar_known(today):
         errors.append("holiday calendar does not cover %s; counting weekends only for results dates" % today.year)
-        cal = None
     out = []
     for t in sorted(watch):
         try:
@@ -597,7 +734,7 @@ def collect_calendar(fetcher, watch, now, cal=None, errors=None):
         for m in meetings:
             if m["date"] < today or not (m["results"] or m["dividend"]):
                 continue
-            away = sessions_between(today, m["date"], cal)
+            away = sessions_between(today, m["date"])
             m = dict(m, sessions_away=away, soon=m["results"] and away <= RESULTS_SOON)
             if m["soon"] or (m["date"] - today).days <= CALENDAR_DAYS:
                 out.append(m)
@@ -619,6 +756,55 @@ def render_calendar(events):
         else:
             out.append("coming up     %-11s %s %s" % (m["ticker"], what, when))
     return out
+
+
+def load_flows(path):
+    """trader/data/flows.csv (date,category,buy_cr,sell_cr,net_cr; rupees crore) -> {"date",
+    "fii_net_cr", "dii_net_cr", "sessions", "fii_net_cr_5d", "dii_net_cr_5d"} for the latest day, or
+    None when the file is missing, unreadable or has no usable row. The 5-session nets are None until
+    each category has 5 days on file. Never raises: this line is context, not a signal."""
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            rows = list(csv.reader(fh))
+        if not rows or [c.strip() for c in rows[0]] != FLOWS_HEADER:
+            return None
+        net = {c: {} for c in FLOW_CATEGORIES}
+        for r in rows[1:]:
+            if not r:
+                continue
+            day, cat = _dt.date.fromisoformat(r[0].strip()).isoformat(), r[1].strip()
+            if cat in net:
+                value = float(r[4])
+                if value != value or value in (float("inf"), float("-inf")):
+                    return None
+                net[cat][day] = value
+    except (OSError, ValueError, IndexError, UnicodeError, csv.Error):
+        return None
+    days = sorted(set(net["FII/FPI"]) | set(net["DII"]))
+    if not days:
+        return None
+    last = days[-1]
+    out = {"date": last, "fii_net_cr": net["FII/FPI"].get(last), "dii_net_cr": net["DII"].get(last),
+           "sessions": FLOW_SESSIONS}
+    for key, cat in (("fii_net_cr_5d", "FII/FPI"), ("dii_net_cr_5d", "DII")):
+        recent = sorted(net[cat])[-FLOW_SESSIONS:]
+        out[key] = round(sum(net[cat][d] for d in recent), 2) if len(recent) == FLOW_SESSIONS else None
+    return out
+
+
+def render_flows(flows):
+    """One context line: the latest day's FII/FPI and DII net, then the 5-session net."""
+    if not flows:
+        return []
+
+    def cr(v):
+        return "n/a" if v is None else format(v, "+,.2f")
+    line = "FII/DII %s (Rs crore): FII/FPI net %s, DII net %s" % (
+        flows["date"], cr(flows["fii_net_cr"]), cr(flows["dii_net_cr"]))
+    if flows["fii_net_cr_5d"] is not None or flows["dii_net_cr_5d"] is not None:
+        line += "; %d sessions: FII/FPI %s, DII %s" % (
+            flows["sessions"], cr(flows["fii_net_cr_5d"]), cr(flows["dii_net_cr_5d"]))
+    return [line + ". Market context, not a signal."]
 
 
 def manual_links(ticker):
@@ -664,8 +850,8 @@ def cached_move(ticker, why=None):
                     "pct": round((price / prev - 1) * 100, 2), "time": None,
                     "note": "%susing cached data from the %s daily close, run `python3 trader-data/data.py daily "
                             "%s` to refresh" % (fail, rows[-1]["date"], ticker)}
-    raise NewsError("%sNo cache at %s or %s either. Next: %s" % (("%s. " % why) if why else "", ipath, dpath,
-                                                                 DATA_HINT))
+    raise NewsError("%sNo cache at %s or %s either. Next: %s" % (("%s. " % why) if why else "", show_path(ipath),
+                                                                 show_path(dpath), DATA_HINT))
 
 
 def fetch_move(fetcher, t):
@@ -860,8 +1046,8 @@ def render_flow(flow):
     return out
 
 
-def render(items, errors, now, moves=None, move_pct=MOVE_PCT, flow=None, calendar=None):
-    out = render_calendar(calendar or [])
+def render(items, errors, now, moves=None, move_pct=MOVE_PCT, flow=None, calendar=None, flows=None):
+    out = render_calendar(calendar or []) + render_flows(flows)
     if out:
         out.append("")
     moved = render_moves(moves or [], move_pct)
@@ -918,7 +1104,9 @@ def main(argv=None):
                     help="deals window in days, also the net buy/sell window (max 365)")
     ap.add_argument("--no-calendar", action="store_true", help="skip NSE board meetings (results dates)")
     ap.add_argument("--calendar", default=os.path.join(DATA_DIR, "calendar.json"),
-                    help="trader-data holiday calendar, used to count sessions (default: weekends only)")
+                    help="trader-data holiday calendar, laid over the built-in tables to count sessions")
+    ap.add_argument("--flows", default=os.path.join(DATA_DIR, "flows.csv"),
+                    help="trader-data FII/DII flows (rupees crore), printed as one context line when it exists")
     ap.add_argument("--cache", action="store_true",
                     help="moves from the trader-data cache (trader/data/intraday, then daily), not Yahoo")
     ap.add_argument("--now", help="ISO time, for reproducible runs (no offset = IST)")
@@ -958,21 +1146,19 @@ def main(argv=None):
     moves = [] if args.no_moves else collect_moves(fetcher, watch, errors, cache=args.cache)
     events = []
     if not args.no_calendar:
-        try:
-            cal = load_calendar(args.calendar)
-        except NewsError as exc:
-            cal = None
-            errors.append(str(exc))
-        events = collect_calendar(fetcher, watch, now, cal, errors)
+        if apply_calendar(args.calendar) is None and os.path.exists(args.calendar):
+            errors.append("%s is not valid JSON; using the built-in holiday tables" % show_path(args.calendar))
+        events = collect_calendar(fetcher, watch, now, errors)
+    flows = load_flows(args.flows)
     if args.json:
         mv = [dict(m, time=m["time"].isoformat() if m.get("time") else None,
                    moving=abs(m["pct"]) >= args.move_pct) for m in moves]
         ev = [dict(e, date=e["date"].isoformat()) for e in events]
         print(json.dumps({"checked": now.isoformat(), "results_soon": [e["ticker"] for e in events if e["soon"]],
                           "calendar": ev, "moves": mv, "items": _json_ready(shown), "deal_flow": flow,
-                          "notes": errors}, indent=2, ensure_ascii=False))
+                          "flows": flows, "notes": errors}, indent=2, ensure_ascii=False))
     else:
-        sys.stdout.write(render(shown, errors, now, moves, args.move_pct, flow_shown, events))
+        sys.stdout.write(render(shown, errors, now, moves, args.move_pct, flow_shown, events, flows))
     if not args.dry_run:
         remember(items, state, now)
         folder = os.path.dirname(args.state)
