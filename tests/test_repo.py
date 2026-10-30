@@ -215,6 +215,40 @@ class Repo(unittest.TestCase):
         finally:
             socket.getaddrinfo = saved
 
+    def test_every_script_prints_the_rupee_sign_on_a_cp1252_pipe(self):
+        marks = ("# --- utf8 output:", "# --- end utf8 output ---")
+        with open(os.path.join(ROOT, "reference", "specs", "utf8_output.py"), encoding="utf-8") as fh:
+            spec = fh.read()
+        want = spec[spec.find(marks[0]):spec.find(marks[1])]
+        for s in SKILLS:
+            for f in os.listdir(os.path.join(ROOT, s)):
+                if f.endswith(".py"):
+                    with open(os.path.join(ROOT, s, f), encoding="utf-8") as fh:
+                        text = fh.read()
+                    self.assertEqual(text[text.find(marks[0]):text.find(marks[1])], want, "%s/%s" % (s, f))
+        # a real run: Windows' default for a pipe, as when Claude Code runs the tool
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        try:
+            daily = os.path.join(tmp, "trader", "data", "daily")
+            os.makedirs(daily)
+            with open(os.path.join(daily, "RUPEE.csv"), "w") as fh:
+                fh.write("date,open,high,low,close,volume\n")
+                for i in range(260):
+                    c = 100 + i * 0.1
+                    fh.write("2025-%02d-%02d,%.2f,%.2f,%.2f,%.2f,500000\n" % (1 + i // 28, 1 + i % 28, c, c + 1, c - 1, c))
+            env = dict(os.environ, PYTHONIOENCODING="cp1252", PYTHONDONTWRITEBYTECODE="1")
+            got = subprocess.run([sys.executable, os.path.join(ROOT, "trader-scanner", "scan.py"), "longterm",
+                                  "--symbols", "RUPEE"], cwd=tmp, env=env, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, timeout=120)
+            self.assertNotIn(b"UnicodeEncodeError", got.stderr, got.stderr.decode("utf-8", "replace"))
+            self.assertIn("₹".encode("utf-8"), got.stdout)
+        finally:
+            shutil.rmtree(tmp)
+
 
 if __name__ == "__main__":
     unittest.main()
