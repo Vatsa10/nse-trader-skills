@@ -255,6 +255,22 @@ class Svg(unittest.TestCase):
         self.assertIn("<details>", svg)                     # table fallback
         self.assertNotIn("http", svg)
 
+    def test_no_css_rule_fills_a_line(self):
+        # a browser showed every line chart as a filled shape: "svg .ln.s1{...fill:...}" (meant for bars) beat
+        # the polyline's fill="none" attribute and the weaker "svg .ln{fill:none}"
+        import re
+        for rule in re.findall(r"([^{}]+)\{([^{}]*)\}", rp.CSS):
+            if ".ln" in rule[0] and "fill:" in rule[1]:
+                self.assertIn("fill:none", rule[1].replace(" ", ""), rule[0])
+
+    def test_thesis_items_read_as_sentences(self):
+        li = rp.rich_item({"point": "P/E above the index", "evidence": "fundamentals.pe", "rupee_impact": "Rs 9,400"})
+        self.assertTrue(li.startswith("P/E above the index<br>"))
+        self.assertIn("evidence: fundamentals.pe; rupee impact: Rs 9,400", li)
+        self.assertNotIn("{", li)
+        self.assertEqual(rp.rich_item({"idea": "x", "reason": "y"}), 'x<br><span class="src">reason: y</span>')
+        self.assertEqual(rp.rich_item("M&M"), "M&amp;M")
+
     def test_downsample_keeps_ends(self):
         xs = list(range(1000))
         out = rp.downsample(xs, 50)

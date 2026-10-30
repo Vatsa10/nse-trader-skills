@@ -525,11 +525,25 @@ def section_symbols(c):
     return "".join(symbol_block(c, s, watch, longterm, actions) for s in c.symbols)
 
 
+def rich_item(x):
+    """One list entry: a string as is; a thesis item ({point|idea|what, ...}) as its headline with the other
+    fields in a muted line, so a case reads as sentences, not as JSON."""
+    if isinstance(x, str):
+        return esc(x)
+    if isinstance(x, dict):
+        head_key = next((k for k in ("point", "idea", "what") if isinstance(x.get(k), str)), None)
+        rest = ["%s: %s" % (k.replace("_", " "), v if isinstance(v, str) else json.dumps(v, ensure_ascii=False))
+                for k, v in x.items() if k != head_key and v not in (None, "", [], {})]
+        if head_key:
+            return esc(x[head_key]) + ('<br><span class="src">%s</span>' % esc("; ".join(rest)) if rest else "")
+    return esc(json.dumps(x, ensure_ascii=False))
+
+
 def rich(v):
     if isinstance(v, str):
         return "<p>%s</p>" % esc(v)
     if isinstance(v, list):
-        return "<ul>%s</ul>" % "".join("<li>%s</li>" % (esc(x) if isinstance(x, str) else esc(json.dumps(x, ensure_ascii=False))) for x in v)
+        return "<ul>%s</ul>" % "".join("<li>%s</li>" % rich_item(x) for x in v)
     if isinstance(v, dict):
         return "<ul>%s</ul>" % "".join("<li><b>%s</b>: %s</li>" % (esc(str(k)), esc(x if isinstance(x, str) else json.dumps(x, ensure_ascii=False))) for k, x in v.items())
     return "<p>%s</p>" % esc(fmt(v))
@@ -544,7 +558,8 @@ def section_thesis(c):
         if not isinstance(doc, dict):
             continue
         keys = [(k, label) for k, label in (("verdict", "Verdict"), ("bull_case", "Bull case"), ("bear_case", "Bear case"),
-                                              ("traps", "Traps")) if doc.get(k) not in (None, "", [], {})]
+                                              ("traps", "Traps"), ("watch", "What to watch"))
+                if doc.get(k) not in (None, "", [], {})]
         if not keys:
             c.notes.append("%s skipped: no verdict, bull_case, bear_case or traps" % p.replace(os.sep, "/"))
             continue
@@ -688,7 +703,7 @@ th{color:var(--mut);font-weight:500}table.sortable th{cursor:pointer}table.kv th
 .flt{width:100%;box-sizing:border-box;margin:6px 0;padding:6px 8px;font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px}
 figure{margin:12px 0}figcaption{font-weight:600}svg{width:100%;height:auto;display:block;margin:6px 0}
 svg .a{fill:var(--mut);font-size:11px}svg .g{stroke:var(--line)}svg .m{stroke:var(--mut);stroke-dasharray:4 4}svg .m.s2{stroke:var(--s2)}svg .m.s3{stroke:var(--s3)}svg .m.band{stroke:var(--band)}
-svg .ln{stroke-width:1.6}svg .ln.s1,svg rect.s1{stroke:var(--s1);fill:var(--s1)}svg .ln.s2,svg rect.s2{stroke:var(--s2);fill:var(--s2)}svg .ln.s3,svg rect.s3{stroke:var(--s3);fill:var(--s3)}svg .ln{fill:none}
+svg .ln{stroke-width:1.6;fill:none}svg .ln.s1{stroke:var(--s1)}svg .ln.s2{stroke:var(--s2)}svg .ln.s3{stroke:var(--s3)}svg rect.s1{stroke:var(--s1);fill:var(--s1)}svg rect.s2{stroke:var(--s2);fill:var(--s2)}svg rect.s3{stroke:var(--s3);fill:var(--s3)}
 .key span{display:inline-block;margin-right:16px;color:var(--mut);font-size:13px}.key i{display:inline-block;width:14px;height:3px;margin-right:6px;vertical-align:middle}
 .key i.s1{background:var(--s1)}.key i.s2{background:var(--s2)}.key i.s3{background:var(--s3)}
 details{margin:6px 0}summary{cursor:pointer;color:var(--mut)}.note{color:var(--s2)}footer{border-top:1px solid var(--line);padding-top:12px;margin-top:20px}
