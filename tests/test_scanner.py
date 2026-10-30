@@ -133,12 +133,13 @@ class Time(unittest.TestCase):
 
     def test_nse_calendar(self):
         self.assertEqual(scan.trading_day(D(2026, 10, 20)), (False, "NSE holiday: Dussehra"))
-        self.assertEqual(scan.trading_day(D(2026, 11, 10)), (False, "NSE holiday: Diwali Balipratipada"))
+        self.assertEqual(scan.trading_day(D(2026, 11, 10)), (False, "NSE holiday: Diwali-Balipratipada"))
         self.assertEqual(scan.trading_day(D(2026, 10, 19)), (True, ""))
         self.assertEqual(scan.session(D(2026, 12, 24)), (datetime.time(9, 15), datetime.time(15, 30)))
         self.assertIsNone(scan.session(D(2026, 11, 8)))            # Muhurat Sunday: treated as closed
         self.assertIn("nseindia.com", scan.calendar_note(D(2027, 1, 4)))
         self.assertEqual(scan.calendar_note(D(2026, 1, 5)), "")
+        self.assertEqual(scan.calendar_note(D(2024, 6, 3)), "")                  # 2024 and 2025 are built in now
 
 
 class Spark(unittest.TestCase):
@@ -1529,6 +1530,14 @@ class PatternsCli(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("trader-data/data.py daily", err)
 
+    def test_the_flows_line_and_object(self):
+        put_flows(FLOWS_OK)
+        code, text, _ = run(["patterns", "--now", "2026-12-01 08:30", "--json", "--no-write"])
+        doc = json.loads(text)
+        self.assertEqual(doc["flows"]["date"], "2026-10-29")
+        code, text, _ = run(["patterns", "--now", "2026-12-01 08:30", "--no-write"])
+        self.assertIn(FLOWS_LINE, text)
+
 
 def flat_rows(closes, start=D(2026, 1, 5)):
     """High = low = close, one calendar day apart: hand-countable breadth."""
@@ -1970,6 +1979,397 @@ class Delivery(unittest.TestCase):
             shutil.rmtree(d)
 
 
+IPAT = os.path.join(SDIR, "intraday-patterns-2026-10-19.json")   # six hand-made 5-minute charts, Mon Oct 19 2026
+I_DAY = D(2026, 10, 19)
+# Closes, one per 5-minute bar from 09:15 (high = close + 0.5, low = close - 0.5, so U = 1.0).
+I_DB = [105, 104, 103, 102, 101, 100, 101, 102, 103, 104, 103, 102, 101, 100, 101, 102, 103, 103]
+I_FL = [103, 102.5, 102, 101, 100, 101, 102, 103, 104, 105, 106, 107, 108, 107, 106.5, 106.8, 106.2, 106.5]
+
+
+def ibars(closes, cutoff="10:45", hw=0.5):
+    """Closes -> session_bars() output at `cutoff` on 2026-10-19; high = close + hw, low = close - hw."""
+    s = bars_series("2026-10-19", closes, [c + hw for c in closes], [c - hw for c in closes])
+    return scan.session_bars(s, I_DAY, DT.strptime("2026-10-19 " + cutoff, "%Y-%m-%d %H:%M"))
+
+
+class IntradayPatterns(unittest.TestCase):
+    def one(self, closes, pattern, cutoff="10:45", hw=0.5):
+        got = [h for h in scan.intraday_hits(ibars(closes, cutoff, hw)) if h["pattern"] == "intraday_" + pattern]
+        return got[0] if got else None
+
+    def test_double_bottom_coiled(self):
+        h = self.one(I_DB, "double_bottom")
+        self.assertEqual((h["state"], h["level"], h["stop"], h["target"]), ("coiled", 104.55, 99.0, 109.5))
+        self.assertEqual(h["setups"], ["intraday_double_bottom"])
+        self.assertEqual(h["pivots"], [["09:40", 99.5], ["10:20", 99.5]])
+        self.assertEqual((h["at"], h["price"]), ("10:45 AM", 103.0))
+
+    def test_double_bottom_negatives(self):
+        self.assertIsNone(self.one([100.4, 100.3, 100.25, 100.2, 100.15] + I_DB[5:], "double_bottom"))  # no 1.5 % decline
+        self.assertIsNone(self.one(I_DB[:13] + [98] + I_DB[14:], "double_bottom"))        # the lows differ by 2 rupees
+        self.assertIsNone(self.one(I_DB[:-1] + [101.0], "double_bottom"))                  # under the midpoint of the base
+        shallow = [102, 101.5, 101, 100.5, 100.2, 100, 100.1, 100.2, 100.3, 100.4, 100.3, 100.2, 100.1, 100, 100.1,
+                   100.2, 100.3, 100.3]
+        self.assertIsNone(self.one(shallow, "double_bottom", hw=0.1))                      # a 0.6 % rebound: under 0.8 %
+        self.assertIsNotNone(self.one([c + 0.3 if c > 100.2 else c for c in shallow], "double_bottom", hw=0.1))
+
+    def test_double_bottom_lows_too_close(self):
+        # the second low 7 bars after the first (the minimum is 8): same shape squeezed by one bar
+        tight = [105, 104, 103, 102, 101, 100, 101, 102, 103, 102, 101, 100.5, 100, 101, 102, 103, 103, 103]
+        self.assertIsNone(self.one(tight, "double_bottom"))
+
+    def test_broken_out_is_the_breakout_state(self):
+        h = self.one(I_DB[:-1] + [105.0], "double_bottom")
+        self.assertEqual(h["state"], "breakout")
+        self.assertEqual(h["level"], 104.55)
+        self.assertIsNone(self.one(I_DB[:-1] + [120.0], "double_bottom"))                  # over 5 % past the trigger
+
+    def test_flag_coiled(self):
+        h = self.one(I_FL, "flag")
+        self.assertEqual((h["state"], h["level"], h["stop"], h["target"]), ("coiled", 108.55, 105.65, 117.5))
+        self.assertEqual(h["pivots"], [["09:35", 99.5], ["10:15", 108.5]])
+        self.assertEqual(h["setups"], ["intraday_flag"])
+
+    def test_flag_negatives(self):
+        self.assertIsNone(self.one(I_FL[:13] + [106, 104, 102, 101, 100.5], "flag"))      # the pullback gave back over half
+        self.assertIsNone(self.one([112] + I_FL[1:], "flag"))                             # the top is not the session high
+        self.assertIsNone(self.one(I_FL[:15], "flag", "10:30"))                           # the top is only 2 bars old
+        weak = [100.4, 100.3, 100.2, 100.1, 100, 100.1, 100.2, 100.3, 100.4, 100.5, 100.6, 100.7, 100.8, 100.7, 100.6,
+                100.65, 100.6, 100.65]
+        self.assertIsNone(self.one(weak, "flag"))                                         # a 1.8 % gain: under 2 %
+
+    def test_short_or_incomplete_sessions_give_nothing(self):
+        self.assertEqual(scan.intraday_hits(ibars(I_DB[:11], "10:10")), [])               # fewer than 12 bars
+        bars = ibars(I_DB)
+        bars[3]["h"] = None
+        self.assertEqual(scan.intraday_hits(bars), [])                                    # no real high
+        self.assertEqual(scan.intraday_hits(ibars(I_DB)), scan.intraday_hits(ibars(I_DB + [90, 90], "10:45")))  # no look-ahead
+
+    def test_only_and_state_filters(self):
+        both = ibars(I_DB)
+        self.assertEqual([h["pattern"] for h in scan.intraday_hits(both, "flag")], [])
+        self.assertEqual(len(scan.intraday_hits(both, "double_bottom", "coiled")), 1)
+        self.assertEqual(scan.intraday_hits(both, "double_bottom", "breakout"), [])
+
+    def test_window_refuses_after_the_cutoff_and_before_enough_bars(self):
+        now = scan.parse_now("2026-10-19 15:05")
+        with self.assertRaises(scan.ScanError) as cm:
+            scan.intraday_window(now, None, datetime.time(15, 0))
+        self.assertIn("no_entries_after", str(cm.exception))
+        with self.assertRaises(scan.ScanError) as cm:
+            scan.intraday_window(scan.parse_now("2026-10-19 10:00"), None, datetime.time(15, 0))
+        self.assertIn("10:15 AM", str(cm.exception))
+        with self.assertRaises(scan.ScanError):
+            scan.intraday_window(scan.parse_now("2026-10-20 11:00"), None, datetime.time(15, 0))   # Dussehra
+        day, cutoff = scan.intraday_window(scan.parse_now("2026-10-19 11:00"), None, datetime.time(15, 0))
+        self.assertEqual((day, cutoff), (I_DAY, DT(2026, 10, 19, 11, 0)))
+
+    def test_scan_counts_and_unconfirmed_cap(self):
+        stage1 = {"DBPOS": bars_series("2026-10-19", I_DB, [c + 0.5 for c in I_DB], [c - 0.5 for c in I_DB]),
+                  "FLPOS": bars_series("2026-10-19", I_FL, [c + 0.5 for c in I_FL], [c - 0.5 for c in I_FL]),
+                  "SHORT": bars_series("2026-10-19", I_FL[:5])}
+        cut = DT(2026, 10, 19, 10, 45)
+        hits, counts, failed = scan.scan_intraday_patterns(stage1, ["DBPOS", "FLPOS", "SHORT", "GONE"], I_DAY, cut)
+        self.assertEqual([h["symbol"] for h in hits], ["DBPOS", "FLPOS"])
+        self.assertEqual((counts["fetched"], counts["unusable"], counts["scanned"], counts["hits"]), (3, 1, 2, 2))
+        seen = []
+
+        def confirm(sym):
+            seen.append(sym)
+            return stage1[sym]
+        hits, counts, _ = scan.scan_intraday_patterns(stage1, ["DBPOS", "FLPOS"], I_DAY, cut, confirm=confirm,
+                                                      max_confirm=1)
+        self.assertEqual((seen, counts["unconfirmed"], counts["confirmed"]), (["FLPOS"], 1, 1))   # 106.5 x volume > 103 x volume
+        self.assertEqual([h["symbol"] for h in hits], ["FLPOS"])
+        _, _, failed = scan.scan_intraday_patterns(stage1, ["DBPOS"], I_DAY, cut, confirm=lambda s: {"t": [], "c": []})
+        self.assertIn("DBPOS", failed)
+
+    def test_the_orb_return_shape_is_unchanged(self):
+        stage1 = {"DBPOS": bars_series("2026-10-19", I_DB, [c + 0.5 for c in I_DB], [c - 0.5 for c in I_DB])}
+        res = scan.scan_orb(stage1, ["DBPOS"], I_DAY, DT(2026, 10, 19, 10, 45), 15)
+        self.assertEqual(len(res), 3)
+        self.assertEqual(sorted(res[1]), ["candidates", "confirmed", "fetched", "hits", "illiquid", "requested",
+                                          "scanned", "unconfirmed", "unusable"])
+
+
+class IntradayPatternsCli(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        os.chdir(self.d)
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def test_offline_replay_writes_the_watchlist(self):
+        code, text, _ = run(["patterns", "--intraday", "--offline", IPAT, "--at", "10:45"])
+        self.assertEqual(code, 0)
+        self.assertIn("1 intraday double bottom, 1 intraday flag", text)
+        self.assertIn("Wrote trader/watchlist.json (mode patterns-intraday, 2 hits)", text)
+        with open(os.path.join("trader", "watchlist.json"), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        self.assertEqual(doc["mode"], "patterns-intraday")
+        self.assertEqual(doc["as_of"], "2026-10-19 10:45 IST")
+        by = {h["symbol"]: h for h in doc["hits"]}
+        self.assertEqual(sorted(by), ["DBPOS", "FLPOS"])          # the three negatives are absent
+        for h in by.values():
+            for k in ("level", "stop", "target", "pattern", "state", "symbol", "setups"):
+                self.assertIn(k, h)
+        self.assertEqual((by["DBPOS"]["level"], by["FLPOS"]["level"]), (104.55, 108.55))
+        self.assertEqual(scan.symbols_from_file(os.path.join("trader", "watchlist.json")), ["DBPOS", "FLPOS"])
+
+    def test_json_pattern_and_state_options(self):
+        code, text, _ = run(["patterns", "--intraday", "--offline", IPAT, "--at", "10:45", "--json", "--no-write",
+                             "--pattern", "flag"])
+        doc = json.loads(text)
+        self.assertEqual([h["symbol"] for h in doc["hits"]], ["FLPOS"])
+        self.assertEqual(doc["pattern"], "flag")
+        code, text, _ = run(["patterns", "--intraday", "--offline", IPAT, "--at", "10:45", "--no-write",
+                             "--state", "breakout"])
+        self.assertEqual(code, 1)
+        self.assertIn("Nothing matched.", text)
+
+    def test_hits_only_before_the_cutoff(self):
+        code, _, err = run(["patterns", "--intraday", "--offline", IPAT, "--at", "15:10", "--no-write"])
+        self.assertEqual(code, 1)
+        self.assertIn("no_entries_after", err)
+        code, text, _ = run(["patterns", "--intraday", "--offline", IPAT, "--at", "10:45", "--until", "10:30",
+                             "--no-write"])
+        self.assertEqual(code, 1)
+        code, _, err = run(["patterns", "--intraday", "--offline", IPAT, "--no-write"])
+        self.assertEqual(code, 1)
+        self.assertIn("--at", err)
+
+    def test_daily_only_patterns_are_refused(self):
+        code, _, err = run(["patterns", "--intraday", "--offline", IPAT, "--at", "10:45", "--pattern", "vcp"])
+        self.assertEqual(code, 1)
+        self.assertIn("double_bottom and flag only", err)
+
+    def test_daily_patterns_keep_their_defaults(self):
+        code, _, err = run(["patterns", "--symbols", "NOPE", "--no-write"])
+        self.assertIn("no daily cache", err)
+
+
+class UserPaths(unittest.TestCase):
+    """Every path printed to the user has forward slashes, on every OS (Windows printed trader\\data\\breadth.csv)."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        os.chdir(self.d)
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def no_backslash(self, *texts):
+        for t in texts:
+            self.assertNotIn("\\", t.replace("\\u", ""), t)
+
+    def test_the_helper(self):
+        self.assertEqual(scan.fwd("trader\\data\\breadth.csv"), "trader/data/breadth.csv")
+        self.assertEqual(scan.fwd(os.path.join("trader", "data", "daily")), "trader/data/daily")
+        self.assertEqual(scan.fwd("already/fine"), "already/fine")
+
+    def test_errors_name_forward_slash_paths(self):
+        for argv in (["longterm"], ["patterns", "--symbols", "GONE"], ["breadth", "--symbols", "GONE"],
+                     ["longterm", "--data-dir", os.path.join("trader", "data"), "--symbols", "GONE"],
+                     ["daily", "--offline", os.path.join("nope", "dir")],
+                     ["daily", "--watchlist", os.path.join("trader", "nofile.json")],
+                     ["daily", "--universe", os.path.join("trader", "nolist.txt")]):
+            code, text, err = run(argv)
+            self.assertEqual(code, 1, argv)
+            self.assertIn("/", err, argv)
+            self.no_backslash(text, err)
+
+    def test_wrote_lines_and_json_out(self):
+        out = os.path.join("trader", "sub", "w.json")
+        code, text, _ = run(["daily", "--offline", DAILY, "--now", "2026-10-19 08:45", "--min-price", "0",
+                             "--min-volume", "0", "--out", out])
+        self.assertIn("Wrote trader/sub/w.json (mode daily", text)
+        self.no_backslash(text)
+        code, text, _ = run(["universe", "--offline", LISTS, "--out", os.path.join("trader", "u.txt")])
+        self.assertIn("Wrote trader/u.txt", text)
+        self.no_backslash(text)
+        code, text, _ = run(["universe", "--offline", LISTS, "--out", os.path.join("trader", "u.txt"), "--json"])
+        self.assertEqual(json.loads(text)["out"], "trader/u.txt")
+
+    def test_breadth_names_its_file_with_forward_slashes(self):
+        base = os.path.join("trader", "data", "daily")
+        os.makedirs(base)
+        for sym in ("AAA", "BBB"):
+            with open(os.path.join(base, "%s.adj.csv" % sym), "w", encoding="utf-8") as fh:
+                fh.write("date,open,high,low,close,volume\n")
+                for i in range(5):
+                    c = 100 + i * (1 if sym == "AAA" else -1)
+                    fh.write("2026-10-%02d,%s,%s,%s,%s,1000\n" % (12 + i, c, c, c, c))
+        code, text, _ = run(["breadth", "--symbols", "AAA,BBB"])
+        self.assertIn("Wrote trader/data/breadth.csv (", text)
+        self.no_backslash(text)
+        code, text, _ = run(["breadth", "--symbols", "AAA,BBB", "--json"])
+        self.assertEqual(json.loads(text)["out"], "trader/data/breadth.csv")
+        code, text, err = run(["longterm", "--symbols", "AAA", "--no-write"])      # 5 sessions: under 200
+        self.no_backslash(text, err)
+
+    def test_notes_and_help(self):
+        note = scan.read_benchmark(os.path.join("trader", "data"))[2]
+        self.assertIn("trader/data/index/nifty-50.csv", note)
+        self.no_backslash(note)
+        for cmd in ("orb", "longterm", "patterns", "breadth"):
+            out = io.StringIO()
+            with redirect_stdout(out), self.assertRaises(SystemExit):
+                scan.main([cmd, "--help"])
+            self.assertIn("trader/data", out.getvalue())
+            self.no_backslash(out.getvalue())
+        _, _, err = run(["longterm", "--symbols", "BAD", "--no-write"])
+        self.assertIn("trader/data/daily", err)
+        self.no_backslash(err)
+
+
+class MarketContext(unittest.TestCase):
+    """trader/data/flows.csv and trader/data/preopen.json (written by trader-data): a header line and fields;
+    a missing or corrupt file is no line and no crash."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        os.chdir(self.d)
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def test_flows_parse(self):
+        put_flows(FLOWS_OK)
+        f = scan.read_flows()
+        self.assertEqual(f, {"date": "2026-10-29", "fii_net_cr": -943.6, "dii_net_cr": 1924.41, "sessions": 5,
+                             "fii_net_cr_5d": -2543.6, "dii_net_cr_5d": 5024.41})
+        self.assertEqual(scan.flows_line(f), FLOWS_LINE)
+
+    def test_flows_one_date_and_one_category(self):
+        put_flows("date,category,buy_cr,sell_cr,net_cr\n2026-10-29,DII,100.00,50.50,49.50\n")
+        f = scan.read_flows()
+        self.assertEqual(scan.flows_line(f), "DII net +49.50 cr on 2026-10-29.")
+        self.assertIsNone(f["fii_net_cr"])
+
+    def test_flows_missing_or_corrupt_is_nothing(self):
+        self.assertIsNone(scan.read_flows())                                  # no file
+        for text in ("", "date,category\n2026-10-29,DII\n", "not,a,flows,file\nx,y,z,w\n", "\x00\x01\x02",
+                     "date,category,buy_cr,sell_cr,net_cr\nsoon,DII,1,2,3\n2026-10-29,GOV,1,2,3\n"
+                     "2026-10-29,DII,a,b,c\n"):
+            put_flows(text)
+            self.assertIsNone(scan.read_flows(), repr(text))
+
+    def test_flows_bad_rows_are_skipped(self):
+        put_flows("date,category,buy_cr,sell_cr,net_cr\njunk,DII,1,2,3\n2026-10-28,FII/FPI,10,20,-10\n"
+                  "2026-10-29,DII,,,\n2026-10-29,FII/FPI,1,2,-1.5\n")
+        f = scan.read_flows()
+        self.assertEqual((f["date"], f["fii_net_cr"], f["dii_net_cr"], f["fii_net_cr_5d"]), ("2026-10-29", -1.5, None, -11.5))
+
+    def test_daily_orb_and_the_json_carry_flows(self):
+        put_flows(FLOWS_OK)
+        code, text, _ = run(["daily", "--offline", DAILY, "--now", "2026-10-19 08:45", "--min-price", "0",
+                             "--min-volume", "0", "--no-write"])
+        self.assertIn(FLOWS_LINE, text)
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--no-write"])
+        self.assertIn(FLOWS_LINE, text)
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--json",
+                             "--no-write"])
+        self.assertEqual(json.loads(text)["flows"]["dii_net_cr"], 1924.41)
+        run(["daily", "--offline", DAILY, "--now", "2026-10-19 08:45", "--min-price", "0", "--min-volume", "0"])
+        with open(os.path.join("trader", "watchlist.json"), encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["flows"]["fii_net_cr"], -943.6)
+
+    def test_no_flows_file_no_line_no_key(self):
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--json",
+                             "--no-write"])
+        self.assertNotIn("flows", json.loads(text))
+        put_flows("garbage")
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--no-write"])
+        self.assertNotIn("FII/FPI", text)
+
+    def test_preopen_read(self):
+        put_preopen(preopen_doc("2026-10-19"))
+        po = scan.read_preopen()
+        self.assertEqual(po["date"], D(2026, 10, 19))
+        self.assertEqual(po["stocks"]["RELIANCE"], {"iep": 361.5, "change_pct": 1.25})
+        self.assertEqual(scan.preopen_line(po), "Pre-open 2026-10-19: 1,402 advances, 812 declines, 103 unchanged.")
+        for text in ("", "{not json", "[1]", '{"date": "soon"}', '{"stocks": []}'):
+            put_preopen(text)
+            self.assertIsNone(scan.read_preopen(), repr(text))
+        os.remove(os.path.join("trader", "data", "preopen.json"))
+        self.assertIsNone(scan.read_preopen())
+
+    def test_orb_hits_get_the_gap_when_the_dates_match(self):
+        put_preopen(preopen_doc("2026-10-19"))
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--json",
+                             "--no-write"])
+        doc = json.loads(text)
+        rel = [h for h in doc["hits"] if h["symbol"] == "RELIANCE"][0]
+        self.assertEqual((rel["preopen_gap_pct"], rel["preopen_iep"]), (1.25, 361.5))
+        self.assertTrue(all("preopen_gap_pct" not in h for h in doc["hits"] if h["symbol"] != "RELIANCE"))
+        self.assertEqual(doc["preopen"]["advances"], 1402)
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--no-write"])
+        self.assertIn("Pre-open 2026-10-19: 1,402 advances, 812 declines, 103 unchanged.", text)
+
+    def test_a_pre_open_from_another_day_is_ignored(self):
+        put_preopen(preopen_doc("2026-10-16"))
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--json",
+                             "--no-write"])
+        doc = json.loads(text)
+        self.assertNotIn("preopen", doc)
+        self.assertTrue(all("preopen_gap_pct" not in h and "preopen_iep" not in h for h in doc["hits"]))
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--no-write"])
+        self.assertNotIn("Pre-open", text)
+
+    def test_intraday_pattern_hits_get_the_gap(self):
+        put_preopen(preopen_doc("2026-10-19", {"symbol": "DBPOS", "iep": 104.0, "change_pct": -0.4}))
+        code, text, _ = run(["patterns", "--intraday", "--offline", IPAT, "--at", "10:45", "--json", "--no-write"])
+        by = {h["symbol"]: h for h in json.loads(text)["hits"]}
+        self.assertEqual((by["DBPOS"]["preopen_gap_pct"], by["DBPOS"]["preopen_iep"]), (-0.4, 104.0))
+        self.assertNotIn("preopen_gap_pct", by["FLPOS"])
+        code, text, _ = run(["patterns", "--intraday", "--offline", IPAT, "--at", "10:45", "--no-write"])
+        self.assertIn("Pre-open 2026-10-19", text)
+
+    def test_a_string_gap_or_a_missing_number_does_not_crash(self):
+        put_preopen(preopen_doc("2026-10-19", {"symbol": "RELIANCE", "iep": "361.5", "change_pct": None}))
+        po = scan.read_preopen()
+        hits = scan.add_preopen([{"symbol": "RELIANCE"}], po)
+        self.assertEqual(hits, [{"symbol": "RELIANCE", "preopen_iep": 361.5}])
+
+
+FLOWS_OK = ("date,category,buy_cr,sell_cr,net_cr\n"
+            "2026-10-23,FII/FPI,9000.00,10000.00,-1000.00\n2026-10-23,DII,8000.00,7000.00,1000.00\n"
+            "2026-10-26,FII/FPI,9000.00,9500.00,-500.00\n2026-10-26,DII,8000.00,7500.00,500.00\n"
+            "2026-10-27,FII/FPI,9000.00,9100.00,-100.00\n2026-10-27,DII,8000.00,7400.00,600.00\n"
+            "2026-10-28,FII/FPI,9000.00,9000.00,0.00\n2026-10-28,DII,8000.00,7000.00,1000.00\n"
+            "2026-10-29,FII/FPI,9000.00,9943.60,-943.60\n2026-10-29,DII,9000.00,7075.59,1924.41\n")
+FLOWS_LINE = ("FII/FPI net -943.60 cr, DII net +1,924.41 cr on 2026-10-29 "
+              "(5-session FII net -2,543.60 cr, DII net +5,024.41 cr).")
+
+
+def put_flows(text):
+    os.makedirs(os.path.join("trader", "data"), exist_ok=True)
+    with open(os.path.join("trader", "data", "flows.csv"), "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def preopen_doc(date, *extra):
+    stocks = [{"symbol": "RELIANCE", "series": "EQ", "iep": 361.5, "prev_close": 357.04, "change_pct": 1.25,
+               "final_qty": 1000, "total_buy_qty": 5000, "total_sell_qty": 4000, "turnover": 361500.0}]
+    stocks.extend(extra)
+    return json.dumps({"key": "NIFTY 50", "timestamp": date + " 09:08:00", "date": date,
+                       "fetched_at": date + "T03:40:00Z", "advances": 1402, "declines": 812, "unchanged": 103,
+                       "stocks": stocks})
+
+
+def put_preopen(text):
+    os.makedirs(os.path.join("trader", "data"), exist_ok=True)
+    with open(os.path.join("trader", "data", "preopen.json"), "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
 CAL = os.path.join(SDIR, "calendar-2027.json")
 
 
@@ -1984,11 +2384,13 @@ class Calendar(unittest.TestCase):
     def tearDown(self):
         os.chdir(self.cwd)
         shutil.rmtree(self.d)
+        scan.apply_calendar()      # back to the built-in tables (the file is read at import and on apply_calendar)
 
     def put(self, text):
         os.makedirs(os.path.join("trader", "data"), exist_ok=True)
         with open(os.path.join("trader", "data", "calendar.json"), "w", encoding="utf-8") as fh:
             fh.write(text)
+        scan.apply_calendar()
 
     def put_fixture(self):
         with open(CAL, encoding="utf-8") as fh:
@@ -1997,7 +2399,9 @@ class Calendar(unittest.TestCase):
     def test_without_the_file_the_built_in_table_answers(self):
         self.assertEqual(scan.trading_day(D(2026, 10, 20)), (False, "NSE holiday: Dussehra"))
         self.assertEqual(scan.trading_day(D(2027, 1, 26)), (True, ""))          # not in the 2026 table
-        self.assertIn("holiday list covers 2026 only", scan.calendar_note(D(2027, 1, 4)))
+        self.assertIn("holiday list covers 2024, 2025, 2026 only", scan.calendar_note(D(2027, 1, 4)))
+        self.assertEqual(scan.trading_day(D(2025, 10, 22)), (False, "NSE holiday: Diwali-Balipratipada"))   # 2025 too
+        self.assertEqual(scan.trading_day(D(2026, 2, 1)), (True, ""))            # the Budget Sunday special session
 
     def test_the_file_covers_2027(self):
         self.put_fixture()
@@ -2010,10 +2414,18 @@ class Calendar(unittest.TestCase):
         self.assertIsNone(scan.session(D(2027, 1, 26)))
 
     def test_a_special_session_is_open_even_on_a_sunday(self):
-        self.put_fixture()
-        self.assertEqual(scan.trading_day(D(2027, 10, 31)), (True, ""))         # Diwali Laxmi Pujan, a Sunday
+        self.put(json.dumps({"years": [2027], "special_sessions": {"2027-10-31": "Union Budget (Sunday)"}}))
+        self.assertEqual(scan.trading_day(D(2027, 10, 31)), (True, ""))
         self.assertIsNotNone(scan.session(D(2027, 10, 31)))
         self.assertEqual(scan.trading_day(D(2027, 10, 30)), (False, "weekend"))
+
+    def test_a_muhurat_session_is_closed_for_the_regular_market(self):
+        self.put_fixture()                                                      # lists Diwali Laxmi Pujan, a Sunday
+        ok, why = scan.trading_day(D(2027, 10, 31))
+        self.assertFalse(ok)
+        self.assertIn("no normal 09:15-15:30 market", why)
+        self.assertIsNone(scan.session(D(2027, 10, 31)))
+        self.assertIsNone(scan.session(D(2026, 11, 8)))                         # the built-in Muhurat Sunday
 
     def test_a_covered_year_beats_the_built_in_table(self):
         # years lists 2026 and no holidays: the built-in Dussehra holiday is not in the file, so the day is open
@@ -2035,6 +2447,7 @@ class Calendar(unittest.TestCase):
             self.put(text)
             self.assertEqual(scan.trading_day(D(2026, 10, 20)), (False, "NSE holiday: Dussehra"), text)
             self.assertIn("2026 only", scan.calendar_note(D(2027, 1, 4)))
+            self.assertEqual(scan.trading_day(D(2027, 1, 26)), (True, ""))
 
     def test_the_orb_window_follows_the_calendar(self):
         self.put(json.dumps({"years": [2026], "holidays": {"2026-10-19": "Test closure"}}))

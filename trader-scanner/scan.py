@@ -14,6 +14,8 @@
     python3 scan.py longterm --screen near_52w_low --near-low 10
     python3 scan.py patterns                          # VCP, double bottom, flag, triangle, inverse H&S, support
     python3 scan.py patterns --pattern vcp --state coiled
+    python3 scan.py patterns --intraday               # during the session: double bottom and flag on 5-minute bars
+    python3 scan.py patterns --intraday --offline day.json --at 10:45
     python3 scan.py breadth                           # market breadth -> trader/data/breadth.csv
 
 universe  Downloads an NSE symbol list and writes one SYMBOL|Name a line.
@@ -94,7 +96,15 @@ patterns  Chart patterns in the trader-data daily cache (real highs and lows, th
           level (trigger + one tick, what trader-entry reads), stop, risk_pct,
           target (a measured move, null for vcp and rising_support), anchor_date,
           pivots, vol_x, vol_dry and first_seen. Writes trader/watchlist.json
-          (mode patterns). Daily bars only: no intraday patterns. No network.
+          (mode patterns). No network.
+          patterns --intraday: the double bottom (pivots 3 + 3, lows 8 to 60 bars
+          apart, prior decline 1.5 %, rebound 0.8 %) and the pole and flag (top in
+          the last 12 bars, 4+ old, the session high, gain 2 %, base to top within
+          24 bars, half the pole held) on the current session's 5-minute bars,
+          through orb's fetch path (--cache, --offline with --at / --now, --at,
+          --until). Hits only when the cut-off is not after no_entries_after
+          (default 15:00). Writes trader/watchlist.json, mode patterns-intraday,
+          hits with level, stop, target, pattern, state, setups.
 
 breadth   Market breadth from the adjusted daily cache (<SYMBOL>.adj.csv), the
           last 500 dates: percent of stocks above their 50- and 200-day
@@ -127,12 +137,13 @@ Bars: null closes are dropped, a bar off the 5-minute grid (the live tick,
 like 10:49:45) is dropped, and a bar counts only once it is complete
 (start + 5 minutes <= the clock). Times are India time (IST, UTC+05:30, no
 daylight saving). --now pins the clock ("2026-10-19 10:00", IST; ...Z for UTC).
-Market days: Monday to Friday minus the NSE holiday list. trader/data/calendar.json
-(trader-data's shared calendar: "years", "holidays", "special_sessions") wins
-when it exists and parses: a special session is open, a listed holiday is
-closed, a year it covers is open. Otherwise the built-in list (2026 only;
-other years get a warning). Without a special-session entry the Muhurat
-session is treated as closed.
+Market days: Monday to Friday minus the NSE holiday list. The calendar is the
+canonical block shared with the other skills (the "nse calendar" block below):
+built-in tables for 2024 to 2026, with trader/data/calendar.json (trader-data's
+shared calendar: "years", "holidays", "special_sessions") laid on top when it
+exists and parses at import: a special session is open, a listed holiday is
+closed, for a year the file lists its holidays replace the built-in ones.
+Other years get a warning. A Muhurat session is treated as closed.
 
 Symbols are NSE symbols (RELIANCE, HDFCBANK); Yahoo is asked for SYMBOL.NS.
 A trailing .NS typed by the user is dropped. Option-looking symbols are refused.
@@ -154,6 +165,12 @@ with ind_nifty500list.csv (and EQUITY_L.csv for --source equity); daily and
 orb take a folder of <SYMBOL>.json v8 chart files or spark responses, or one
 file that is a spark response, a v8 chart, or a bundle {"RELIANCE": <v8 json>, ...}.
 .json.gz is fine.
+
+Market context (trader-data files; missing or corrupt = no line, no crash): daily, orb and patterns print one
+line from trader/data/flows.csv ("FII/FPI net -943.60 cr, DII net +1,924.41 cr on 2026-10-29 (5-session ...)")
+and put a `flows` object in the watchlist. orb and patterns --intraday read trader/data/preopen.json: when its
+date is the session day they print the pre-open advances and declines and add preopen_gap_pct (change_pct) and
+preopen_iep to each matching hit.
 
 A scan is a list of charts that match a rule, not a list of stocks to buy.
 Exit code 0 when the scan found something, 1 when it did not or could not run.
@@ -217,27 +234,6 @@ MIN_DAILY_BARS = 30
 DEFAULT_UNIVERSE = "trader/universe.txt"
 NOTE = "A scan is a list of charts that match a rule, not a list of stocks to buy."
 
-NSE_HOLIDAYS = {  # NSE equity segment, weekday holidays
-    "2026-01-15": "Maharashtra municipal elections (special holiday)",
-    "2026-01-26": "Republic Day",
-    "2026-03-03": "Holi",
-    "2026-03-26": "Shri Ram Navami",
-    "2026-03-31": "Shri Mahavir Jayanti",
-    "2026-04-03": "Good Friday",
-    "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
-    "2026-05-01": "Maharashtra Day",
-    "2026-05-28": "Bakri Id",
-    "2026-06-26": "Muharram",
-    "2026-09-14": "Ganesh Chaturthi",
-    "2026-10-02": "Mahatma Gandhi Jayanti",
-    "2026-10-20": "Dussehra",
-    "2026-11-10": "Diwali Balipratipada",
-    "2026-11-24": "Guru Nanak Jayanti",
-    "2026-12-25": "Christmas",
-}
-NSE_EARLY_CLOSE = {}  # NSE has no early closes (the Muhurat session is treated as closed)
-CALENDAR_YEARS = (2026,)
-CALENDAR_FILE = os.path.join(DATA_DIR, "calendar.json")   # trader-data's shared trading calendar, when it exists
 IST_OFFSET = datetime.timedelta(hours=5, minutes=30)  # fixed, India has no DST
 OPEN = datetime.time(9, 15)
 CLOSE = datetime.time(15, 30)
@@ -260,6 +256,12 @@ LABEL = dict(SETUPS)
 
 class ScanError(Exception):
     pass
+
+
+def fwd(path):
+    """A path as the user reads it: forward slashes on every OS (trader\\data\\breadth.csv -> trader/data/breadth.csv).
+    Used at every print site; the file operations keep the native form."""
+    return str(path).replace("\\", "/")
 
 
 # ---------------------------------------------------------------- time
@@ -306,57 +308,147 @@ def parse_hhmm(text, flag="--at"):
     return datetime.time(int(m.group(1)), int(m.group(2)))
 
 
-def _calendar_dates(doc):
-    """{"YYYY-MM-DD": name} from a calendar.json section; bad keys are skipped."""
+# --- nse calendar: keep byte-identical in every script that has it (tests/test_repo.py checks) ---
+# The NSE equity-segment trading calendar. Built-in tables for 2024 to 2026 (NSE circulars), then
+# trader/data/calendar.json (trader-data: data.py calendar, from NSE's holiday master and its trading
+# circulars) laid on top: for a year the file lists, its holidays replace the built-in ones. A missing or
+# unreadable file means the built-in tables; nothing here raises.
+BUILTIN_HOLIDAYS = {   # weekday closures of the regular 09:15-15:30 market
+    "2024-01-22": "Special holiday (Ram Mandir)", "2024-01-26": "Republic Day",
+    "2024-03-08": "Mahashivratri", "2024-03-25": "Holi", "2024-03-29": "Good Friday",
+    "2024-04-11": "Id-Ul-Fitr (Ramadan Eid)", "2024-04-17": "Shri Ram Navmi",
+    "2024-05-01": "Maharashtra Day", "2024-05-20": "Lok Sabha election (Mumbai)",
+    "2024-06-17": "Bakri Id", "2024-07-17": "Moharram", "2024-08-15": "Independence Day",
+    "2024-10-02": "Mahatma Gandhi Jayanti", "2024-11-01": "Diwali Laxmi Pujan",
+    "2024-11-15": "Gurunanak Jayanti", "2024-11-20": "Maharashtra assembly election",
+    "2024-12-25": "Christmas",
+    "2025-02-26": "Mahashivratri", "2025-03-14": "Holi", "2025-03-31": "Id-Ul-Fitr (Ramadan Eid)",
+    "2025-04-10": "Shri Mahavir Jayanti", "2025-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2025-04-18": "Good Friday", "2025-05-01": "Maharashtra Day", "2025-08-15": "Independence Day",
+    "2025-08-27": "Ganesh Chaturthi", "2025-10-02": "Mahatma Gandhi Jayanti/Dussehra",
+    "2025-10-21": "Diwali Laxmi Pujan", "2025-10-22": "Diwali-Balipratipada",
+    "2025-11-05": "Prakash Gurpurb Sri Guru Nanak Dev", "2025-12-25": "Christmas",
+    "2026-01-15": "Maharashtra municipal elections (special holiday)", "2026-01-26": "Republic Day",
+    "2026-03-03": "Holi", "2026-03-26": "Shri Ram Navami", "2026-03-31": "Shri Mahavir Jayanti",
+    "2026-04-03": "Good Friday", "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2026-05-01": "Maharashtra Day", "2026-05-28": "Bakri Id", "2026-06-26": "Muharram",
+    "2026-09-14": "Ganesh Chaturthi", "2026-10-02": "Mahatma Gandhi Jayanti", "2026-10-20": "Dussehra",
+    "2026-11-10": "Diwali-Balipratipada", "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
+    "2026-12-25": "Christmas",
+}
+BUILTIN_YEARS = (2024, 2025, 2026)
+BUILTIN_SPECIAL = {    # normal-hours sessions on a weekend or a holiday
+    "2024-01-20": "Saturday special session", "2024-03-02": "Saturday DR session",
+    "2024-05-18": "Saturday DR session", "2025-02-01": "Union Budget (Saturday)",
+    "2026-02-01": "Union Budget (Sunday)",
+}
+BUILTIN_MUHURAT = {    # one evening hour at times set by circular: the regular market is closed that day
+    "2023-11-12": "Diwali Laxmi Pujan (Muhurat), Sunday", "2024-11-01": "Diwali Laxmi Pujan (Muhurat)",
+    "2025-10-21": "Diwali Laxmi Pujan (Muhurat)", "2026-11-08": "Diwali Laxmi Pujan (Muhurat), Sunday",
+}
+NSE_HOLIDAYS = dict(BUILTIN_HOLIDAYS)    # these four hold the built-in tables plus calendar.json
+SPECIAL_SESSIONS = dict(BUILTIN_SPECIAL)
+MUHURAT_SESSIONS = dict(BUILTIN_MUHURAT)
+CALENDAR_YEARS = BUILTIN_YEARS
+CALENDAR_PATH = os.path.join("trader", "data", "calendar.json")
+
+
+def _cal_dates(m):
+    """{"2027-01-26": "Republic Day"} with bad keys dropped; anything but an object is corrupt."""
+    if m is None:
+        return {}
+    if not isinstance(m, dict):
+        raise ValueError("not an object")
     out = {}
-    if isinstance(doc, dict):
-        for k, v in doc.items():
-            try:
-                out[datetime.date.fromisoformat(str(k)).isoformat()] = str(v or "")
-            except ValueError:
-                continue
+    for k, v in m.items():
+        try:
+            datetime.date.fromisoformat(k)
+        except (TypeError, ValueError):
+            continue
+        out[k] = str(v)
     return out
 
 
 def load_calendar(path=None):
-    """trader/data/calendar.json -> {"years": set, "holidays": {...}, "special": {...}}, or None when the
-    file is missing or not the shape this tool knows (the built-in table then answers)."""
+    """trader/data/calendar.json -> {"years", "holidays", "special_sessions", "fetched_at",
+    "last_circular_check", "warnings"}, or None when it is missing or unreadable."""
     try:
-        with open(path or CALENDAR_FILE, encoding="utf-8") as fh:
+        with open(path or CALENDAR_PATH, encoding="utf-8") as fh:
             doc = json.load(fh)
-    except (OSError, ValueError):
+        if not isinstance(doc, dict):
+            return None
+        warns = doc.get("warnings")
+        return {"years": sorted(set(int(y) for y in (doc.get("years") or []))),
+                "holidays": _cal_dates(doc.get("holidays")),
+                "special_sessions": _cal_dates(doc.get("special_sessions")),
+                "fetched_at": doc.get("fetched_at"), "last_circular_check": doc.get("last_circular_check"),
+                "warnings": [str(w) for w in warns] if isinstance(warns, list) else []}
+    except (OSError, ValueError, TypeError, AttributeError):
         return None
-    if not isinstance(doc, dict):
+
+
+def is_muhurat(name):
+    low = str(name).lower()
+    return "muhurat" in low or "laxmi pujan" in low
+
+
+def apply_calendar(path=None):
+    """Rebuild NSE_HOLIDAYS, SPECIAL_SESSIONS, MUHURAT_SESSIONS and CALENDAR_YEARS from the built-in
+    tables plus calendar.json (path None = CALENDAR_PATH). Returns the file's contents, or None."""
+    global CALENDAR_YEARS
+    cal = load_calendar(path)
+    for table, base in ((NSE_HOLIDAYS, BUILTIN_HOLIDAYS), (SPECIAL_SESSIONS, BUILTIN_SPECIAL),
+                        (MUHURAT_SESSIONS, BUILTIN_MUHURAT)):
+        table.clear()
+        table.update(base)
+    CALENDAR_YEARS = BUILTIN_YEARS
+    if not cal:
         return None
-    years = set()
-    ys = doc.get("years")
-    for y in (list(ys) if isinstance(ys, (list, tuple, dict)) else []):
-        try:
-            years.add(int(y))
-        except (TypeError, ValueError):
-            continue
-    return {"years": years, "holidays": _calendar_dates(doc.get("holidays")),
-            "special": _calendar_dates(doc.get("special_sessions"))}
+    for y in cal["years"]:
+        for iso in [k for k in NSE_HOLIDAYS if k.startswith("%04d-" % y)]:
+            del NSE_HOLIDAYS[iso]
+    NSE_HOLIDAYS.update(cal["holidays"])
+    for iso, name in cal["special_sessions"].items():
+        SPECIAL_SESSIONS.pop(iso, None)
+        MUHURAT_SESSIONS.pop(iso, None)
+        (MUHURAT_SESSIONS if is_muhurat(name) else SPECIAL_SESSIONS)[iso] = name
+    CALENDAR_YEARS = tuple(sorted(set(BUILTIN_YEARS) | set(cal["years"])))
+    return cal
+
+
+def years_text():
+    return ", ".join(str(y) for y in CALENDAR_YEARS)
 
 
 def trading_day(d):
-    """(is_trading_day, reason). A special session is open; then weekends, the shared calendar.json
-    (its holidays, then any year it covers is open), then the built-in NSE holiday list."""
-    cal = load_calendar()
+    """(open, reason) for the regular 09:15-15:30 market on date d. A normal-hours special session is
+    open; a weekend, a listed holiday and a Muhurat day are closed. Outside CALENDAR_YEARS the weekday
+    rule is a guess, which calendar_known says."""
     iso = d.isoformat()
-    if cal and iso in cal["special"]:
+    if iso in MUHURAT_SESSIONS:
+        return False, ("special session: %s, about an hour in the evening at times set by NSE; "
+                       "no normal 09:15-15:30 market" % MUHURAT_SESSIONS[iso])
+    if iso in SPECIAL_SESSIONS:
         return True, ""
     if d.weekday() >= 5:
         return False, "weekend"
-    if cal:
-        if iso in cal["holidays"]:
-            return False, "NSE holiday: " + (cal["holidays"][iso] or "closed")
-        if d.year in cal["years"]:
-            return True, ""
     name = NSE_HOLIDAYS.get(iso)
     if name:
         return False, "NSE holiday: " + name
     return True, ""
+
+
+def calendar_known(d):
+    return d.year in CALENDAR_YEARS
+
+
+def bars_expected(d):
+    """Does NSE publish a daily bar for d? Every regular trading day, and a Muhurat session too."""
+    return trading_day(d)[0] or d.isoformat() in MUHURAT_SESSIONS
+
+
+apply_calendar()   # at import, from trader/data/calendar.json in the working directory when it exists
+# --- end nse calendar ---
 
 
 def session(d):
@@ -368,13 +460,8 @@ def session(d):
 
 
 def calendar_note(d):
-    """A warning when neither calendar.json nor the built-in holiday list covers the date's year."""
-    if d.year in CALENDAR_YEARS:
-        return ""
-    cal = load_calendar()
-    if cal and d.year in cal["years"]:
-        return ""
-    return "holiday list covers 2026 only: check nseindia.com"
+    """A warning when neither the built-in tables nor calendar.json cover the date's year."""
+    return "" if calendar_known(d) else "holiday list covers %s only: check nseindia.com" % years_text()
 
 
 def clock_label(t):
@@ -576,7 +663,7 @@ def load_offline(path):
     if os.path.isdir(path):
         names = sorted(f for f in os.listdir(path) if f.endswith((".json", ".json.gz")))
         if not names:
-            raise ScanError("no .json files in %s" % path)
+            raise ScanError("no .json files in %s" % fwd(path))
         for f in names:
             try:
                 doc = json.loads(_read_maybe_gz(os.path.join(path, f)))
@@ -590,10 +677,10 @@ def load_offline(path):
         try:
             doc = json.loads(_read_maybe_gz(path))
         except ValueError as e:
-            raise ScanError("%s is not valid JSON: %s" % (path, e))
+            raise ScanError("%s is not valid JSON: %s" % (fwd(path), e))
         _absorb(doc, "", data, errors)
     else:
-        raise ScanError("no offline file or folder at %s" % path)
+        raise ScanError("no offline file or folder at %s" % fwd(path))
     return data, errors
 
 
@@ -1490,6 +1577,130 @@ def carry_first_seen(hits, previous):
     return hits
 
 
+# ---------------------------------------------------------------- intraday chart patterns
+
+# The double bottom and the pole and flag on the current session's 5-minute bars: the same detectors as the daily
+# ones with the intraday parameters from the stock-pattern notes (pivots 3 + 3, bars not days). A bar's high and low
+# are real (stage 2 charts), the session so far is the whole look-back.
+INTRA_MIN_BARS = 12         # the flag looks at the last 12 bars; before 10:15 there is nothing to read
+INTRA = {
+    "L": 3, "R": 3,
+    "db_gap": (8, 60), "db_rebound_u": 0.0, "db_rebound_pct": 0.8,   # lows 8 to 60 bars apart, rebound >= 0.8 % (repo)
+    "db_prior_bars": SESSION_BARS, "db_prior_drop": 1.015,           # the session before low A reached 1.015 x low A
+    "flag_min_bars": INTRA_MIN_BARS, "flag_recent": 12, "flag_age": (4, 11), "flag_lookback": SESSION_BARS,
+    "flag_gain": 0.02, "flag_base_bars": 24, "flag_retrace": 0.5,    # top in the last 12 bars, 4+ old, session high
+}
+INTRA_DETECTORS = [("double_bottom", detect_double_bottom), ("flag", detect_flag)]
+INTRA_PATTERNS = [k for k, _ in INTRA_DETECTORS]
+INTRA_LABEL = {"double_bottom": "intraday double bottom", "flag": "intraday flag"}
+
+
+def intraday_hits(bars, only=None, state=None):
+    """Session bars (session_bars() output, real highs and lows) -> intraday pattern hits (no symbol yet). A pure
+    function of the bars up to the last completed one."""
+    if len(bars) < INTRA_MIN_BARS or any(b["h"] is None or b["l"] is None for b in bars):
+        return []
+    rows = [(b["start"], b["c"], b["h"], b["l"], b["c"], b["v"]) for b in bars]
+    x = pat_context(rows, INTRA)
+    last_close = bars[-1]["start"] + datetime.timedelta(minutes=BAR_MIN)
+    out = []
+    for name, fn in INTRA_DETECTORS:
+        if only and name != only:
+            continue
+        raw = fn(x)
+        if not raw or raw["level"] <= raw["stop"] or (state and raw["state"] != state):
+            continue
+        tag = "intraday_" + name
+        out.append({"setups": [tag], "pattern": tag, "state": raw["state"], "price": round(x["c"][-1], 2),
+                    "at": clock_label(last_close), "level": round(raw["level"], 2), "stop": round(raw["stop"], 2),
+                    "risk_pct": round((raw["level"] - raw["stop"]) / raw["level"] * 100, 2),
+                    "target": round(raw["target"], 2) if raw["target"] is not None else None,
+                    "anchor_time": x["dates"][raw["anchor"]].strftime("%H:%M"),
+                    "pivots": [[x["dates"][i].strftime("%H:%M"), round(pr, 2)] for i, pr in raw["pivots"]]})
+    return out
+
+
+def intraday_window(now_utc, at, until, explicit_day=None):
+    """-> (day, cutoff naive IST) for `patterns --intraday`, or raise ScanError with the plain message. Like
+    orb_window: a trading day, a cut-off not after now, not after the close, not after `until`."""
+    now = to_ist(now_utc)
+    day = explicit_day or now.date()
+    ok, why = trading_day(day)
+    if not ok:
+        raise ScanError("No session on %s (%s): the market is closed. Run patterns --intraday on a trading day "
+                        "during the session, or replay a past day with --offline." % (day_label(day), why))
+    s = session(day)
+    close_dt = datetime.datetime.combine(day, s[1])
+    first = slot(day, INTRA_MIN_BARS)
+    if at is not None:
+        cutoff = datetime.datetime.combine(day, at)
+        if explicit_day is None and cutoff > now + datetime.timedelta(seconds=59):
+            raise ScanError("--at %s is later than now (%s IST)." % (at.strftime("%H:%M"), clock_label(now)))
+        if cutoff > close_dt:
+            raise ScanError("--at %s is after the %s close on %s." % (at.strftime("%H:%M"), clock_label(close_dt),
+                                                                       day_label(day)))
+    else:
+        cutoff = now.replace(second=0, microsecond=0)
+        if cutoff >= close_dt:
+            raise ScanError("The market closed at %s IST on %s. Replay the session with --at 11:00."
+                            % (clock_label(close_dt), day_label(day)))
+    if cutoff < first:
+        raise ScanError("It is %s IST: an intraday pattern needs %d five-minute bars, the first complete set closes "
+                        "at %s. Run patterns --intraday again after that." % (clock_label(cutoff), INTRA_MIN_BARS,
+                                                                              clock_label(first)))
+    if until is not None and cutoff.time() > until:
+        raise ScanError("It is %s IST, after %s, your last time for new entries (no_entries_after): an intraday "
+                        "pattern found now is expired. Run it tomorrow after %s, or replay today with --at 11:00."
+                        % (clock_label(cutoff), until.strftime("%H:%M"), clock_label(first)))
+    return day, cutoff
+
+
+def scan_intraday_patterns(stage1, symbols, day, cutoff, min_price=0.0, min_volume=0, confirm=None,
+                           max_confirm=None, only=None, state=None):
+    """stage1 = {SYM: series}; confirm(sym) -> a series with real highs and lows (None = stage 1 has them). With
+    max_confirm only the most traded (price x volume so far) are read. Returns (hits, counts, failed {sym: why})."""
+    counts = {"requested": len(symbols), "fetched": 0, "unusable": 0, "illiquid": 0, "scanned": 0,
+              "confirmed": 0, "unconfirmed": 0}
+    hits, failed, cands = [], {}, []
+    for sym in symbols:
+        s = stage1.get(sym)
+        if not s:
+            continue
+        counts["fetched"] += 1
+        bars = session_bars(s, day, cutoff)
+        if not usable(bars, day, cutoff, INTRA_MIN_BARS):
+            counts["unusable"] += 1
+            continue
+        vol = sum(b["v"] for b in bars) if s.get("v") else (s.get("meta") or {}).get("regularMarketVolume") or 0
+        if bars[-1]["c"] < min_price or vol < min_volume:
+            counts["illiquid"] += 1
+            continue
+        counts["scanned"] += 1
+        cands.append((sym, bars, bars[-1]["c"] * vol))
+    if confirm is not None and max_confirm and len(cands) > max_confirm:
+        cands.sort(key=lambda x: -x[2])
+        counts["unconfirmed"] = len(cands) - max_confirm
+        cands = cands[:max_confirm]
+    for sym, bars, _ in cands:
+        full = bars
+        if confirm is not None:
+            try:
+                s2 = confirm(sym)
+            except ScanError as e:
+                failed[sym] = str(e)
+                continue
+            full = session_bars(s2, day, cutoff)
+            if not usable(full, day, cutoff, INTRA_MIN_BARS):
+                failed[sym] = "the v8 chart has a missing bar"
+                continue
+        counts["confirmed"] += 1
+        for h in intraday_hits(full, only, state):
+            hits.append(dict({"symbol": sym}, **h))
+    hits.sort(key=lambda h: (h["state"] != "coiled", (h["level"] - h["price"]) / h["level"], h["symbol"]))
+    counts["hits"] = len(hits)
+    return hits, counts, failed
+
+
 # ---------------------------------------------------------------- fetching
 
 def progress(a, msg):
@@ -1533,9 +1744,9 @@ def read_symbols(a, offline_syms=None):
         if os.path.exists(path):
             syms = symbols_from_file(path)
         elif a.universe:
-            raise ScanError("no %s: run `scan.py universe --out %s` first, or pass --symbols" % (path, path))
+            raise ScanError("no %s: run `scan.py universe --out %s` first, or pass --symbols" % (fwd(path), fwd(path)))
         else:
-            text, fb = fallback_list("no %s yet" % path)
+            text, fb = fallback_list("no %s yet" % fwd(path))
             kept, _, _ = build_universe({NIFTY500_FILE: text})
             syms = [k for k, _ in kept]
             note_out(a, fb + " (run `scan.py universe` to save a list)")
@@ -1553,14 +1764,14 @@ def read_symbols(a, offline_syms=None):
 
 def symbols_from_file(path):
     if not os.path.exists(path):
-        raise ScanError("no file at %s" % path)
+        raise ScanError("no file at %s" % fwd(path))
     with open(path, encoding="utf-8") as fh:
         text = fh.read()
     if text.lstrip().startswith(("{", "[")):
         try:
             doc = json.loads(text)
         except ValueError as e:
-            raise ScanError("%s is not valid JSON: %s" % (path, e))
+            raise ScanError("%s is not valid JSON: %s" % (fwd(path), e))
         items = doc.get("hits", []) if isinstance(doc, dict) else doc
         return [clean_symbol(x.get("symbol") if isinstance(x, dict) else x) for x in items if x]
     out = []
@@ -1578,7 +1789,7 @@ def read_config(path):
         with open(path, encoding="utf-8") as fh:
             cfg = json.load(fh)
     except ValueError as e:
-        raise ScanError("%s is not valid JSON: %s" % (path, e))
+        raise ScanError("%s is not valid JSON: %s" % (fwd(path), e))
     return cfg if isinstance(cfg, dict) else {}
 
 
@@ -1669,15 +1880,15 @@ def load_daily_cache(symbols, data_dir=None):
     for sym in symbols:
         path = daily_cache_path(sym, data_dir)
         if not os.path.exists(path):
-            missing[sym] = "no daily cache at %s" % path
+            missing[sym] = "no daily cache at %s" % fwd(path)
             continue
         try:
             rows = read_daily_csv(path)
         except OSError as e:
-            missing[sym] = "could not read %s: %s" % (path, e)
+            missing[sym] = "could not read %s: %s" % (fwd(path), e)
             continue
         if not rows:
-            missing[sym] = "%s has no rows" % path
+            missing[sym] = "%s has no rows" % fwd(path)
             continue
         data[sym] = series_from_daily(rows)
         lasts.append(rows[-1][0])
@@ -1690,12 +1901,12 @@ def load_intraday_cache(symbols, data_dir=None):
     for sym in symbols:
         path = intraday_cache_path(sym, data_dir)
         if not os.path.exists(path):
-            missing[sym] = "no intraday cache at %s" % path
+            missing[sym] = "no intraday cache at %s" % fwd(path)
             continue
         try:
             series = parse_chart(_read_maybe_gz(path), sym)
         except (OSError, ScanError) as e:
-            missing[sym] = "%s: %s" % (path, e)
+            missing[sym] = "%s: %s" % (fwd(path), e)
             continue
         data[sym] = series
         ts = [t for t in series["t"] if t]
@@ -1759,9 +1970,9 @@ def fallback_list(why=None):
         with open(path, encoding="utf-8", errors="replace") as fh:
             text = fh.read()
         try:
-            return list_from_any(text, path), "%sused %s (trader-data)" % (lead, path.replace(os.sep, "/"))
+            return list_from_any(text, path), "%sused %s (trader-data)" % (lead, fwd(path))
         except ScanError as e:
-            lead += "%s: %s; " % (path, e)
+            lead += "%s: %s; " % (fwd(path), e)
     if os.path.exists(SNAPSHOT_FILE):
         with open(SNAPSHOT_FILE, encoding="utf-8", errors="replace") as fh:
             text = fh.read()
@@ -1874,7 +2085,7 @@ def read_benchmark(data_dir=None):
     if short:
         return short
     return {}, None, ("no benchmark (neither %s nor NIFTYBEES in %s): mansfield_rs is null and rs_positive is off"
-                      % (os.path.join(base, "index", "nifty-50.csv"), os.path.join(base, "daily")))
+                      % (fwd(os.path.join(base, "index", "nifty-50.csv")), fwd(os.path.join(base, "daily"))))
 
 
 # ---------------------------------------------------------------- market breadth
@@ -1980,6 +2191,131 @@ def regime_note(data_dir=None):
     return "Market breadth %s: %s (%s above the 200-day average, %s above the 50-day%s)." % (
         r["date"], word, ("%.0f%%" % p200) if p200 is not None else "-", ("%.0f%%" % p50) if p50 is not None else "-",
         (", McClellan %+.1f" % mc) if mc is not None else "")
+
+
+# ---------------------------------------------------------------- flows and pre-open (trader-data files)
+
+FLOWS_WINDOW = 5   # sessions in the FII / DII running total
+FLOWS_COLUMNS = ("date", "category", "net_cr")
+FLOW_CATEGORY = {"FII/FPI": "fii", "FII": "fii", "FPI": "fii", "DII": "dii"}
+
+
+def _num(v):
+    """A number from a JSON or CSV field, else None (booleans and NaN are not numbers)."""
+    if isinstance(v, bool):
+        return None
+    try:
+        x = float(str(v).replace(",", "").strip() if isinstance(v, str) else v)
+    except (TypeError, ValueError):
+        return None
+    return x if x == x and abs(x) != float("inf") else None
+
+
+def read_flows(data_dir=None):
+    """trader/data/flows.csv (trader-data: date,category,buy_cr,sell_cr,net_cr; FII/FPI and DII, rupee crore) ->
+    {"date", "fii_net_cr", "dii_net_cr", "sessions", "fii_net_cr_5d", "dii_net_cr_5d"} for the newest date and the
+    running total over the last FLOWS_WINDOW dates in the file, or None when the file is missing, has no usable
+    row or is not the shape this tool knows. A bad row is skipped; the later row for a date and category wins."""
+    path = os.path.join(data_dir or DATA_DIR, "flows.csv")
+    got = {}
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            rd = csv.DictReader(fh)
+            if not rd.fieldnames or any(k not in [(f or "").strip() for f in rd.fieldnames] for k in FLOWS_COLUMNS):
+                return None
+            for r in rd:
+                r = {(k or "").strip(): v for k, v in r.items()}
+                cat = FLOW_CATEGORY.get(str(r.get("category") or "").strip().upper())
+                net = _num(r.get("net_cr"))
+                if net is None:
+                    buy, sell = _num(r.get("buy_cr")), _num(r.get("sell_cr"))
+                    net = buy - sell if buy is not None and sell is not None else None
+                try:
+                    d = datetime.date.fromisoformat(str(r.get("date") or "").strip())
+                except ValueError:
+                    continue
+                if cat and net is not None:
+                    got[(d, cat)] = net
+    except (OSError, ValueError, csv.Error, UnicodeDecodeError):
+        return None
+    if not got:
+        return None
+    dates = sorted({d for d, _ in got})
+    last, window = dates[-1], dates[-FLOWS_WINDOW:]
+
+    def total(cat):
+        vals = [got[(d, cat)] for d in window if (d, cat) in got]
+        return round(sum(vals), 2) if vals else None
+    out = {"date": last.isoformat(), "fii_net_cr": got.get((last, "fii")), "dii_net_cr": got.get((last, "dii")),
+           "sessions": len(window)}
+    out["fii_net_cr_5d"], out["dii_net_cr_5d"] = total("fii"), total("dii")
+    return out
+
+
+def flows_line(f):
+    """'FII/FPI net -943.60 cr, DII net +1,924.41 cr on 2026-10-29 (5-session FII net ..., DII net ...).'"""
+    def part(name, v):
+        return ["%s net %s cr" % (name, format(v, "+,.2f"))] if v is not None else []
+    head = part("FII/FPI", f["fii_net_cr"]) + part("DII", f["dii_net_cr"])
+    if not head:
+        return ""
+    line = "%s on %s" % (", ".join(head), f["date"])
+    if f["sessions"] > 1:
+        tail = part("FII", f["fii_net_cr_5d"]) + part("DII", f["dii_net_cr_5d"])
+        if tail:
+            line += " (%d-session %s)" % (f["sessions"], ", ".join(tail))
+    return line + "."
+
+
+def read_preopen(data_dir=None):
+    """trader/data/preopen.json (trader-data: the pre-open session's indicative prices) -> {"date", "advances",
+    "declines", "unchanged", "stocks": {SYMBOL: {"iep", "change_pct"}}}, or None when the file is missing, corrupt or
+    has no ISO date."""
+    try:
+        with open(os.path.join(data_dir or DATA_DIR, "preopen.json"), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        d = datetime.date.fromisoformat(str(doc.get("date")))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    stocks = {}
+    for s in (doc.get("stocks") if isinstance(doc.get("stocks"), list) else []):
+        if isinstance(s, dict) and s.get("symbol"):
+            stocks[str(s["symbol"]).strip().upper()] = {"iep": _num(s.get("iep")), "change_pct": _num(s.get("change_pct"))}
+    return {"date": d, "advances": _num(doc.get("advances")), "declines": _num(doc.get("declines")),
+            "unchanged": _num(doc.get("unchanged")), "stocks": stocks}
+
+
+def preopen_for(day, data_dir=None):
+    """The pre-open file when its date is the scan's session day, else None."""
+    po = read_preopen(data_dir)
+    return po if po and po["date"] == day else None
+
+
+def preopen_line(po):
+    parts = [("%s %s" % (indian(po[k]), word)) for k, word in (("advances", "advances"), ("declines", "declines"),
+                                                               ("unchanged", "unchanged")) if po[k] is not None]
+    return ("Pre-open %s: %s." % (po["date"].isoformat(), ", ".join(parts))) if parts else ""
+
+
+def add_preopen(hits, po):
+    """Stamp each hit whose symbol is in the pre-open file with preopen_gap_pct (the file's change_pct) and
+    preopen_iep. A hit with no match, or a missing number, gets no field."""
+    for h in hits:
+        s = po["stocks"].get(h["symbol"]) if po else None
+        if s and s["change_pct"] is not None:
+            h["preopen_gap_pct"] = s["change_pct"]
+        if s and s["iep"] is not None:
+            h["preopen_iep"] = s["iep"]
+    return hits
+
+
+def add_context(doc, data_dir):
+    """Put the FII / DII flows into a watchlist document and return the header lines to print."""
+    f = read_flows(data_dir)
+    line = flows_line(f) if f else ""
+    if line:
+        doc["flows"] = f
+    return line
 
 
 # ---------------------------------------------------------------- long-term screen
@@ -2135,7 +2471,7 @@ def cmd_universe(a):
             texts[fname], fb = fallback_list("%s failed (%s)" % (what, e))
             note = (note + " " if note else "") + fb + "."
     if not texts:
-        raise ScanError(("no %s in %s" % (" or ".join(wanted), a.offline)) if a.offline else "no symbol list")
+        raise ScanError(("no %s in %s" % (" or ".join(wanted), fwd(a.offline))) if a.offline else "no symbol list")
     if a.source == "equity" and EQUITY_FILE not in texts and not note:
         note = "no EQUITY_L.csv: fell back to the Nifty 500 list."
     kept, counts, used = build_universe(texts, a.source)
@@ -2152,7 +2488,7 @@ def cmd_universe(a):
         note = note.replace("--cache", "--cache (EQUITY_L.csv is not cached)")
     if a.json:
         print(json.dumps({"count": len(kept), "rows": counts.get("rows", 0), "source": used, "note": note or None,
-                          "dropped": dropped, "out": None if a.no_write else a.out,
+                          "dropped": dropped, "out": None if a.no_write else fwd(a.out),
                           "seconds": round(time.time() - t0, 1)}, indent=2))
     else:
         if note:
@@ -2163,7 +2499,7 @@ def cmd_universe(a):
             print("Dropped: " + ", ".join("%s %s" % (indian(v), k)
                                           for k, v in sorted(dropped.items(), key=lambda kv: -kv[1])) + ".")
         if not a.no_write:
-            print("Wrote %s (one SYMBOL|Name a line)." % a.out)
+            print("Wrote %s (one SYMBOL|Name a line)." % fwd(a.out))
     return 0 if kept else 1
 
 
@@ -2214,6 +2550,7 @@ def cmd_daily(a):
     regime = regime_note(DATA_DIR)
     if regime:
         doc["regime"] = regime
+    flows_text = add_context(doc, DATA_DIR)
     if not a.no_write:
         write_json(a.out, doc)
     if a.json:
@@ -2226,6 +2563,8 @@ def cmd_daily(a):
          "yahoo+cache": "Yahoo spark + trader-data cache"}[source]))
     if regime:
         print(regime)
+    if flows_text:
+        print(flows_text)
     note_out(a, cnote)
     print("Fetched %s of %s charts%s. %s passed the liquidity filter (₹%s+ and %s+ shares)%s; "
           "%s scanned." % (indian(counts["fetched"]), indian(len(symbols)),
@@ -2256,7 +2595,7 @@ def cmd_daily(a):
     if len(hits) > a.show:
         print("  ... and %d more in the watchlist (--show N for more)." % (len(hits) - a.show))
     if not a.no_write:
-        print("Wrote %s (mode daily, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
+        print("Wrote %s (mode daily, %d hit%s)." % (fwd(a.out), len(hits), "" if len(hits) == 1 else "s"))
     print(NOTE + " Next: pick one chart, then /trader-news SYMBOL.")
     return 0 if hits else 1
 
@@ -2266,26 +2605,10 @@ def _n(x):
     return str(int(x)) if x == int(x) else "%.2f" % x
 
 
-def cmd_orb(a):
-    t0 = time.time()
-    now = parse_now(a.now)
-    at = parse_hhmm(a.at) if a.at else None
-    cfg = read_config(a.config)
-    until = parse_hhmm(a.until or cfg.get("no_entries_after") or DEFAULT_UNTIL, "--until")
-    data = failed = None
-    explicit_day = None
-    offline_syms = None
-    if a.offline:
-        data, failed = load_offline(a.offline)
-        offline_syms = sorted(set(data) | set(failed))
-        if not a.now:
-            days = [ts_to_ist(s["t"][-1]).date() for s in data.values() if s["t"]]
-            if days:
-                explicit_day = max(days)
-                if at is None:
-                    raise ScanError("offline replay: give --at HH:MM or --now \"YYYY-MM-DD HH:MM\"")
-    day, cutoff = orb_window(now, at, a.or_minutes, until, explicit_day)
-    symbols = read_symbols(a, offline_syms)
+def intraday_source(a, symbols, day, data, failed):
+    """The orb fetch path, shared with `patterns --intraday`: offline files, the trader-data cache, or Yahoo (spark for
+    stage 1, a v8 chart per candidate for stage 2). -> (data, failed, confirm, source, cnote); confirm is None when
+    the stage-1 series already carry real highs and lows (offline, cache)."""
     confirm = None
     source, cnote = ("offline" if a.offline else "yahoo"), ""
     today = to_ist(parse_now(None)).date()
@@ -2335,6 +2658,35 @@ def cmd_orb(a):
                 if sym in got:
                     return got[sym]
                 raise ScanError("%s; no intraday cache either" % e)
+    return data, failed, confirm, source, cnote
+
+
+def load_offline_day(a, at):
+    """--offline files for orb and `patterns --intraday` -> (data, failed, symbols in them, the replay day). Without
+    --now the replay day is the last day in the files, and --at must say the time. Nothing offline: all None."""
+    if not a.offline:
+        return None, None, None, None
+    data, failed = load_offline(a.offline)
+    explicit_day = None
+    if not a.now:
+        days = [ts_to_ist(s["t"][-1]).date() for s in data.values() if s["t"]]
+        if days:
+            explicit_day = max(days)
+            if at is None:
+                raise ScanError("offline replay: give --at HH:MM or --now \"YYYY-MM-DD HH:MM\"")
+    return data, failed, sorted(set(data) | set(failed)), explicit_day
+
+
+def cmd_orb(a):
+    t0 = time.time()
+    now = parse_now(a.now)
+    at = parse_hhmm(a.at) if a.at else None
+    cfg = read_config(a.config)
+    until = parse_hhmm(a.until or cfg.get("no_entries_after") or DEFAULT_UNTIL, "--until")
+    data, failed, offline_syms, explicit_day = load_offline_day(a, at)
+    day, cutoff = orb_window(now, at, a.or_minutes, until, explicit_day)
+    symbols = read_symbols(a, offline_syms)
+    data, failed, confirm, source, cnote = intraday_source(a, symbols, day, data, failed)
     hits, counts, failed2 = scan_orb(data, symbols, day, cutoff, a.or_minutes, a.min_price, a.min_volume, confirm,
                                      a.max_confirm)
     tfilter = None
@@ -2369,6 +2721,12 @@ def cmd_orb(a):
     regime = regime_note(a.data_dir or DATA_DIR)
     if regime:
         doc["regime"] = regime
+    flows_text = add_context(doc, a.data_dir or DATA_DIR)
+    po = preopen_for(day, a.data_dir or DATA_DIR)
+    if po:
+        add_preopen(hits, po)
+        doc["preopen"] = {"date": po["date"].isoformat(), "advances": po["advances"],
+                          "declines": po["declines"], "unchanged": po["unchanged"]}
     if not a.no_write:
         write_json(a.out, doc)
     if a.json:
@@ -2380,6 +2738,10 @@ def cmd_orb(a):
              {"cache": "trader-data cache", "yahoo+cache": "Yahoo + trader-data cache"}.get(source, "Yahoo")))
     if regime:
         print(regime)
+    if flows_text:
+        print(flows_text)
+    if po and preopen_line(po):
+        print(preopen_line(po))
     print("Fetched %s of %s charts%s; %s usable%s; %s candidates, %s confirmed with real highs and lows."
           % (indian(counts["fetched"]), indian(len(symbols)),
              (" (%s failed or had no data)" % indian(nfailed)) if nfailed else "",
@@ -2410,7 +2772,7 @@ def cmd_orb(a):
     else:
         print("No chart closed above its opening-range high by %s." % clock_label(cutoff))
     if not a.no_write:
-        print("Wrote %s (mode orb, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
+        print("Wrote %s (mode orb, %d hit%s)." % (fwd(a.out), len(hits), "" if len(hits) == 1 else "s"))
     print(NOTE + " Next: pick one chart, then /trader-news SYMBOL and /trader-entry SYMBOL.")
     return 0 if hits else 1
 
@@ -2442,12 +2804,12 @@ def read_cache_rows(symbols, data_dir):
     for sym in symbols:
         path = daily_cache_path(sym, data_dir)
         if not os.path.exists(path):
-            missing[sym] = path
+            missing[sym] = fwd(path)
             continue
         try:
             rows[sym] = read_daily_csv(path)
         except OSError as e:
-            missing[sym] = "%s (%s)" % (path, e)
+            missing[sym] = "%s (%s)" % (fwd(path), e)
     return rows, missing
 
 
@@ -2459,7 +2821,7 @@ def cmd_longterm(a):
     rows, missing = read_cache_rows(symbols, data_dir)
     if not rows:
         raise ScanError("no daily cache in %s for these symbols. Next: run `python3 trader-data/data.py daily "
-                        "SYMBOL [SYMBOL ...]`, or %s" % (daily_dir, DATA_HINT))
+                        "SYMBOL [SYMBOL ...]`, or %s" % (fwd(daily_dir), DATA_HINT))
     bench, bench_name, bench_note = read_benchmark(data_dir)
     delivery = load_delivery(sorted(rows), data_dir)
     hits, counts, last_date = scan_longterm(rows, symbols, a.min_price, a.min_volume, a.screen, a.near_high,
@@ -2518,16 +2880,111 @@ def cmd_longterm(a):
                 ("%+.1f" % h["mansfield_rs"]) if h["mansfield_rs"] is not None else "-", swing_text(h),
                 ", ".join(LT_LABEL[t] for t in h["setups"])))
         if len(hits) > a.show:
-            print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, a.out))
+            print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, fwd(a.out)))
     else:
         print("Nothing matched.")
     if not a.no_write:
-        print("Wrote %s (mode longterm, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
+        print("Wrote %s (mode longterm, %d hit%s)." % (fwd(a.out), len(hits), "" if len(hits) == 1 else "s"))
     print(NOTE + " Not financial advice. Next: /trader-news SYMBOL, then read the company's filings.")
     return 0 if hits else 1
 
 
+def cmd_patterns_intraday(a):
+    """patterns --intraday: the double bottom and the flag on today's 5-minute bars, through orb's fetch path."""
+    t0 = time.time()
+    now = parse_now(a.now)
+    at = parse_hhmm(a.at) if a.at else None
+    cfg = read_config(a.config)
+    until = parse_hhmm(a.until or cfg.get("no_entries_after") or DEFAULT_UNTIL, "--until")
+    if a.pattern and a.pattern not in INTRA_PATTERNS:
+        raise ScanError("--intraday reads %s only (not %s)" % (" and ".join(INTRA_PATTERNS), a.pattern))
+    min_price = 50.0 if a.min_price is None else a.min_price
+    min_volume = 0 if a.min_volume is None else a.min_volume
+    state = None if a.state == "any" else a.state
+    data, failed, offline_syms, explicit_day = load_offline_day(a, at)
+    day, cutoff = intraday_window(now, at, until, explicit_day)
+    symbols = read_symbols(a, offline_syms)
+    data, failed, confirm, source, cnote = intraday_source(a, symbols, day, data, failed)
+    hits, counts, failed2 = scan_intraday_patterns(data, symbols, day, cutoff, min_price, min_volume, confirm,
+                                                   a.max_confirm, a.pattern, state)
+    failed = dict(failed or {})
+    failed.update(failed2)
+    nfailed = len([s for s in symbols if s in failed])
+    as_of = "%s %s IST" % (day.isoformat(), cutoff.strftime("%H:%M"))
+    doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "mode": "patterns-intraday", "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"],
+           "failed": nfailed, "unconfirmed": counts["unconfirmed"],
+           "source": "yahoo" if source == "offline" else source, "interval": "%dm" % BAR_MIN,
+           "pattern": a.pattern or "any", "state": a.state, "no_entries_after": until.strftime("%H:%M"),
+           "filters": {"min_price": min_price, "min_volume": min_volume}, "note": NOTE + " Not financial advice.",
+           "hits": hits}
+    if a.offline:
+        doc["offline"] = os.path.basename(a.offline.rstrip("/"))
+    if cnote:
+        doc["cache_note"] = cnote
+    regime = regime_note(a.data_dir or DATA_DIR)
+    if regime:
+        doc["regime"] = regime
+    flows_text = add_context(doc, a.data_dir or DATA_DIR)
+    po = preopen_for(day, a.data_dir or DATA_DIR)
+    if po:
+        add_preopen(hits, po)
+        doc["preopen"] = {"date": po["date"].isoformat(), "advances": po["advances"],
+                          "declines": po["declines"], "unchanged": po["unchanged"]}
+    if not a.no_write:
+        write_json(a.out, doc)
+    if a.json:
+        print(json.dumps(dict(doc, counts=counts, seconds=round(time.time() - t0, 1)), indent=2))
+        return 0 if hits else 1
+    note_out(a, cnote)
+    print("Intraday pattern scan, %s %s IST: double bottom and flag on 5-minute bars, %s."
+          % (day_label(day), clock_label(cutoff),
+             {"cache": "trader-data cache", "yahoo+cache": "Yahoo + trader-data cache"}.get(source, "Yahoo")))
+    if regime:
+        print(regime)
+    if flows_text:
+        print(flows_text)
+    if po and preopen_line(po):
+        print(preopen_line(po))
+    print("Fetched %s of %s charts%s; %s usable%s; %s read with real highs and lows."
+          % (indian(counts["fetched"]), indian(len(symbols)),
+             (" (%s failed or had no data)" % indian(nfailed)) if nfailed else "",
+             indian(counts["scanned"]),
+             (" (%s under the price / volume floor)" % indian(counts["illiquid"])) if counts["illiquid"] else "",
+             indian(counts["confirmed"])))
+    if calendar_note(day):
+        print(calendar_note(day) + ".")
+    if counts["unconfirmed"]:
+        print("PARTIAL: %s more charts were not read (only the %s most traded are; --max-confirm 0 reads all)."
+              % (indian(counts["unconfirmed"]), indian(a.max_confirm)))
+    print("Hits are only before %s (no_entries_after); pivots need %d bars on each side, so a turn in the last %d "
+          "bars is not visible yet." % (until.strftime("%H:%M"), INTRA["R"], INTRA["R"]))
+    if hits:
+        per = [(k, sum(1 for h in hits if h["pattern"] == "intraday_" + k)) for k in INTRA_PATTERNS]
+        print("%d matched: %s." % (len(hits), ", ".join("%d %s" % (n, INTRA_LABEL[k]) for k, n in per if n)))
+        print("  %-10s %-22s %-8s %9s %12s %12s %12s %6s %12s" % (
+            "SYMBOL", "PATTERN", "STATE", "AT", "CLOSE", "LEVEL", "STOP", "RISK", "TARGET"))
+        for h in hits[:a.show]:
+            print("  %-10s %-22s %-8s %9s %12s %12s %12s %5.1f%% %12s" % (
+                h["symbol"], h["pattern"], h["state"], h["at"], money(h["price"]), money(h["level"]),
+                money(h["stop"]), h["risk_pct"], money(h["target"]) if h["target"] is not None else "-"))
+        if len(hits) > a.show:
+            print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, fwd(a.out)))
+    else:
+        print("Nothing matched.")
+    if not a.no_write:
+        print("Wrote %s (mode patterns-intraday, %d hit%s)." % (fwd(a.out), len(hits), "" if len(hits) == 1 else "s"))
+    print(NOTE + " Not financial advice. Next: /trader-news SYMBOL, then /trader-entry watchlist --setup level.")
+    return 0 if hits else 1
+
+
 def cmd_patterns(a):
+    if a.intraday:
+        return cmd_patterns_intraday(a)
+    if a.min_price is None:
+        a.min_price = 20.0
+    if a.min_volume is None:
+        a.min_volume = 100000
     now = parse_now(a.now)
     data_dir = a.data_dir or DATA_DIR
     daily_dir = os.path.join(data_dir, "daily")
@@ -2535,7 +2992,7 @@ def cmd_patterns(a):
     rows, missing = read_cache_rows(symbols, data_dir)
     if not rows:
         raise ScanError("no daily cache in %s for these symbols. Next: run `python3 trader-data/data.py daily "
-                        "SYMBOL [SYMBOL ...]`, or %s" % (daily_dir, DATA_HINT))
+                        "SYMBOL [SYMBOL ...]`, or %s" % (fwd(daily_dir), DATA_HINT))
     only = [a.pattern] if a.pattern else None
     hits, counts, last_date = scan_patterns(rows, symbols, a.min_price, a.min_volume, only,
                                             None if a.state == "any" else a.state)
@@ -2559,6 +3016,7 @@ def cmd_patterns(a):
     regime = regime_note(data_dir)
     if regime:
         doc["regime"] = regime
+    flows_text = add_context(doc, data_dir)
     if not a.no_write:
         write_json(a.out, doc)
     if a.json:
@@ -2568,6 +3026,8 @@ def cmd_patterns(a):
         last_date.isoformat() if last_date else "nothing"))
     if regime:
         print(regime)
+    if flows_text:
+        print(flows_text)
     note_out(a, cnote)
     if stale:
         print("Note: the newest close is %s, more than 5 days old: refresh with `python3 trader-data/data.py "
@@ -2593,11 +3053,11 @@ def cmd_patterns(a):
                 h["risk_pct"], money(h["target"]) if h["target"] is not None else "-", h["first_seen"],
                 "  (new)" if h["first_seen"] == h["close_date"] else ""))
         if len(hits) > a.show:
-            print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, a.out))
+            print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, fwd(a.out)))
     else:
         print("Nothing matched.")
     if not a.no_write:
-        print("Wrote %s (mode patterns, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
+        print("Wrote %s (mode patterns, %d hit%s)." % (fwd(a.out), len(hits), "" if len(hits) == 1 else "s"))
     print(NOTE + " Not financial advice. Next: /trader-news SYMBOL, then /trader-entry SYMBOL for the level.")
     return 0 if hits else 1
 
@@ -2614,23 +3074,23 @@ def cmd_breadth(a):
             if os.path.exists(daily_cache_path(sym, data_dir)):
                 unadjusted.append(sym)
             else:
-                missing[sym] = adj
+                missing[sym] = fwd(adj)
             continue
         path = daily_cache_path(sym, data_dir)
         if not os.path.exists(path):
-            missing[sym] = path
+            missing[sym] = fwd(path)
             continue
         try:
             got = read_daily_csv(path)
         except OSError as e:
-            missing[sym] = "%s (%s)" % (path, e)
+            missing[sym] = "%s (%s)" % (fwd(path), e)
             continue
         if got:
             rows[sym] = got
     if not rows:
         raise ScanError("no adjusted daily cache (<SYMBOL>.adj.csv) in %s for these symbols%s. Next: run `python3 "
                         "trader-data/data.py daily SYMBOL [SYMBOL ...]`, or %s" % (
-                            daily_dir, (" (%s have only an unadjusted .csv: --unadjusted uses them, but a split "
+                            fwd(daily_dir), (" (%s have only an unadjusted .csv: --unadjusted uses them, but a split "
                                         "then fakes a new low)" % indian(len(unadjusted))) if unadjusted else "",
                             DATA_HINT))
     series = breadth_series(rows, days=BREADTH_DAYS if a.days is None else a.days)
@@ -2640,7 +3100,7 @@ def cmd_breadth(a):
     last = series[-1] if series else None
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "breadth",
            "symbols": len(rows), "skipped_unadjusted": len(unadjusted), "missing": len(missing),
-           "rows": len(series), "out": None if a.no_write else out, "last": last, "caveat": BREADTH_CAVEAT,
+           "rows": len(series), "out": None if a.no_write else fwd(out), "last": last, "caveat": BREADTH_CAVEAT,
            "unadjusted_included": bool(a.unadjusted)}
     if a.json:
         print(json.dumps(doc, indent=2))
@@ -2665,7 +3125,7 @@ def cmd_breadth(a):
         print("No dates with a previous close to compare.")
     print("Caveat: %s." % BREADTH_CAVEAT)
     if not a.no_write:
-        print("Wrote %s (%d rows). The other scans print a one-line regime note from it." % (out, len(series)))
+        print("Wrote %s (%d rows). The other scans print a one-line regime note from it." % (fwd(out), len(series)))
     return 0 if series else 1
 
 
@@ -2688,7 +3148,7 @@ def main(argv=None):
         g = p.add_mutually_exclusive_group()
         g.add_argument("--symbols", help="comma-separated NSE symbols instead of the universe (RELIANCE,TCS)")
         g.add_argument("--watchlist", metavar="FILE", help="a watchlist.json (hits) or a text file of NSE symbols")
-        p.add_argument("--universe", help="symbol list, one SYMBOL|Name a line (default %s)" % DEFAULT_UNIVERSE)
+        p.add_argument("--universe", help="symbol list, one SYMBOL|Name a line (default %s)" % fwd(DEFAULT_UNIVERSE))
         p.add_argument("--limit", type=int, help="scan only the first N symbols")
         p.add_argument("--min-price", type=float, default=min_price)
         p.add_argument("--min-volume", type=int, default=min_volume)
@@ -2715,20 +3175,20 @@ def main(argv=None):
     p.add_argument("--config", default="trader/config.json")
     p.add_argument("--trend-filter", action="store_true",
                    help="drop names whose daily swing trend (trader-data daily cache) is down; no cache = kept, flagged")
-    p.add_argument("--data-dir", help="the trader-data folder for --trend-filter (default %s)" % DATA_DIR)
+    p.add_argument("--data-dir", help="the trader-data folder for --trend-filter (default %s)" % fwd(DATA_DIR))
     p = sub.add_parser("longterm", help="long-term screen of the trader-data daily cache (no network)")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--symbols", help="comma-separated NSE symbols instead of the universe")
     g.add_argument("--watchlist", metavar="FILE", help="a watchlist.json (hits) or a text file of NSE symbols")
     p.add_argument("--universe", help="symbol list (default %s; without it, every stock in the cache)"
-                   % DEFAULT_UNIVERSE)
+                   % fwd(DEFAULT_UNIVERSE))
     p.add_argument("--limit", type=int)
     p.add_argument("--screen", choices=[k for k, _ in LT_SCREENS], help="keep only this screen (default: any)")
     p.add_argument("--near-high", type=float, default=5.0, help="percent under the 52-week high (5)")
     p.add_argument("--near-low", type=float, default=10.0, help="percent over the 52-week low (10)")
     p.add_argument("--min-price", type=float, default=20.0)
     p.add_argument("--min-volume", type=int, default=100000, help="20-day average volume (1,00,000)")
-    p.add_argument("--data-dir", help="the trader-data folder (default %s)" % DATA_DIR)
+    p.add_argument("--data-dir", help="the trader-data folder (default %s)" % fwd(DATA_DIR))
     p.add_argument("--now", help='pretend it is this time ("2026-10-29 08:30" IST)')
     p.add_argument("--out", default="trader/longterm.json")
     p.add_argument("--no-write", action="store_true")
@@ -2739,30 +3199,44 @@ def main(argv=None):
     g.add_argument("--symbols", help="comma-separated NSE symbols instead of the universe")
     g.add_argument("--watchlist", metavar="FILE", help="a watchlist.json (hits) or a text file of NSE symbols")
     p.add_argument("--universe", help="symbol list (default %s; without it, every stock in the cache)"
-                   % DEFAULT_UNIVERSE)
+                   % fwd(DEFAULT_UNIVERSE))
     p.add_argument("--limit", type=int)
     p.add_argument("--pattern", choices=[k for k, _ in PATTERNS], help="look for this pattern only (default: all)")
     p.add_argument("--state", choices=["coiled", "breakout", "any"], default="any",
                    help="coiled (formed, not broken out) or breakout (first close over the trigger); default any")
-    p.add_argument("--min-price", type=float, default=20.0)
-    p.add_argument("--min-volume", type=int, default=100000, help="20-day average volume (1,00,000)")
-    p.add_argument("--data-dir", help="the trader-data folder (default %s)" % DATA_DIR)
+    p.add_argument("--min-price", type=float, help="last close (20; 50 with --intraday)")
+    p.add_argument("--min-volume", type=int,
+                   help="20-day average volume (1,00,000); with --intraday the volume so far (0)")
+    p.add_argument("--data-dir", help="the trader-data folder (default %s)" % fwd(DATA_DIR))
     p.add_argument("--now", help='pretend it is this time ("2026-10-29 08:30" IST)')
     p.add_argument("--out", default="trader/watchlist.json")
     p.add_argument("--no-write", action="store_true")
     p.add_argument("--show", type=int, default=50)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--intraday", action="store_true",
+                   help="intraday double bottom and flag on today's 5-minute bars (orb's fetch path; needs the "
+                        "session open, or --offline with --at / --now)")
+    p.add_argument("--offline", metavar="PATH", help="--intraday: fixture folder or file instead of the network")
+    p.add_argument("--at", help="--intraday: cut the clock at this IST time, HH:MM")
+    p.add_argument("--until", help="--intraday: no hits after HH:MM IST (default: config no_entries_after, %s)"
+                   % DEFAULT_UNTIL)
+    p.add_argument("--config", default="trader/config.json")
+    p.add_argument("--cache", action="store_true", help="--intraday: read trader/data/intraday instead of Yahoo")
+    p.add_argument("--max-confirm", type=int, default=MAX_CONFIRM,
+                   help="--intraday: v8 charts to fetch, most traded first (%d; 0 = all)" % MAX_CONFIRM)
+    p.add_argument("--pause", type=float, default=PAUSE, help="--intraday: seconds between requests (%.1f)" % PAUSE)
+    p.add_argument("--quiet", action="store_true")
     p = sub.add_parser("breadth", help="market breadth from the trader-data daily cache -> trader/data/breadth.csv")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--symbols", help="comma-separated NSE symbols instead of the universe")
     g.add_argument("--watchlist", metavar="FILE", help="a watchlist.json (hits) or a text file of NSE symbols")
     p.add_argument("--universe", help="symbol list (default %s; without it, every stock in the cache)"
-                   % DEFAULT_UNIVERSE)
+                   % fwd(DEFAULT_UNIVERSE))
     p.add_argument("--limit", type=int)
     p.add_argument("--unadjusted", action="store_true",
                    help="also use symbols that have only an unadjusted <SYMBOL>.csv (a split fakes a new low)")
     p.add_argument("--days", type=int, help="dates to write (%d; 0 = every date in the cache)" % BREADTH_DAYS)
-    p.add_argument("--data-dir", help="the trader-data folder (default %s)" % DATA_DIR)
+    p.add_argument("--data-dir", help="the trader-data folder (default %s)" % fwd(DATA_DIR))
     p.add_argument("--now", help='pretend it is this time ("2026-10-29 08:30" IST)')
     p.add_argument("--out", help="default <data-dir>/breadth.csv")
     p.add_argument("--no-write", action="store_true")

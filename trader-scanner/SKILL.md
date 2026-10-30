@@ -13,7 +13,8 @@ description: >-
   trader/watchlist.json for trader-news and trader-entry. Also a long-term
   chart-pattern scan of the daily cache (VCP, double bottom, pole and flag,
   ascending triangle, inverse head and shoulders, rising-support retest, each
-  with a trigger level, a stop and a target), and a long-term
+  with a trigger level, a stop and a target), an intraday double bottom and
+  intraday flag scan on the session's 5-minute bars (patterns --intraday), and a long-term
   screen of the trader-data daily cache (above the 200-day average, near the
   52-week high, near the 52-week low as a value screen, RSI, and market
   structure: swing up with a change-of-character stop level, or a swing
@@ -22,7 +23,10 @@ description: >-
   200-day averages, net new highs, advance-decline line, McClellan oscillator)
   that adds a one-line regime note to every scan, and a delivery spike tag
   (institutional-size trades with high delivery) from the delivery files
-  trader-data keeps. Free Yahoo data
+  trader-data keeps. Prints the day's FII/DII cash-market flows (fii dii net
+  buying and selling) and the pre-open session's advances and declines, and
+  stamps each opening-range or intraday-pattern hit with its pre-open gap,
+  when trader-data has saved them. Free Yahoo data
   (SYMBOL.NS), bar by bar, with the trader-data cache as the fallback when
   Yahoo or NSE block the download. Use when the user says "scan the market", "find
   me setups", "what is breaking out on NSE", "opening range breakouts", "scan
@@ -31,12 +35,13 @@ description: >-
   200 DMA", "near 52-week high", "52-week low value stocks", "stocks in a
   swing uptrend", "swing reversal", "pullback in an uptrend", "change of
   character level", "only breakouts in an uptrend", "find VCP setups",
-  "double bottoms", "chart patterns", "pole and flag", "inverse head and
+  "double bottoms", "intraday double bottom", "intraday flag", "chart patterns", "pole and flag", "inverse head and
   shoulders", "stocks coiling under resistance", "market breadth", "is the
   market healthy", "McClellan", "relative strength vs Nifty", "delivery
-  spike", "high delivery volume", "institutional buying", or at the start
+  spike", "high delivery volume", "institutional buying", "fii dii", "FII
+  selling", "pre-open gap", "gap up at the open", or at the start
   of a trading day before /trader-news.
-argument-hint: "[universe | daily | orb | longterm | patterns | breadth] [--at HH:MM] [--cache] [--trend-filter]"
+argument-hint: "[universe | daily | orb | longterm | patterns | breadth] [--at HH:MM] [--cache] [--trend-filter] [--intraday]"
 ---
 
 # trader-scanner
@@ -65,6 +70,8 @@ python3 "${CLAUDE_SKILL_DIR}/scan.py" longterm                       # long-term
 python3 "${CLAUDE_SKILL_DIR}/scan.py" longterm --screen near_52w_low --near-low 10
 python3 "${CLAUDE_SKILL_DIR}/scan.py" patterns                       # chart patterns -> trader/watchlist.json
 python3 "${CLAUDE_SKILL_DIR}/scan.py" patterns --pattern vcp --state coiled
+python3 "${CLAUDE_SKILL_DIR}/scan.py" patterns --intraday           # intraday double bottom + flag, 5-minute bars, during the session
+python3 "${CLAUDE_SKILL_DIR}/scan.py" patterns --intraday --offline FILE --at 10:45   # replay a saved day
 python3 "${CLAUDE_SKILL_DIR}/scan.py" breadth                        # market breadth -> trader/data/breadth.csv
 ```
 
@@ -92,10 +99,36 @@ scanner asks Yahoo for `SYMBOL.NS` (with `&` sent as `%26`) and drops a
 | `trader/data/index/nifty-50.csv` | read by `longterm` as the relative-strength benchmark when it exists (written by trader-data: `date,open,high,low,close,volume,pe,pb,div_yield`); else `trader/data/daily/NIFTYBEES.adj.csv`, else `NIFTYBEES.csv`; none means `mansfield_rs` is null, with a note |
 | `trader/data/delivery/<SYMBOL>.csv` | read by `daily --cache` and `longterm` when it exists (written by trader-data): `date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series`, an empty field is missing. No file means no `delivery_spike` tag and `dq` null |
 | `trader/data/breadth.csv` | written by `breadth`: `date,pct_50,pct_200,net_new_highs,ad_line,mcclellan_osc,net_adv_ratio,fast_ema,slow_ema`. When it exists every scan prints one regime line from its newest row (and puts it in the file as `regime`) |
-| `trader/data/calendar.json` | read for the trading calendar when it exists (written by trader-data): `years`, `holidays`, `special_sessions`. Missing or unreadable means the built-in 2026 table |
+| `trader/data/flows.csv` | read by `daily`, `orb` and `patterns` when it exists (written by trader-data): `date,category,buy_cr,sell_cr,net_cr`, ISO dates ascending, category `FII/FPI` or `DII`, rupee crore. Missing, corrupt or empty means no line and no `flows` key |
+| `trader/data/preopen.json` | read by `orb` and `patterns --intraday` when it exists (written by trader-data): `date`, `advances`, `declines`, `unchanged` and `stocks[]` with `symbol`, `iep`, `change_pct`. Used only when its `date` is the scan's session day |
+| `trader/data/calendar.json` | read for the trading calendar when it exists (written by trader-data): `years`, `holidays`, `special_sessions`. Missing or unreadable means the built-in 2024 to 2026 tables |
 | `nifty500-snapshot.csv` (+ `.json`) | bundled with this skill: the Nifty 500 list as of 2026-07-13, the last fallback |
 | `trader/watchlist.json` (patterns) | written by `patterns`: `mode: "patterns"`, per hit `pattern`, `state`, `level`, `stop`, `risk_pct`, `target`, `anchor_date`, `pivots`, `vol_x`, `vol_dry`, `first_seen`. It replaces the file the other scans wrote |
+| `trader/watchlist.json` (patterns --intraday) | written by `patterns --intraday`: `mode: "patterns-intraday"`, per hit `pattern` (`intraday_double_bottom` or `intraday_flag`), `setups`, `state`, `level`, `stop`, `risk_pct`, `target`, `at`, `anchor_time`, `pivots`. `entry.py watchlist --setup level` reads `level` unchanged |
 | `trader/longterm.json` | written by `longterm`: same shape as the watchlist, `mode: "longterm"`, per hit the 200-day average, 52-week high and low and the distance from each, and the swing fields (`swing_trend`, `swing_coc`, `swing_event`, `swing_bars_since`) |
+
+## Market context: FII / DII flows and the pre-open
+
+Two files trader-data keeps add context to the scans (the scanner works
+without them, and a missing or corrupt file is no line and never an error).
+
+- **Flows.** `daily`, `orb` and `patterns` print one header line from
+  `trader/data/flows.csv`, like `FII/FPI net -943.60 cr, DII net +1,924.41 cr
+  on 2026-10-29 (5-session FII net -2,543.60 cr, DII net +5,024.41 cr).` The
+  figures are the newest date's net rupee crore per category and the sum over
+  the last 5 dates in the file (fewer when the file has fewer; one date has no
+  running part). The same numbers go in the watchlist document as `flows`
+  (`date`, `fii_net_cr`, `dii_net_cr`, `sessions`, `fii_net_cr_5d`,
+  `dii_net_cr_5d`). Say what it is: a day's institutional cash flow, context
+  and not a signal, and the file's last date may not be today.
+- **Pre-open.** `orb` and `patterns --intraday` read
+  `trader/data/preopen.json`. When its `date` equals the session day being
+  scanned, the header prints `Pre-open 2026-10-19: 1,402 advances, 812
+  declines, 103 unchanged.`, the document gets `preopen` (`date`,
+  `advances`, `declines`, `unchanged`), and each hit whose symbol is in the
+  file gets `preopen_gap_pct` (the file's `change_pct`) and `preopen_iep` (the
+  indicative equilibrium price). A file from another day is ignored. A
+  pre-open gap is the call auction's indicative price, not a traded price.
 
 ## The universe
 
@@ -305,10 +338,32 @@ file was also written by `patterns`.
 first completed 5-minute bar that closes over it, inside the entry window.
 `stop` goes to trader-exit as `--stop price:X`. These are daily patterns held
 for days, not intraday trades: the stop can be far under price and trader-exit's
-intraday plan will flat the position by the close. Opening-range scanning
-(below) stays the intraday tool; intraday double-bottom and flag detection is
-not built. The detectors' thresholds are constants in `scan.py` (`PAT`),
-marked repo or ours.
+intraday plan will flat the position by the close. For an intraday trade use
+`patterns --intraday` (next) or the opening-range scan. The detectors'
+thresholds are constants in `scan.py` (`PAT`), marked repo or ours.
+
+### Intraday patterns (`patterns --intraday`, during the session)
+
+The double bottom and the pole and flag, on the current session's 5-minute
+bars, through the same fetch path as `orb` (spark closes for every symbol,
+then a v8 chart with real highs and lows for the `--max-confirm` most traded;
+`--cache`, `--offline PATH` with `--at` or `--now`, `--at`, `--until`,
+`--config` work as in `orb`). The session so far is the look-back, the pivot
+window is 3 bars each side (`INTRA`), and a chart must have every bar from
+9:15 to the cutoff (as in `orb`).
+
+| pattern | the rule (all must hold) | level / stop / target |
+| --- | --- | --- |
+| `intraday_double_bottom` | two pivot lows 8 to 60 bars apart, within 0.5 U of each other; a pivot high between them at least 0.8 % over the lows; the session before the first low reached 1.015 times it; no close under the lows minus 0.5 U, none over the middle high after the second low | middle high + tick / lows - 0.5 U / middle high + (middle high - low) |
+| `intraday_flag` | the highest high of the last 12 bars is the highest of the session so far and 4 or more bars old; the latest pivot low before it is at most 24 bars earlier and the pole gain is at least 2 %; the lowest low since the top holds the midpoint of the pole | top + tick / flag low - tick / top + pole height |
+
+A hit exists only when the cutoff is at or before `no_entries_after`
+(`--until`, config, default 15:00): later, the scan prints one line and writes
+nothing. No scan before 10:15 (12 bars). State is `coiled` or `breakout`
+(a flag is always coiled). The file is `trader/watchlist.json` with `mode:
+"patterns-intraday"` and replaces the one the other scans wrote.
+`--min-price` defaults to 50 and `--min-volume` (volume so far) to 0 here.
+A pivot shows up 3 bars late, so a turn in the last 15 minutes is not visible.
 
 ## The opening-range breakout scan (during the session)
 
@@ -359,15 +414,20 @@ cache, under 41 daily bars, or no trend yet stays in the list, marked
   Say which data the scan used: Yahoo, the cache, or both.
 - Partial results are said as partial: "Fetched 480 of 500 charts (20 failed
   or had no data)". Never round a partial scan up to "the whole market".
-- Times are IST (UTC+05:30, no daylight saving). The trading calendar is
-  `trader/data/calendar.json` when it exists and parses (trader-data writes
-  it): a date in `special_sessions` is open, a weekend is closed, a date in
-  `holidays` is closed, a year listed in `years` is otherwise open. NSE
-  equity holidays are also built in for 2026 only; with no calendar file, or
-  for a year neither has, the scanner warns "holiday list covers 2026 only:
-  check nseindia.com". NSE has no early closes. The Diwali Muhurat session
-  (a Sunday, timings by circular) is treated as closed unless the calendar
-  lists it as a special session.
+- Times are IST (UTC+05:30, no daylight saving). The trading calendar is the
+  "nse calendar" block that every script in this pack carries byte for byte:
+  NSE equity holidays and special sessions built in for 2024 to 2026, with
+  `trader/data/calendar.json` (trader-data writes it) laid on top when it
+  exists and parses, read once at start: for a year the file lists in `years`,
+  its `holidays` replace the built-in ones; a date in `special_sessions` is
+  open (a Muhurat or Laxmi Pujan one is closed for the regular market), a
+  weekend is closed. For a year neither covers, the scanner warns "holiday list
+  covers 2024, 2025, 2026 only: check nseindia.com". NSE has no early
+  closes. The Diwali Muhurat session (an hour in the evening, timings by
+  circular) is treated as closed for the 09:15 to 15:30 scans.
+- Every path the scanner prints (the "Wrote ..." line, errors, notes, `--help`
+  defaults, the `out` field of `--json`) uses forward slashes on every OS, so
+  Windows prints `trader/data/breadth.csv`, not `trader\data\breadth.csv`.
 - Circuit limits: NSE stocks have daily price bands (2, 5, 10 or 20 %). A
   breakout into the upper circuit may not be fillable; say so.
 
