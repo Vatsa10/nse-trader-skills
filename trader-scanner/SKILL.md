@@ -13,7 +13,8 @@ description: >-
   trader/watchlist.json for trader-news and trader-entry. Also a long-term
   chart-pattern scan of the daily cache (VCP, double bottom, pole and flag,
   ascending triangle, inverse head and shoulders, rising-support retest, each
-  with a trigger level, a stop and a target), and a long-term
+  with a trigger level, a stop and a target), an intraday double bottom and
+  intraday flag scan on the session's 5-minute bars (patterns --intraday), and a long-term
   screen of the trader-data daily cache (above the 200-day average, near the
   52-week high, near the 52-week low as a value screen, RSI, and market
   structure: swing up with a change-of-character stop level, or a swing
@@ -31,12 +32,12 @@ description: >-
   200 DMA", "near 52-week high", "52-week low value stocks", "stocks in a
   swing uptrend", "swing reversal", "pullback in an uptrend", "change of
   character level", "only breakouts in an uptrend", "find VCP setups",
-  "double bottoms", "chart patterns", "pole and flag", "inverse head and
+  "double bottoms", "intraday double bottom", "intraday flag", "chart patterns", "pole and flag", "inverse head and
   shoulders", "stocks coiling under resistance", "market breadth", "is the
   market healthy", "McClellan", "relative strength vs Nifty", "delivery
   spike", "high delivery volume", "institutional buying", or at the start
   of a trading day before /trader-news.
-argument-hint: "[universe | daily | orb | longterm | patterns | breadth] [--at HH:MM] [--cache] [--trend-filter]"
+argument-hint: "[universe | daily | orb | longterm | patterns | breadth] [--at HH:MM] [--cache] [--trend-filter] [--intraday]"
 ---
 
 # trader-scanner
@@ -65,6 +66,8 @@ python3 "${CLAUDE_SKILL_DIR}/scan.py" longterm                       # long-term
 python3 "${CLAUDE_SKILL_DIR}/scan.py" longterm --screen near_52w_low --near-low 10
 python3 "${CLAUDE_SKILL_DIR}/scan.py" patterns                       # chart patterns -> trader/watchlist.json
 python3 "${CLAUDE_SKILL_DIR}/scan.py" patterns --pattern vcp --state coiled
+python3 "${CLAUDE_SKILL_DIR}/scan.py" patterns --intraday           # intraday double bottom + flag, 5-minute bars, during the session
+python3 "${CLAUDE_SKILL_DIR}/scan.py" patterns --intraday --offline FILE --at 10:45   # replay a saved day
 python3 "${CLAUDE_SKILL_DIR}/scan.py" breadth                        # market breadth -> trader/data/breadth.csv
 ```
 
@@ -95,6 +98,7 @@ scanner asks Yahoo for `SYMBOL.NS` (with `&` sent as `%26`) and drops a
 | `trader/data/calendar.json` | read for the trading calendar when it exists (written by trader-data): `years`, `holidays`, `special_sessions`. Missing or unreadable means the built-in 2026 table |
 | `nifty500-snapshot.csv` (+ `.json`) | bundled with this skill: the Nifty 500 list as of 2026-07-13, the last fallback |
 | `trader/watchlist.json` (patterns) | written by `patterns`: `mode: "patterns"`, per hit `pattern`, `state`, `level`, `stop`, `risk_pct`, `target`, `anchor_date`, `pivots`, `vol_x`, `vol_dry`, `first_seen`. It replaces the file the other scans wrote |
+| `trader/watchlist.json` (patterns --intraday) | written by `patterns --intraday`: `mode: "patterns-intraday"`, per hit `pattern` (`intraday_double_bottom` or `intraday_flag`), `setups`, `state`, `level`, `stop`, `risk_pct`, `target`, `at`, `anchor_time`, `pivots`. `entry.py watchlist --setup level` reads `level` unchanged |
 | `trader/longterm.json` | written by `longterm`: same shape as the watchlist, `mode: "longterm"`, per hit the 200-day average, 52-week high and low and the distance from each, and the swing fields (`swing_trend`, `swing_coc`, `swing_event`, `swing_bars_since`) |
 
 ## The universe
@@ -305,10 +309,32 @@ file was also written by `patterns`.
 first completed 5-minute bar that closes over it, inside the entry window.
 `stop` goes to trader-exit as `--stop price:X`. These are daily patterns held
 for days, not intraday trades: the stop can be far under price and trader-exit's
-intraday plan will flat the position by the close. Opening-range scanning
-(below) stays the intraday tool; intraday double-bottom and flag detection is
-not built. The detectors' thresholds are constants in `scan.py` (`PAT`),
-marked repo or ours.
+intraday plan will flat the position by the close. For an intraday trade use
+`patterns --intraday` (next) or the opening-range scan. The detectors'
+thresholds are constants in `scan.py` (`PAT`), marked repo or ours.
+
+### Intraday patterns (`patterns --intraday`, during the session)
+
+The double bottom and the pole and flag, on the current session's 5-minute
+bars, through the same fetch path as `orb` (spark closes for every symbol,
+then a v8 chart with real highs and lows for the `--max-confirm` most traded;
+`--cache`, `--offline PATH` with `--at` or `--now`, `--at`, `--until`,
+`--config` work as in `orb`). The session so far is the look-back, the pivot
+window is 3 bars each side (`INTRA`), and a chart must have every bar from
+9:15 to the cutoff (as in `orb`).
+
+| pattern | the rule (all must hold) | level / stop / target |
+| --- | --- | --- |
+| `intraday_double_bottom` | two pivot lows 8 to 60 bars apart, within 0.5 U of each other; a pivot high between them at least 0.8 % over the lows; the session before the first low reached 1.015 times it; no close under the lows minus 0.5 U, none over the middle high after the second low | middle high + tick / lows - 0.5 U / middle high + (middle high - low) |
+| `intraday_flag` | the highest high of the last 12 bars is the highest of the session so far and 4 or more bars old; the latest pivot low before it is at most 24 bars earlier and the pole gain is at least 2 %; the lowest low since the top holds the midpoint of the pole | top + tick / flag low - tick / top + pole height |
+
+A hit exists only when the cutoff is at or before `no_entries_after`
+(`--until`, config, default 15:00): later, the scan prints one line and writes
+nothing. No scan before 10:15 (12 bars). State is `coiled` or `breakout`
+(a flag is always coiled). The file is `trader/watchlist.json` with `mode:
+"patterns-intraday"` and replaces the one the other scans wrote.
+`--min-price` defaults to 50 and `--min-volume` (volume so far) to 0 here.
+A pivot shows up 3 bars late, so a turn in the last 15 minutes is not visible.
 
 ## The opening-range breakout scan (during the session)
 

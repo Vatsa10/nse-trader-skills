@@ -14,6 +14,8 @@
     python3 scan.py longterm --screen near_52w_low --near-low 10
     python3 scan.py patterns                          # VCP, double bottom, flag, triangle, inverse H&S, support
     python3 scan.py patterns --pattern vcp --state coiled
+    python3 scan.py patterns --intraday               # during the session: double bottom and flag on 5-minute bars
+    python3 scan.py patterns --intraday --offline day.json --at 10:45
     python3 scan.py breadth                           # market breadth -> trader/data/breadth.csv
 
 universe  Downloads an NSE symbol list and writes one SYMBOL|Name a line.
@@ -94,7 +96,15 @@ patterns  Chart patterns in the trader-data daily cache (real highs and lows, th
           level (trigger + one tick, what trader-entry reads), stop, risk_pct,
           target (a measured move, null for vcp and rising_support), anchor_date,
           pivots, vol_x, vol_dry and first_seen. Writes trader/watchlist.json
-          (mode patterns). Daily bars only: no intraday patterns. No network.
+          (mode patterns). No network.
+          patterns --intraday: the double bottom (pivots 3 + 3, lows 8 to 60 bars
+          apart, prior decline 1.5 %, rebound 0.8 %) and the pole and flag (top in
+          the last 12 bars, 4+ old, the session high, gain 2 %, base to top within
+          24 bars, half the pole held) on the current session's 5-minute bars,
+          through orb's fetch path (--cache, --offline with --at / --now, --at,
+          --until). Hits only when the cut-off is not after no_entries_after
+          (default 15:00). Writes trader/watchlist.json, mode patterns-intraday,
+          hits with level, stop, target, pattern, state, setups.
 
 breadth   Market breadth from the adjusted daily cache (<SYMBOL>.adj.csv), the
           last 500 dates: percent of stocks above their 50- and 200-day
@@ -1490,6 +1500,130 @@ def carry_first_seen(hits, previous):
     return hits
 
 
+# ---------------------------------------------------------------- intraday chart patterns
+
+# The double bottom and the pole and flag on the current session's 5-minute bars: the same detectors as the daily
+# ones with the intraday parameters from the stock-pattern notes (pivots 3 + 3, bars not days). A bar's high and low
+# are real (stage 2 charts), the session so far is the whole look-back.
+INTRA_MIN_BARS = 12         # the flag looks at the last 12 bars; before 10:15 there is nothing to read
+INTRA = {
+    "L": 3, "R": 3,
+    "db_gap": (8, 60), "db_rebound_u": 0.0, "db_rebound_pct": 0.8,   # lows 8 to 60 bars apart, rebound >= 0.8 % (repo)
+    "db_prior_bars": SESSION_BARS, "db_prior_drop": 1.015,           # the session before low A reached 1.015 x low A
+    "flag_min_bars": INTRA_MIN_BARS, "flag_recent": 12, "flag_age": (4, 11), "flag_lookback": SESSION_BARS,
+    "flag_gain": 0.02, "flag_base_bars": 24, "flag_retrace": 0.5,    # top in the last 12 bars, 4+ old, session high
+}
+INTRA_DETECTORS = [("double_bottom", detect_double_bottom), ("flag", detect_flag)]
+INTRA_PATTERNS = [k for k, _ in INTRA_DETECTORS]
+INTRA_LABEL = {"double_bottom": "intraday double bottom", "flag": "intraday flag"}
+
+
+def intraday_hits(bars, only=None, state=None):
+    """Session bars (session_bars() output, real highs and lows) -> intraday pattern hits (no symbol yet). A pure
+    function of the bars up to the last completed one."""
+    if len(bars) < INTRA_MIN_BARS or any(b["h"] is None or b["l"] is None for b in bars):
+        return []
+    rows = [(b["start"], b["c"], b["h"], b["l"], b["c"], b["v"]) for b in bars]
+    x = pat_context(rows, INTRA)
+    last_close = bars[-1]["start"] + datetime.timedelta(minutes=BAR_MIN)
+    out = []
+    for name, fn in INTRA_DETECTORS:
+        if only and name != only:
+            continue
+        raw = fn(x)
+        if not raw or raw["level"] <= raw["stop"] or (state and raw["state"] != state):
+            continue
+        tag = "intraday_" + name
+        out.append({"setups": [tag], "pattern": tag, "state": raw["state"], "price": round(x["c"][-1], 2),
+                    "at": clock_label(last_close), "level": round(raw["level"], 2), "stop": round(raw["stop"], 2),
+                    "risk_pct": round((raw["level"] - raw["stop"]) / raw["level"] * 100, 2),
+                    "target": round(raw["target"], 2) if raw["target"] is not None else None,
+                    "anchor_time": x["dates"][raw["anchor"]].strftime("%H:%M"),
+                    "pivots": [[x["dates"][i].strftime("%H:%M"), round(pr, 2)] for i, pr in raw["pivots"]]})
+    return out
+
+
+def intraday_window(now_utc, at, until, explicit_day=None):
+    """-> (day, cutoff naive IST) for `patterns --intraday`, or raise ScanError with the plain message. Like
+    orb_window: a trading day, a cut-off not after now, not after the close, not after `until`."""
+    now = to_ist(now_utc)
+    day = explicit_day or now.date()
+    ok, why = trading_day(day)
+    if not ok:
+        raise ScanError("No session on %s (%s): the market is closed. Run patterns --intraday on a trading day "
+                        "during the session, or replay a past day with --offline." % (day_label(day), why))
+    s = session(day)
+    close_dt = datetime.datetime.combine(day, s[1])
+    first = slot(day, INTRA_MIN_BARS)
+    if at is not None:
+        cutoff = datetime.datetime.combine(day, at)
+        if explicit_day is None and cutoff > now + datetime.timedelta(seconds=59):
+            raise ScanError("--at %s is later than now (%s IST)." % (at.strftime("%H:%M"), clock_label(now)))
+        if cutoff > close_dt:
+            raise ScanError("--at %s is after the %s close on %s." % (at.strftime("%H:%M"), clock_label(close_dt),
+                                                                       day_label(day)))
+    else:
+        cutoff = now.replace(second=0, microsecond=0)
+        if cutoff >= close_dt:
+            raise ScanError("The market closed at %s IST on %s. Replay the session with --at 11:00."
+                            % (clock_label(close_dt), day_label(day)))
+    if cutoff < first:
+        raise ScanError("It is %s IST: an intraday pattern needs %d five-minute bars, the first complete set closes "
+                        "at %s. Run patterns --intraday again after that." % (clock_label(cutoff), INTRA_MIN_BARS,
+                                                                              clock_label(first)))
+    if until is not None and cutoff.time() > until:
+        raise ScanError("It is %s IST, after %s, your last time for new entries (no_entries_after): an intraday "
+                        "pattern found now is expired. Run it tomorrow after %s, or replay today with --at 11:00."
+                        % (clock_label(cutoff), until.strftime("%H:%M"), clock_label(first)))
+    return day, cutoff
+
+
+def scan_intraday_patterns(stage1, symbols, day, cutoff, min_price=0.0, min_volume=0, confirm=None,
+                           max_confirm=None, only=None, state=None):
+    """stage1 = {SYM: series}; confirm(sym) -> a series with real highs and lows (None = stage 1 has them). With
+    max_confirm only the most traded (price x volume so far) are read. Returns (hits, counts, failed {sym: why})."""
+    counts = {"requested": len(symbols), "fetched": 0, "unusable": 0, "illiquid": 0, "scanned": 0,
+              "confirmed": 0, "unconfirmed": 0}
+    hits, failed, cands = [], {}, []
+    for sym in symbols:
+        s = stage1.get(sym)
+        if not s:
+            continue
+        counts["fetched"] += 1
+        bars = session_bars(s, day, cutoff)
+        if not usable(bars, day, cutoff, INTRA_MIN_BARS):
+            counts["unusable"] += 1
+            continue
+        vol = sum(b["v"] for b in bars) if s.get("v") else (s.get("meta") or {}).get("regularMarketVolume") or 0
+        if bars[-1]["c"] < min_price or vol < min_volume:
+            counts["illiquid"] += 1
+            continue
+        counts["scanned"] += 1
+        cands.append((sym, bars, bars[-1]["c"] * vol))
+    if confirm is not None and max_confirm and len(cands) > max_confirm:
+        cands.sort(key=lambda x: -x[2])
+        counts["unconfirmed"] = len(cands) - max_confirm
+        cands = cands[:max_confirm]
+    for sym, bars, _ in cands:
+        full = bars
+        if confirm is not None:
+            try:
+                s2 = confirm(sym)
+            except ScanError as e:
+                failed[sym] = str(e)
+                continue
+            full = session_bars(s2, day, cutoff)
+            if not usable(full, day, cutoff, INTRA_MIN_BARS):
+                failed[sym] = "the v8 chart has a missing bar"
+                continue
+        counts["confirmed"] += 1
+        for h in intraday_hits(full, only, state):
+            hits.append(dict({"symbol": sym}, **h))
+    hits.sort(key=lambda h: (h["state"] != "coiled", (h["level"] - h["price"]) / h["level"], h["symbol"]))
+    counts["hits"] = len(hits)
+    return hits, counts, failed
+
+
 # ---------------------------------------------------------------- fetching
 
 def progress(a, msg):
@@ -2266,26 +2400,10 @@ def _n(x):
     return str(int(x)) if x == int(x) else "%.2f" % x
 
 
-def cmd_orb(a):
-    t0 = time.time()
-    now = parse_now(a.now)
-    at = parse_hhmm(a.at) if a.at else None
-    cfg = read_config(a.config)
-    until = parse_hhmm(a.until or cfg.get("no_entries_after") or DEFAULT_UNTIL, "--until")
-    data = failed = None
-    explicit_day = None
-    offline_syms = None
-    if a.offline:
-        data, failed = load_offline(a.offline)
-        offline_syms = sorted(set(data) | set(failed))
-        if not a.now:
-            days = [ts_to_ist(s["t"][-1]).date() for s in data.values() if s["t"]]
-            if days:
-                explicit_day = max(days)
-                if at is None:
-                    raise ScanError("offline replay: give --at HH:MM or --now \"YYYY-MM-DD HH:MM\"")
-    day, cutoff = orb_window(now, at, a.or_minutes, until, explicit_day)
-    symbols = read_symbols(a, offline_syms)
+def intraday_source(a, symbols, day, data, failed):
+    """The orb fetch path, shared with `patterns --intraday`: offline files, the trader-data cache, or Yahoo (spark for
+    stage 1, a v8 chart per candidate for stage 2). -> (data, failed, confirm, source, cnote); confirm is None when
+    the stage-1 series already carry real highs and lows (offline, cache)."""
     confirm = None
     source, cnote = ("offline" if a.offline else "yahoo"), ""
     today = to_ist(parse_now(None)).date()
@@ -2335,6 +2453,35 @@ def cmd_orb(a):
                 if sym in got:
                     return got[sym]
                 raise ScanError("%s; no intraday cache either" % e)
+    return data, failed, confirm, source, cnote
+
+
+def load_offline_day(a, at):
+    """--offline files for orb and `patterns --intraday` -> (data, failed, symbols in them, the replay day). Without
+    --now the replay day is the last day in the files, and --at must say the time. Nothing offline: all None."""
+    if not a.offline:
+        return None, None, None, None
+    data, failed = load_offline(a.offline)
+    explicit_day = None
+    if not a.now:
+        days = [ts_to_ist(s["t"][-1]).date() for s in data.values() if s["t"]]
+        if days:
+            explicit_day = max(days)
+            if at is None:
+                raise ScanError("offline replay: give --at HH:MM or --now \"YYYY-MM-DD HH:MM\"")
+    return data, failed, sorted(set(data) | set(failed)), explicit_day
+
+
+def cmd_orb(a):
+    t0 = time.time()
+    now = parse_now(a.now)
+    at = parse_hhmm(a.at) if a.at else None
+    cfg = read_config(a.config)
+    until = parse_hhmm(a.until or cfg.get("no_entries_after") or DEFAULT_UNTIL, "--until")
+    data, failed, offline_syms, explicit_day = load_offline_day(a, at)
+    day, cutoff = orb_window(now, at, a.or_minutes, until, explicit_day)
+    symbols = read_symbols(a, offline_syms)
+    data, failed, confirm, source, cnote = intraday_source(a, symbols, day, data, failed)
     hits, counts, failed2 = scan_orb(data, symbols, day, cutoff, a.or_minutes, a.min_price, a.min_volume, confirm,
                                      a.max_confirm)
     tfilter = None
@@ -2527,7 +2674,92 @@ def cmd_longterm(a):
     return 0 if hits else 1
 
 
+def cmd_patterns_intraday(a):
+    """patterns --intraday: the double bottom and the flag on today's 5-minute bars, through orb's fetch path."""
+    t0 = time.time()
+    now = parse_now(a.now)
+    at = parse_hhmm(a.at) if a.at else None
+    cfg = read_config(a.config)
+    until = parse_hhmm(a.until or cfg.get("no_entries_after") or DEFAULT_UNTIL, "--until")
+    if a.pattern and a.pattern not in INTRA_PATTERNS:
+        raise ScanError("--intraday reads %s only (not %s)" % (" and ".join(INTRA_PATTERNS), a.pattern))
+    min_price = 50.0 if a.min_price is None else a.min_price
+    min_volume = 0 if a.min_volume is None else a.min_volume
+    state = None if a.state == "any" else a.state
+    data, failed, offline_syms, explicit_day = load_offline_day(a, at)
+    day, cutoff = intraday_window(now, at, until, explicit_day)
+    symbols = read_symbols(a, offline_syms)
+    data, failed, confirm, source, cnote = intraday_source(a, symbols, day, data, failed)
+    hits, counts, failed2 = scan_intraday_patterns(data, symbols, day, cutoff, min_price, min_volume, confirm,
+                                                   a.max_confirm, a.pattern, state)
+    failed = dict(failed or {})
+    failed.update(failed2)
+    nfailed = len([s for s in symbols if s in failed])
+    as_of = "%s %s IST" % (day.isoformat(), cutoff.strftime("%H:%M"))
+    doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "mode": "patterns-intraday", "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"],
+           "failed": nfailed, "unconfirmed": counts["unconfirmed"],
+           "source": "yahoo" if source == "offline" else source, "interval": "%dm" % BAR_MIN,
+           "pattern": a.pattern or "any", "state": a.state, "no_entries_after": until.strftime("%H:%M"),
+           "filters": {"min_price": min_price, "min_volume": min_volume}, "note": NOTE + " Not financial advice.",
+           "hits": hits}
+    if a.offline:
+        doc["offline"] = os.path.basename(a.offline.rstrip("/"))
+    if cnote:
+        doc["cache_note"] = cnote
+    regime = regime_note(a.data_dir or DATA_DIR)
+    if regime:
+        doc["regime"] = regime
+    if not a.no_write:
+        write_json(a.out, doc)
+    if a.json:
+        print(json.dumps(dict(doc, counts=counts, seconds=round(time.time() - t0, 1)), indent=2))
+        return 0 if hits else 1
+    note_out(a, cnote)
+    print("Intraday pattern scan, %s %s IST: double bottom and flag on 5-minute bars, %s."
+          % (day_label(day), clock_label(cutoff),
+             {"cache": "trader-data cache", "yahoo+cache": "Yahoo + trader-data cache"}.get(source, "Yahoo")))
+    if regime:
+        print(regime)
+    print("Fetched %s of %s charts%s; %s usable%s; %s read with real highs and lows."
+          % (indian(counts["fetched"]), indian(len(symbols)),
+             (" (%s failed or had no data)" % indian(nfailed)) if nfailed else "",
+             indian(counts["scanned"]),
+             (" (%s under the price / volume floor)" % indian(counts["illiquid"])) if counts["illiquid"] else "",
+             indian(counts["confirmed"])))
+    if calendar_note(day):
+        print(calendar_note(day) + ".")
+    if counts["unconfirmed"]:
+        print("PARTIAL: %s more charts were not read (only the %s most traded are; --max-confirm 0 reads all)."
+              % (indian(counts["unconfirmed"]), indian(a.max_confirm)))
+    print("Hits are only before %s (no_entries_after); pivots need %d bars on each side, so a turn in the last %d "
+          "bars is not visible yet." % (until.strftime("%H:%M"), INTRA["R"], INTRA["R"]))
+    if hits:
+        per = [(k, sum(1 for h in hits if h["pattern"] == "intraday_" + k)) for k in INTRA_PATTERNS]
+        print("%d matched: %s." % (len(hits), ", ".join("%d %s" % (n, INTRA_LABEL[k]) for k, n in per if n)))
+        print("  %-10s %-22s %-8s %9s %12s %12s %12s %6s %12s" % (
+            "SYMBOL", "PATTERN", "STATE", "AT", "CLOSE", "LEVEL", "STOP", "RISK", "TARGET"))
+        for h in hits[:a.show]:
+            print("  %-10s %-22s %-8s %9s %12s %12s %12s %5.1f%% %12s" % (
+                h["symbol"], h["pattern"], h["state"], h["at"], money(h["price"]), money(h["level"]),
+                money(h["stop"]), h["risk_pct"], money(h["target"]) if h["target"] is not None else "-"))
+        if len(hits) > a.show:
+            print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, a.out))
+    else:
+        print("Nothing matched.")
+    if not a.no_write:
+        print("Wrote %s (mode patterns-intraday, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
+    print(NOTE + " Not financial advice. Next: /trader-news SYMBOL, then /trader-entry watchlist --setup level.")
+    return 0 if hits else 1
+
+
 def cmd_patterns(a):
+    if a.intraday:
+        return cmd_patterns_intraday(a)
+    if a.min_price is None:
+        a.min_price = 20.0
+    if a.min_volume is None:
+        a.min_volume = 100000
     now = parse_now(a.now)
     data_dir = a.data_dir or DATA_DIR
     daily_dir = os.path.join(data_dir, "daily")
@@ -2744,14 +2976,28 @@ def main(argv=None):
     p.add_argument("--pattern", choices=[k for k, _ in PATTERNS], help="look for this pattern only (default: all)")
     p.add_argument("--state", choices=["coiled", "breakout", "any"], default="any",
                    help="coiled (formed, not broken out) or breakout (first close over the trigger); default any")
-    p.add_argument("--min-price", type=float, default=20.0)
-    p.add_argument("--min-volume", type=int, default=100000, help="20-day average volume (1,00,000)")
+    p.add_argument("--min-price", type=float, help="last close (20; 50 with --intraday)")
+    p.add_argument("--min-volume", type=int,
+                   help="20-day average volume (1,00,000); with --intraday the volume so far (0)")
     p.add_argument("--data-dir", help="the trader-data folder (default %s)" % DATA_DIR)
     p.add_argument("--now", help='pretend it is this time ("2026-10-29 08:30" IST)')
     p.add_argument("--out", default="trader/watchlist.json")
     p.add_argument("--no-write", action="store_true")
     p.add_argument("--show", type=int, default=50)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--intraday", action="store_true",
+                   help="intraday double bottom and flag on today's 5-minute bars (orb's fetch path; needs the "
+                        "session open, or --offline with --at / --now)")
+    p.add_argument("--offline", metavar="PATH", help="--intraday: fixture folder or file instead of the network")
+    p.add_argument("--at", help="--intraday: cut the clock at this IST time, HH:MM")
+    p.add_argument("--until", help="--intraday: no hits after HH:MM IST (default: config no_entries_after, %s)"
+                   % DEFAULT_UNTIL)
+    p.add_argument("--config", default="trader/config.json")
+    p.add_argument("--cache", action="store_true", help="--intraday: read trader/data/intraday instead of Yahoo")
+    p.add_argument("--max-confirm", type=int, default=MAX_CONFIRM,
+                   help="--intraday: v8 charts to fetch, most traded first (%d; 0 = all)" % MAX_CONFIRM)
+    p.add_argument("--pause", type=float, default=PAUSE, help="--intraday: seconds between requests (%.1f)" % PAUSE)
+    p.add_argument("--quiet", action="store_true")
     p = sub.add_parser("breadth", help="market breadth from the trader-data daily cache -> trader/data/breadth.csv")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--symbols", help="comma-separated NSE symbols instead of the universe")

@@ -1970,6 +1970,178 @@ class Delivery(unittest.TestCase):
             shutil.rmtree(d)
 
 
+IPAT = os.path.join(SDIR, "intraday-patterns-2026-10-19.json")   # six hand-made 5-minute charts, Mon Oct 19 2026
+I_DAY = D(2026, 10, 19)
+# Closes, one per 5-minute bar from 09:15 (high = close + 0.5, low = close - 0.5, so U = 1.0).
+I_DB = [105, 104, 103, 102, 101, 100, 101, 102, 103, 104, 103, 102, 101, 100, 101, 102, 103, 103]
+I_FL = [103, 102.5, 102, 101, 100, 101, 102, 103, 104, 105, 106, 107, 108, 107, 106.5, 106.8, 106.2, 106.5]
+
+
+def ibars(closes, cutoff="10:45", hw=0.5):
+    """Closes -> session_bars() output at `cutoff` on 2026-10-19; high = close + hw, low = close - hw."""
+    s = bars_series("2026-10-19", closes, [c + hw for c in closes], [c - hw for c in closes])
+    return scan.session_bars(s, I_DAY, DT.strptime("2026-10-19 " + cutoff, "%Y-%m-%d %H:%M"))
+
+
+class IntradayPatterns(unittest.TestCase):
+    def one(self, closes, pattern, cutoff="10:45", hw=0.5):
+        got = [h for h in scan.intraday_hits(ibars(closes, cutoff, hw)) if h["pattern"] == "intraday_" + pattern]
+        return got[0] if got else None
+
+    def test_double_bottom_coiled(self):
+        h = self.one(I_DB, "double_bottom")
+        self.assertEqual((h["state"], h["level"], h["stop"], h["target"]), ("coiled", 104.55, 99.0, 109.5))
+        self.assertEqual(h["setups"], ["intraday_double_bottom"])
+        self.assertEqual(h["pivots"], [["09:40", 99.5], ["10:20", 99.5]])
+        self.assertEqual((h["at"], h["price"]), ("10:45 AM", 103.0))
+
+    def test_double_bottom_negatives(self):
+        self.assertIsNone(self.one([100.4, 100.3, 100.25, 100.2, 100.15] + I_DB[5:], "double_bottom"))  # no 1.5 % decline
+        self.assertIsNone(self.one(I_DB[:13] + [98] + I_DB[14:], "double_bottom"))        # the lows differ by 2 rupees
+        self.assertIsNone(self.one(I_DB[:-1] + [101.0], "double_bottom"))                  # under the midpoint of the base
+        shallow = [102, 101.5, 101, 100.5, 100.2, 100, 100.1, 100.2, 100.3, 100.4, 100.3, 100.2, 100.1, 100, 100.1,
+                   100.2, 100.3, 100.3]
+        self.assertIsNone(self.one(shallow, "double_bottom", hw=0.1))                      # a 0.6 % rebound: under 0.8 %
+        self.assertIsNotNone(self.one([c + 0.3 if c > 100.2 else c for c in shallow], "double_bottom", hw=0.1))
+
+    def test_double_bottom_lows_too_close(self):
+        # the second low 7 bars after the first (the minimum is 8): same shape squeezed by one bar
+        tight = [105, 104, 103, 102, 101, 100, 101, 102, 103, 102, 101, 100.5, 100, 101, 102, 103, 103, 103]
+        self.assertIsNone(self.one(tight, "double_bottom"))
+
+    def test_broken_out_is_the_breakout_state(self):
+        h = self.one(I_DB[:-1] + [105.0], "double_bottom")
+        self.assertEqual(h["state"], "breakout")
+        self.assertEqual(h["level"], 104.55)
+        self.assertIsNone(self.one(I_DB[:-1] + [120.0], "double_bottom"))                  # over 5 % past the trigger
+
+    def test_flag_coiled(self):
+        h = self.one(I_FL, "flag")
+        self.assertEqual((h["state"], h["level"], h["stop"], h["target"]), ("coiled", 108.55, 105.65, 117.5))
+        self.assertEqual(h["pivots"], [["09:35", 99.5], ["10:15", 108.5]])
+        self.assertEqual(h["setups"], ["intraday_flag"])
+
+    def test_flag_negatives(self):
+        self.assertIsNone(self.one(I_FL[:13] + [106, 104, 102, 101, 100.5], "flag"))      # the pullback gave back over half
+        self.assertIsNone(self.one([112] + I_FL[1:], "flag"))                             # the top is not the session high
+        self.assertIsNone(self.one(I_FL[:15], "flag", "10:30"))                           # the top is only 2 bars old
+        weak = [100.4, 100.3, 100.2, 100.1, 100, 100.1, 100.2, 100.3, 100.4, 100.5, 100.6, 100.7, 100.8, 100.7, 100.6,
+                100.65, 100.6, 100.65]
+        self.assertIsNone(self.one(weak, "flag"))                                         # a 1.8 % gain: under 2 %
+
+    def test_short_or_incomplete_sessions_give_nothing(self):
+        self.assertEqual(scan.intraday_hits(ibars(I_DB[:11], "10:10")), [])               # fewer than 12 bars
+        bars = ibars(I_DB)
+        bars[3]["h"] = None
+        self.assertEqual(scan.intraday_hits(bars), [])                                    # no real high
+        self.assertEqual(scan.intraday_hits(ibars(I_DB)), scan.intraday_hits(ibars(I_DB + [90, 90], "10:45")))  # no look-ahead
+
+    def test_only_and_state_filters(self):
+        both = ibars(I_DB)
+        self.assertEqual([h["pattern"] for h in scan.intraday_hits(both, "flag")], [])
+        self.assertEqual(len(scan.intraday_hits(both, "double_bottom", "coiled")), 1)
+        self.assertEqual(scan.intraday_hits(both, "double_bottom", "breakout"), [])
+
+    def test_window_refuses_after_the_cutoff_and_before_enough_bars(self):
+        now = scan.parse_now("2026-10-19 15:05")
+        with self.assertRaises(scan.ScanError) as cm:
+            scan.intraday_window(now, None, datetime.time(15, 0))
+        self.assertIn("no_entries_after", str(cm.exception))
+        with self.assertRaises(scan.ScanError) as cm:
+            scan.intraday_window(scan.parse_now("2026-10-19 10:00"), None, datetime.time(15, 0))
+        self.assertIn("10:15 AM", str(cm.exception))
+        with self.assertRaises(scan.ScanError):
+            scan.intraday_window(scan.parse_now("2026-10-20 11:00"), None, datetime.time(15, 0))   # Dussehra
+        day, cutoff = scan.intraday_window(scan.parse_now("2026-10-19 11:00"), None, datetime.time(15, 0))
+        self.assertEqual((day, cutoff), (I_DAY, DT(2026, 10, 19, 11, 0)))
+
+    def test_scan_counts_and_unconfirmed_cap(self):
+        stage1 = {"DBPOS": bars_series("2026-10-19", I_DB, [c + 0.5 for c in I_DB], [c - 0.5 for c in I_DB]),
+                  "FLPOS": bars_series("2026-10-19", I_FL, [c + 0.5 for c in I_FL], [c - 0.5 for c in I_FL]),
+                  "SHORT": bars_series("2026-10-19", I_FL[:5])}
+        cut = DT(2026, 10, 19, 10, 45)
+        hits, counts, failed = scan.scan_intraday_patterns(stage1, ["DBPOS", "FLPOS", "SHORT", "GONE"], I_DAY, cut)
+        self.assertEqual([h["symbol"] for h in hits], ["DBPOS", "FLPOS"])
+        self.assertEqual((counts["fetched"], counts["unusable"], counts["scanned"], counts["hits"]), (3, 1, 2, 2))
+        seen = []
+
+        def confirm(sym):
+            seen.append(sym)
+            return stage1[sym]
+        hits, counts, _ = scan.scan_intraday_patterns(stage1, ["DBPOS", "FLPOS"], I_DAY, cut, confirm=confirm,
+                                                      max_confirm=1)
+        self.assertEqual((seen, counts["unconfirmed"], counts["confirmed"]), (["FLPOS"], 1, 1))   # 106.5 x volume > 103 x volume
+        self.assertEqual([h["symbol"] for h in hits], ["FLPOS"])
+        _, _, failed = scan.scan_intraday_patterns(stage1, ["DBPOS"], I_DAY, cut, confirm=lambda s: {"t": [], "c": []})
+        self.assertIn("DBPOS", failed)
+
+    def test_the_orb_return_shape_is_unchanged(self):
+        stage1 = {"DBPOS": bars_series("2026-10-19", I_DB, [c + 0.5 for c in I_DB], [c - 0.5 for c in I_DB])}
+        res = scan.scan_orb(stage1, ["DBPOS"], I_DAY, DT(2026, 10, 19, 10, 45), 15)
+        self.assertEqual(len(res), 3)
+        self.assertEqual(sorted(res[1]), ["candidates", "confirmed", "fetched", "hits", "illiquid", "requested",
+                                          "scanned", "unconfirmed", "unusable"])
+
+
+class IntradayPatternsCli(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        os.chdir(self.d)
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def test_offline_replay_writes_the_watchlist(self):
+        code, text, _ = run(["patterns", "--intraday", "--offline", IPAT, "--at", "10:45"])
+        self.assertEqual(code, 0)
+        self.assertIn("1 intraday double bottom, 1 intraday flag", text)
+        self.assertIn("Wrote trader/watchlist.json (mode patterns-intraday, 2 hits)", text)
+        with open(os.path.join("trader", "watchlist.json"), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        self.assertEqual(doc["mode"], "patterns-intraday")
+        self.assertEqual(doc["as_of"], "2026-10-19 10:45 IST")
+        by = {h["symbol"]: h for h in doc["hits"]}
+        self.assertEqual(sorted(by), ["DBPOS", "FLPOS"])          # the three negatives are absent
+        for h in by.values():
+            for k in ("level", "stop", "target", "pattern", "state", "symbol", "setups"):
+                self.assertIn(k, h)
+        self.assertEqual((by["DBPOS"]["level"], by["FLPOS"]["level"]), (104.55, 108.55))
+        self.assertEqual(scan.symbols_from_file(os.path.join("trader", "watchlist.json")), ["DBPOS", "FLPOS"])
+
+    def test_json_pattern_and_state_options(self):
+        code, text, _ = run(["patterns", "--intraday", "--offline", IPAT, "--at", "10:45", "--json", "--no-write",
+                             "--pattern", "flag"])
+        doc = json.loads(text)
+        self.assertEqual([h["symbol"] for h in doc["hits"]], ["FLPOS"])
+        self.assertEqual(doc["pattern"], "flag")
+        code, text, _ = run(["patterns", "--intraday", "--offline", IPAT, "--at", "10:45", "--no-write",
+                             "--state", "breakout"])
+        self.assertEqual(code, 1)
+        self.assertIn("Nothing matched.", text)
+
+    def test_hits_only_before_the_cutoff(self):
+        code, _, err = run(["patterns", "--intraday", "--offline", IPAT, "--at", "15:10", "--no-write"])
+        self.assertEqual(code, 1)
+        self.assertIn("no_entries_after", err)
+        code, text, _ = run(["patterns", "--intraday", "--offline", IPAT, "--at", "10:45", "--until", "10:30",
+                             "--no-write"])
+        self.assertEqual(code, 1)
+        code, _, err = run(["patterns", "--intraday", "--offline", IPAT, "--no-write"])
+        self.assertEqual(code, 1)
+        self.assertIn("--at", err)
+
+    def test_daily_only_patterns_are_refused(self):
+        code, _, err = run(["patterns", "--intraday", "--offline", IPAT, "--at", "10:45", "--pattern", "vcp"])
+        self.assertEqual(code, 1)
+        self.assertIn("double_bottom and flag only", err)
+
+    def test_daily_patterns_keep_their_defaults(self):
+        code, _, err = run(["patterns", "--symbols", "NOPE", "--no-write"])
+        self.assertIn("no daily cache", err)
+
+
 CAL = os.path.join(SDIR, "calendar-2027.json")
 
 
