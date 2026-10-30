@@ -367,6 +367,7 @@ class Fetcher(object):
         self.pause = pause
         self._last = 0.0
         self._nse = None
+        self._home_refused = False   # NSE refused its home page once this run: do not ask again
 
     def get(self, url, name):
         if self.offline:
@@ -418,13 +419,22 @@ class Fetcher(object):
         if gap < self.pause:
             time.sleep(self.pause - gap)
         headers = {"User-Agent": BROWSER_UA, "Accept": "application/json, text/plain, */*",
-                   "Accept-Language": "en-IN,en;q=0.9", "Referer": NSE_QUOTE % urllib.parse.quote(ticker)}
+                   "Accept-Language": "en-IN,en;q=0.9", "Referer": NSE_QUOTE % urllib.parse.quote(ticker),
+                   "X-Requested-With": "XMLHttpRequest"}
         try:
             if self._nse is None:
                 self._nse = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-                self._nse.open(urllib.request.Request(NSE_HOME, headers=dict(headers, Accept="text/html")),
-                               timeout=30).read()
-                time.sleep(self.pause)
+                if not self._home_refused:
+                    # the home page sets the cookies, but from some networks NSE refuses it while the API
+                    # still answers (seen live): a refused home page is not the end, the API call goes ahead
+                    try:
+                        self._nse.open(urllib.request.Request(NSE_HOME, headers=dict(headers, Accept="text/html")),
+                                       timeout=30).read()
+                    except urllib.error.HTTPError as exc:
+                        if exc.code not in (401, 403):
+                            raise
+                        self._home_refused = True
+                    time.sleep(self.pause)
             self._last = time.time()
             with self._nse.open(urllib.request.Request(url, headers=headers), timeout=30) as resp:
                 data = resp.read()

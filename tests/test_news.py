@@ -312,6 +312,8 @@ class FakeOpener(object):
     """Stands in for the cookie-primed opener: the home page answers, then the API answers
     with the scripted replies (bytes, or an HTTP status code to raise)."""
 
+    home = 200   # what the home page answers
+
     def __init__(self, replies, log):
         self.replies, self.log = replies, log
 
@@ -319,6 +321,8 @@ class FakeOpener(object):
         url = req.full_url
         self.log.append(url)
         if url == news.NSE_HOME:
+            if self.home != 200:
+                raise news.urllib.error.HTTPError(url, self.home, "refused", {}, None)
             return FakeResponse(b"<html>home</html>")
         reply = self.replies.pop(0)
         if isinstance(reply, int):
@@ -336,6 +340,16 @@ class NseSession(unittest.TestCase):
 
     def tearDown(self):
         news.urllib.request.build_opener = self.saved
+        FakeOpener.home = 200
+
+    def test_a_refused_home_page_does_not_stop_an_answering_api(self):
+        # live NSE refuses the home page from some networks while its JSON endpoints still answer
+        FakeOpener.home = 403
+        self.scripts = [[b'{"data": [1]}', b'{"data": [2]}']]
+        f = news.Fetcher(pause=0)
+        self.assertEqual(f.nse_json("https://www.nseindia.com/api/x", "x.json", "RELIANCE"), b'{"data": [1]}')
+        self.assertEqual(f.nse_json("https://www.nseindia.com/api/y", "y.json", "RELIANCE"), b'{"data": [2]}')
+        self.assertEqual(self.log.count(news.NSE_HOME), 1)     # asked once, not before every call
 
     def test_403_then_a_fresh_session_works(self):
         self.scripts = [[403], [b'{"data": []}']]
