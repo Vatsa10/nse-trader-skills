@@ -438,6 +438,11 @@ def fmt(x):
     return s if s not in ("", "-0") else "0"
 
 
+def show_path(path):
+    """A path as printed to the user: forward slashes on every OS (file operations keep the native form)."""
+    return str(path).replace("\\", "/")
+
+
 def norm_symbol(sym):
     s = str(sym or "").strip().upper()
     for suf in (".NS", "-EQ"):
@@ -561,7 +566,7 @@ def read_daily(path):
                 rows.append(bar(r["date"], float(r["open"]), float(r["high"]), float(r["low"]),
                                 float(r["close"]), num(r.get("volume")) or 0))
             except (KeyError, TypeError, ValueError):
-                raise DataError("%s has a bad row: %r" % (path, r))
+                raise DataError("%s has a bad row: %r" % (show_path(path), r))
     return rows
 
 
@@ -578,7 +583,7 @@ def write_daily(path, rows):
     rows = sorted(rows, key=lambda r: r["date"])
     errors, warnings = validate_daily(rows)
     if errors:
-        raise DataError("refusing to write %s: %s" % (path, "; ".join(errors[:5])))
+        raise DataError("refusing to write %s: %s" % (show_path(path), "; ".join(errors[:5])))
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\n")
     w.writerow(HEADER)
@@ -681,7 +686,7 @@ def write_intraday(path, sym, new_bars, meta=None, source="", keep_sessions=60):
     bars = [b for b in bars if ts_to_ist(b[0]).date() in keep]
     errors, warnings = validate_intraday(bars)
     if errors:
-        raise DataError("refusing to write %s: %s" % (path, "; ".join(errors[:5])))
+        raise DataError("refusing to write %s: %s" % (show_path(path), "; ".join(errors[:5])))
     m = dict(old_meta)
     m.update(meta or {})
     _write_json(path, build_chart(sym, bars, m, source))
@@ -1631,7 +1636,7 @@ def fill_delivery(data_dir, bhav, syms, today):
     done = store_delivery(data_dir, bhav, names)
     if done:
         lines.append("delivery: %d row(s) written for %d symbol(s) in %s" % (
-            sum(done.values()), len(done), delivery_dir(data_dir)))
+            sum(done.values()), len(done), show_path(delivery_dir(data_dir))))
     keep = set()
     for d in sorted(pend):
         if d in bhav.full:
@@ -1864,7 +1869,7 @@ def cmd_bands(a):
     if unknown:
         print("Unknown bands stay unknown. Kite MCP get_quotes gives lower_circuit_limit / upper_circuit_limit: "
               "save it and run import-kite --kind quotes.")
-    print("Wrote %s (%d known)." % (os.path.join(a.data, "bands.json"), len(doc["bands"])))
+    print("Wrote %s (%d known)." % (show_path(os.path.join(a.data, "bands.json")), len(doc["bands"])))
     return 0 if not unknown else 1
 
 
@@ -1898,7 +1903,7 @@ def import_kite_historical(a, doc):
     sym = norm_symbol(a.symbol)
     cs = kite_candles(doc)
     if not cs:
-        raise DataError("no candles in %s" % a.file)
+        raise DataError("no candles in %s" % show_path(a.file))
     daily = all(c[0].time() == datetime.time(0, 0) for c in cs)
     raw_p, adj_p, intra_p = data_paths(a.data, sym)
     if daily:
@@ -1911,8 +1916,8 @@ def import_kite_historical(a, doc):
                                          "file": os.path.basename(target)})
         if a.adjusted:
             note_meta(a.data, "adjusted", sym, {"source": "kite-mcp", "fetched_at": stamp()})
-        print("%s: %d daily bar(s) from Kite into %s (%s to %s)." % (sym, len(rows), target, rows[0]["date"],
-                                                                     rows[-1]["date"]))
+        print("%s: %d daily bar(s) from Kite into %s (%s to %s)." % (sym, len(rows), show_path(target),
+                                                                     rows[0]["date"], rows[-1]["date"]))
     else:
         steps = sorted(set(int((b[0] - x[0]).total_seconds()) for x, b in zip(cs, cs[1:])
                            if b[0].date() == x[0].date()))
@@ -1925,7 +1930,7 @@ def import_kite_historical(a, doc):
         note_meta(a.data, "intraday", sym, {"source": "kite-mcp", "fetched_at": stamp(), "bars": len(allbars),
                                             "sessions": len(sessions), "last": sessions[-1].isoformat()})
         bad = []
-        print("%s: %d 5m bar(s) from Kite (%d-second candles) into %s." % (sym, len(bars), step, intra_p))
+        print("%s: %d 5m bar(s) from Kite (%d-second candles) into %s." % (sym, len(bars), step, show_path(intra_p)))
     for b in bad:
         print("  dropped bad bar " + b)
     for w in warns:
@@ -1982,7 +1987,7 @@ def import_kite_quotes(a, doc, kind):
             print("%s: band %s, lower %s, upper %s -> bands.json" % (
                 sym, "?" if e["band_pct"] is None else "%s%%" % e["band_pct"], fmt(e["lower"]), fmt(e["upper"])))
     if not entries and not wrote:
-        raise DataError("nothing usable in %s" % a.file)
+        raise DataError("nothing usable in %s" % show_path(a.file))
     return 0
 
 
@@ -1991,7 +1996,7 @@ def cmd_import_kite(a):
         try:
             doc = json.load(fh)
         except ValueError:
-            raise DataError("%s is not JSON (save the tool output as-is)" % a.file)
+            raise DataError("%s is not JSON (save the tool output as-is)" % show_path(a.file))
     if a.kind == "historical":
         return import_kite_historical(a, doc)
     return import_kite_quotes(a, doc, a.kind)
@@ -2066,7 +2071,7 @@ def cmd_import_csv(a):
     with open(a.file, encoding="utf-8-sig", newline="") as fh:
         rows, notes = parse_ohlc_csv(fh.read(), sym)
     if not rows:
-        raise DataError("no bars in %s" % a.file)
+        raise DataError("no bars in %s" % show_path(a.file))
     good, bad = split_valid(rows)
     if bad and not a.drop_bad:
         raise DataError("%d bar(s) fail OHLC checks, e.g. %s; fix the file or pass --drop-bad" % (len(bad), bad[0]))
@@ -2080,7 +2085,7 @@ def cmd_import_csv(a):
     if a.adjusted:
         note_meta(a.data, "adjusted", sym, {"source": "import-csv:" + os.path.basename(a.file), "fetched_at": stamp()})
     print("%s: imported %d bar(s) (%s to %s) into %s; %d cached." % (
-        sym, len(good), good[0]["date"], good[-1]["date"], target, len(merged)))
+        sym, len(good), good[0]["date"], good[-1]["date"], show_path(target), len(merged)))
     for n in notes + ["dropped bad bar " + b for b in bad]:
         print("  note: " + n)
     for w in warns:
@@ -2294,7 +2299,7 @@ def cmd_calendar(a):
         bits.append("holiday list %s" % ", ".join(str(y) for y in sorted(master[2])))
     if circ:
         bits.append("circulars %s to %s" % (checked_from, today))
-    print("Wrote %s (%s)." % (path, "; ".join(bits)))
+    print("Wrote %s (%s)." % (show_path(path), "; ".join(bits)))
     changes = calendar_changes(old, new)
     for line in changes[:40]:
         print(line)
@@ -2545,7 +2550,7 @@ def cmd_actions(a):
                     x["ex_date"], x["subject"][:90]))
         if cached and adjusting:
             print("  next: data.py adjust %s" % sym)
-    print("Actions file: %s." % actions_path(a.data))
+    print("Actions file: %s." % show_path(actions_path(a.data)))
     return rc
 
 
@@ -2946,7 +2951,7 @@ def cmd_index(a):
             after = write_index(a.data, name, got[slug])
             print("%s: +%d row(s), %d cached (%s to %s) -> %s" % (
                 name, len(after) - before, len(after), after[0]["date"], after[-1]["date"],
-                index_path(a.data, slug)))
+                show_path(index_path(a.data, slug))))
         elif not days and not a.years:
             print("%s: up to date." % name)
     for n in notes:
@@ -3152,16 +3157,11 @@ def cmd_chain(a):
     if vix:
         print("  " + vix)
     print("PCR is a sentiment hint, never a signal; OI walls and max pain are levels where positions sit, not "
-          "guarantees. Wrote %s." % path)
+          "guarantees. Wrote %s." % show_path(path))
     return 0
 
 
 # ---------------------------------------------------------------- FII / DII flows
-
-def show_path(path):
-    """A path as printed to the user: forward slashes on every OS (file operations keep the native form)."""
-    return str(path).replace("\\", "/")
-
 
 def flows_path(data_dir):
     return os.path.join(data_dir, FLOWS_FILE)
@@ -3512,7 +3512,7 @@ def cmd_doctor(a):
     doc = {"checked_at": stamp(), "price_sources_ok": price_ok, "sources": results}
     _write_json(os.path.join(a.data, "sources.json"), doc)
     if price_ok:
-        print("Price data OK via: %s. Wrote %s." % (", ".join(price_ok), os.path.join(a.data, "sources.json")))
+        print("Price data OK via: %s. Wrote %s." % (", ".join(price_ok), show_path(os.path.join(a.data, "sources.json"))))
         return 0
     print("No free price source works from this machine. Use the Kite MCP connector (get_historical_data, "
           "get_quotes) + import-kite, or download CSVs and import-csv.")
@@ -3572,7 +3572,7 @@ def cmd_record(a):
     prov["source"] = sorted(set(str(v.get("source")) for v in prov["files"].values() if v.get("source")))
     prov["problems"] = errors
     _write_json(os.path.join(out, "provenance.json"), prov)
-    print("Recorded %s into %s: %s." % (sym, out, ", ".join(sorted(prov["files"]))))
+    print("Recorded %s into %s: %s." % (sym, show_path(out), ", ".join(sorted(prov["files"]))))
     for e in errors:
         print("  " + e)
     return 0
@@ -3587,7 +3587,7 @@ def cmd_status(a):
     files = sorted(f for f in (os.listdir(dd) if os.path.isdir(dd) else []) if f.endswith(".csv"))
     print("Last complete NSE session: %s" % end)
     if not files:
-        print("No daily cache in %s. Run: data.py daily RELIANCE" % dd)
+        print("No daily cache in %s. Run: data.py daily RELIANCE" % show_path(dd))
     for f in files:
         rows = read_daily(os.path.join(dd, f))
         if not rows:
@@ -3752,10 +3752,10 @@ def main(argv=None):
                 "flows": cmd_flows, "preopen": cmd_preopen, "doctor": cmd_doctor, "record": cmd_record,
                 "status": cmd_status}[a.cmd](a)
     except DataError as e:
-        print("data.py: %s" % e, file=sys.stderr)
+        print("data.py: %s" % show_path(e), file=sys.stderr)
         return 1
     except OSError as e:
-        print("data.py: %s" % e, file=sys.stderr)
+        print("data.py: %s" % show_path(e), file=sys.stderr)
         return 1
     finally:
         _CAL = saved

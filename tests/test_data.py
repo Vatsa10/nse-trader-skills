@@ -2457,6 +2457,60 @@ class PreopenCommand(Net):
         self.assertIn("no pre-open rows", s["nse-preopen"]["error"])
 
 
+# ---------------------------------------------------------------- printed paths
+
+class PrintedPaths(Net):
+    """Every path shown to the user uses forward slashes, whatever the OS."""
+
+    def setUp(self):
+        Net.setUp(self)
+        self.dd = os.path.join(self.tmp, "sub\\data")        # a backslash in the folder name: it must not reach the screen
+
+    def clean(self, *argv, **kw):
+        code, out, err = self.run_d(*argv)
+        self.assertNotIn("\\", out + err, argv)
+        if kw.get("shows"):
+            self.assertIn(kw["shows"], out + err, argv)
+        return code, out, err
+
+    def test_helper(self):
+        self.assertEqual(data.show_path("trader/data\\calendar.json"), "trader/data/calendar.json")
+        self.assertEqual(data.show_path("C:\\a\\b.csv"), "C:/a/b.csv")
+        self.assertEqual(data.show_path(ValueError("[WinError 2] 'x\\y'")), "[WinError 2] 'x/y'")
+
+    def test_representative_commands(self):
+        self.clean("status", "--now", "2026-10-23 19:00", shows="No daily cache in ")
+        self.net([("api/fiidiiTradeReact", 200, fx("nse-fiidii-live.json")), ("www.nseindia.com/", 200, b"home")])
+        self.clean("flows", shows="flows.csv")
+        self.net([("api/market-data-pre-open", 200, fx("nse-preopen-NIFTY50-live.json")),
+                  ("www.nseindia.com/", 200, b"home")])
+        self.clean("preopen", shows="preopen.json")
+        self.net([("api/holiday-master", 200, fx("nse-holiday-master.json")),
+                  ("api/circulars", 200, fx("nse-circulars-cmtr.json")), ("www.nseindia.com/", 200, b"home")])
+        self.clean("calendar", "--now", "2027-03-08 10:00", shows="calendar.json")
+        self.net([("ind_close_all", 200, fx("ind_close_all_23102026.csv")), ("www.nseindia.com/", 200, b"home")])
+        self.clean("index", "--days", "1", "--now", "2026-10-23 19:00", shows="nifty-50.csv")
+        self.net([("quote-equity", 200, fx("nse-quote-RELIANCE.json")), ("www.nseindia.com/", 200, b"home")])
+        self.clean("bands", "RELIANCE", "--now", "2026-10-23 19:00", shows="bands.json")
+        self.clean("import-csv", os.path.join(DFIX, "nse-website-RELIANCE.csv"), "--symbol", "RELIANCE", shows="into ")
+        self.clean("record", "RELIANCE", "--no-fetch", "--out", os.path.join(self.tmp, "re\\al"), shows="Recorded")
+        self.net([("query1", 200, fx("yahoo-daily-RELIANCE.json")), ("", 403, b"")])
+        self.clean("doctor", "--now", "2026-10-23 19:00", shows="sources.json")
+
+    def test_errors_and_help(self):
+        code, out, err = self.clean("import-csv", os.path.join(self.tmp, "no\\such.csv"), "--symbol", "RELIANCE")
+        self.assertEqual(code, 1)
+        self.assertIn("such.csv", err)
+        code, out, err = self.clean("record", "ZZZZ", "--no-fetch", "--out", os.path.join(self.tmp, "r\\x"))
+        self.assertEqual(code, 1)
+        for cmd in ("daily", "index", "flows"):
+            with self.assertRaises(SystemExit):
+                with redirect_stdout(io.StringIO()) as buf:
+                    data.main([cmd, "--help"])
+            self.assertNotIn("\\", buf.getvalue())
+            self.assertIn("(default trader/data)", buf.getvalue())
+
+
 # ---------------------------------------------------------------- report readiness
 
 class Readiness(Net):

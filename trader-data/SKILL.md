@@ -76,7 +76,9 @@ python3 "${CLAUDE_SKILL_DIR}/data.py" record RELIANCE --date 2026-10-23   # real
 ```
 
 Every command takes `--data DIR` (default `trader/data`) and `--now
-"YYYY-MM-DD HH:MM"` (IST) to pin the clock.
+"YYYY-MM-DD HH:MM"` (IST) to pin the clock. Every path the script prints
+("Wrote trader/data/calendar.json", errors, notes) uses forward slashes on
+every OS, so output reads the same on Windows, macOS and Linux.
 
 ## What it writes
 
