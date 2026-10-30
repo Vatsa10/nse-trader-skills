@@ -31,6 +31,8 @@ def frontmatter(path):
 def every_text_file():
     for base, dirs, files in os.walk(ROOT):
         dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", ".claude")]
+        if os.path.abspath(base) == os.path.join(ROOT, "reference"):
+            dirs[:] = [d for d in dirs if d == "specs"]   # the rest is the studied GPL repos, gitignored
         for f in files:
             if f.endswith((".md", ".py", ".json", ".csv", ".txt", ".xml")) or f == "LICENSE":
                 yield os.path.join(base, f)
@@ -45,7 +47,14 @@ class Repo(unittest.TestCase):
     def test_root_matches_the_reel(self):
         # .claude/ is a user's local Claude Code folder (gitignored), not part of the pack
         root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git") and d != ".claude")
-        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "tests"] + SKILLS))
+        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "reference", "tests"] + SKILLS))
+
+    def test_no_gpl_reference_code_is_tracked(self):
+        # reference/ holds the GPL repos the clean-room specs were written from; only reference/specs ships
+        with open(os.path.join(ROOT, ".gitignore"), encoding="utf-8") as fh:
+            ignore = fh.read().split()
+        self.assertIn("reference/*", ignore)
+        self.assertIn("!reference/specs/", ignore)
 
     def test_frontmatter_name_and_description(self):
         for s in SKILLS:

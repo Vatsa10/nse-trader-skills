@@ -1,2 +1,6 @@
 tests/fixtures/real/
 __pycache__/
+# reference/: the GPL-3.0 repos studied for clean-room specs (eod2, NseIndiaApi, SwingTrend,
+# stock-pattern) and eod2_data (no licence). Local only, never committed. Our own specs are kept.
+reference/*
+!reference/specs/
