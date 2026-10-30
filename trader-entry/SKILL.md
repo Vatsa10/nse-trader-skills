@@ -93,8 +93,8 @@ then re-run with `--cache`.
   as closed.
 - **What it says.** Waiting (and how far the last close is from the level),
   triggered, expired, or no data. Before 9:15: not open yet. Before 9:30: the
-  range is still forming. Weekends and NSE holidays (the built-in 2026 list
-  plus `trader/data/calendar.json`, which `python3 trader-data/data.py
+  range is still forming. Weekends and NSE holidays (the built-in 2024 to 2026
+  lists plus `trader/data/calendar.json`, which `python3 trader-data/data.py
   calendar` writes; a year in neither gets a "check nseindia.com" warning):
   the market is closed. A normal-hours special session on a weekend counts as
   open.

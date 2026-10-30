@@ -626,7 +626,7 @@ class CalendarFile(unittest.TestCase):
         self.assertIn("NSE holiday: Republic Day", self.warnings(t, "2026-10-13", 105))      # 2027-01-26
         w = self.warnings(t, "2026-10-14", 105)                                              # 2027-01-27
         self.assertFalse(any("holiday" in x or "covers" in x for x in w), w)
-        self.assertIn(2027, t.HOLIDAY_YEARS)
+        self.assertIn(2027, t.CALENDAR_YEARS)
         self.assertNotIn("2027-01-26", tm.NSE_HOLIDAYS)                  # the module loaded at import is untouched
 
     def test_muhurat_is_not_a_regular_session(self):
@@ -639,23 +639,24 @@ class CalendarFile(unittest.TestCase):
     def test_a_special_session_is_not_a_holiday(self):
         t = self.fresh(dict(CAL_2027, holidays={"2027-01-26": "Republic Day"},
                             special_sessions={"2027-01-26": "Budget session"}))
-        self.assertEqual(t.SPECIAL_SESSIONS, {"2026-02-01": "Union Budget (Sunday)", "2027-01-26": "Budget session"})
+        self.assertEqual(t.SPECIAL_SESSIONS["2027-01-26"], "Budget session")
+        self.assertEqual(t.SPECIAL_SESSIONS["2026-02-01"], "Union Budget (Sunday)")
         w = self.warnings(t, "2026-10-13", 105)                                              # 2027-01-26
         self.assertFalse(any("holiday" in x for x in w), w)
 
     def test_builtin_2026_still_holds_and_other_years_still_warn(self):
         t = self.fresh(CAL_2027)
         self.assertIn("NSE holiday: Dussehra", self.warnings(t, "2026-10-13", 7))            # 2026-10-20
-        self.assertIn("holiday list covers 2026, 2027 only: check nseindia.com",
+        self.assertIn("holiday list covers 2024, 2025, 2026, 2027 only: check nseindia.com",
                       self.warnings(t, "2026-10-16", 448))                                   # 2028-01-07
 
     def test_missing_or_corrupt_file_falls_back_to_the_builtin_table(self):
-        self.assertEqual(load("trader-timemachine", "timemachine").HOLIDAY_YEARS, (2026,))  # no file at all
+        self.assertEqual(load("trader-timemachine", "timemachine").CALENDAR_YEARS, (2024, 2025, 2026))  # no file at all
         for bad in ("{not json", "[1, 2]", "", '{"years": "x", "holidays": []}'):
             t = self.fresh(bad)
-            self.assertEqual(t.HOLIDAY_YEARS, (2026,), bad)
+            self.assertEqual(t.CALENDAR_YEARS, (2024, 2025, 2026), bad)
             w = self.warnings(t, "2026-10-13", 105)                                          # 2027-01-26
-            self.assertIn("holiday list covers 2026 only: check nseindia.com", w, bad)
+            self.assertIn("holiday list covers 2024, 2025, 2026 only: check nseindia.com", w, bad)
             self.assertFalse(any("Republic Day" in x for x in w), bad)
 
 

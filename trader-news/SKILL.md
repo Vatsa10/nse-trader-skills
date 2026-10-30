@@ -50,7 +50,7 @@ python3 "${CLAUDE_SKILL_DIR}/news.py" --no-calendar           # skip the results
 | NSE corporate announcements | when both headline feeds fail for a symbol (or with `--nse`): a cookie-primed session, `https://www.nseindia.com/` first, then `https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=RELIANCE`. Results, board meetings, outcomes: the primary source |
 | NSE bulk, block and short-selling deals | `https://www.nseindia.com/api/historicalOR/bulk-block-short-deals?optionType=bulk_deals&from=DD-MM-YYYY&to=DD-MM-YYYY` (also `block_deals`, `short_selling`): three requests per run for the whole `--deal-days` window, not one per symbol, then filtered to your symbols. Same cookie-primed NSE session as the announcements |
 | NSE board meetings | `https://www.nseindia.com/api/corporate-board-meetings?index=equities&symbol=RELIANCE` (forthcoming meetings), one request per symbol on the same NSE session. A purpose containing "financial results" is a results date, "dividend" a dividend board date |
-| `trader/data/calendar.json` | optional, from trader-data: `{"years": [..], "holidays": {"YYYY-MM-DD": name}, "special_sessions": {..}}`. Used to count sessions to a results date; without it only weekends are skipped (a weekday holiday then makes a date look one session farther away than it is). A calendar that does not list this year is ignored, with a note |
+| `trader/data/calendar.json` | optional, from trader-data: `{"years": [..], "holidays": {"YYYY-MM-DD": name}, "special_sessions": {..}}`. Laid over the built-in 2024 to 2026 holiday tables to count sessions to a results date; without it the built-in tables alone are used, and a year neither covers counts weekends only, with a note |
 | `trader/data/daily/<SYMBOL>.adj.csv` (else `.csv`) | `date,open,high,low,close,volume`: the 20-day average volume a deal is measured against |
 | `trader/data/intraday/<SYMBOL>-5m.json`, `trader/data/daily/<SYMBOL>.csv` | the trader-data cache: the move when Yahoo's chart fails (or with `--cache`), with "using cached data from <time>" |
 | `trader/state/news.json` | what has been shown (kept 30 days) |
@@ -99,7 +99,7 @@ coming up     RELIANCE    results 2026-10-19 (Mon), 3 sessions away
 
 **RESULTS SOON** means a results date 0, 1 or 2 NSE sessions away (0 is
 today: results often land after the close and the gap is the next morning).
-Sessions skip weekends and the holidays in `trader/data/calendar.json`. Other
+Sessions skip weekends and NSE holidays (built-in 2024 to 2026, plus `trader/data/calendar.json`). Other
 results and dividend dates within 30 days print as `coming up`; meetings on
 other business (fund raising, say) are left out. `--json` has `results_soon`
 (the symbols) and `calendar` (every date, with `sessions_away`).

@@ -97,20 +97,20 @@ NSE symbols (RELIANCE, M&M, BAJAJ-AUTO); a typed `.NS` is stripped.
 
 Normal market 09:15 to 15:30 IST (UTC+05:30, no daylight saving). Pre-open
 09:00-09:08 is order collection only and is not treated as open. No early
-closes. Closed on weekends and these 2026 NSE equity holidays (built in):
-
-Jan 26 Republic Day, Mar 3 Holi, Mar 26 Shri Ram Navami, Mar 31 Shri Mahavir
-Jayanti, Apr 3 Good Friday, Apr 14 Ambedkar Jayanti, May 1 Maharashtra Day,
-May 28 Bakri Id, Jun 26 Muharram, Sep 14 Ganesh Chaturthi, Oct 2 Gandhi
-Jayanti, Oct 20 Dussehra, Nov 10 Diwali Balipratipada, Nov 24 Guru Nanak
-Jayanti, Dec 25 Christmas.
+closes. Closed on weekends and on the NSE equity holidays for 2024, 2025 and
+2026 (built in; the same calendar block sits in every script that needs it).
+2026: Jan 15 Maharashtra municipal elections, Jan 26 Republic Day, Mar 3 Holi,
+Mar 26 Shri Ram Navami, Mar 31 Shri Mahavir Jayanti, Apr 3 Good Friday,
+Apr 14 Ambedkar Jayanti, May 1 Maharashtra Day, May 28 Bakri Id, Jun 26
+Muharram, Sep 14 Ganesh Chaturthi, Oct 2 Gandhi Jayanti, Oct 20 Dussehra,
+Nov 10 Diwali Balipratipada, Nov 24 Guru Nanak Jayanti, Dec 25 Christmas.
 
 Other years come from `trader/data/calendar.json`, which trader-data keeps
 current (`python3 trader-data/data.py calendar`). When the file exists its
-holidays and special sessions are merged over the built-in table, and a year
+holidays and special sessions are merged over the built-in tables, and a year
 it lists is treated as fully known. A missing or unreadable file means the
-built-in table only, never an error. For a year with no calendar the clock
-says "holiday list covers 2026 only: check nseindia.com, or run python3
+built-in tables only, never an error. For a year with no calendar the clock
+says "holiday list covers 2024, 2025, 2026 only: check nseindia.com, or run python3
 trader-data/data.py calendar".
 
 Special sessions are not the same as closures. A session on a weekend or

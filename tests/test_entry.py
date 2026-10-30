@@ -374,14 +374,14 @@ class CalendarFile(unittest.TestCase):
         self.assertFalse(ok)
         r = self.run_on(e, "2028-01-03")
         self.assertFalse(r["calendar_known"])
-        self.assertIn("covers 2026, 2027 only", "\n".join(e.describe(r)))
+        self.assertIn("covers 2024, 2025, 2026, 2027 only", "\n".join(e.describe(r)))
 
     def test_missing_or_corrupt_file_falls_back_to_the_builtin_table(self):
         e = load("trader-entry", "entry")                                    # no file at all
-        self.assertEqual(e.CALENDAR_YEARS, (2026,))
+        self.assertEqual(e.CALENDAR_YEARS, (2024, 2025, 2026))
         for bad in ("{not json", "[1, 2]", "", '{"years": "x", "holidays": []}'):
             e = self.fresh(bad)
-            self.assertEqual(e.CALENDAR_YEARS, (2026,), bad)
+            self.assertEqual(e.CALENDAR_YEARS, (2024, 2025, 2026), bad)
             self.assertEqual(e.trading_day(datetime.date(2027, 1, 26)), (True, ""), bad)
             self.assertFalse(self.run_on(e, "2027-01-26")["calendar_known"], bad)
             self.assertIn("NSE holiday: Dussehra", e.trading_day(datetime.date(2026, 10, 20))[1], bad)
