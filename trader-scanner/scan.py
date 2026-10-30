@@ -258,6 +258,12 @@ class ScanError(Exception):
     pass
 
 
+def fwd(path):
+    """A path as the user reads it: forward slashes on every OS (trader\\data\\breadth.csv -> trader/data/breadth.csv).
+    Used at every print site; the file operations keep the native form."""
+    return str(path).replace("\\", "/")
+
+
 # ---------------------------------------------------------------- time
 
 def ist_offset(utc=None):
@@ -657,7 +663,7 @@ def load_offline(path):
     if os.path.isdir(path):
         names = sorted(f for f in os.listdir(path) if f.endswith((".json", ".json.gz")))
         if not names:
-            raise ScanError("no .json files in %s" % path)
+            raise ScanError("no .json files in %s" % fwd(path))
         for f in names:
             try:
                 doc = json.loads(_read_maybe_gz(os.path.join(path, f)))
@@ -671,10 +677,10 @@ def load_offline(path):
         try:
             doc = json.loads(_read_maybe_gz(path))
         except ValueError as e:
-            raise ScanError("%s is not valid JSON: %s" % (path, e))
+            raise ScanError("%s is not valid JSON: %s" % (fwd(path), e))
         _absorb(doc, "", data, errors)
     else:
-        raise ScanError("no offline file or folder at %s" % path)
+        raise ScanError("no offline file or folder at %s" % fwd(path))
     return data, errors
 
 
@@ -1738,9 +1744,9 @@ def read_symbols(a, offline_syms=None):
         if os.path.exists(path):
             syms = symbols_from_file(path)
         elif a.universe:
-            raise ScanError("no %s: run `scan.py universe --out %s` first, or pass --symbols" % (path, path))
+            raise ScanError("no %s: run `scan.py universe --out %s` first, or pass --symbols" % (fwd(path), fwd(path)))
         else:
-            text, fb = fallback_list("no %s yet" % path)
+            text, fb = fallback_list("no %s yet" % fwd(path))
             kept, _, _ = build_universe({NIFTY500_FILE: text})
             syms = [k for k, _ in kept]
             note_out(a, fb + " (run `scan.py universe` to save a list)")
@@ -1758,14 +1764,14 @@ def read_symbols(a, offline_syms=None):
 
 def symbols_from_file(path):
     if not os.path.exists(path):
-        raise ScanError("no file at %s" % path)
+        raise ScanError("no file at %s" % fwd(path))
     with open(path, encoding="utf-8") as fh:
         text = fh.read()
     if text.lstrip().startswith(("{", "[")):
         try:
             doc = json.loads(text)
         except ValueError as e:
-            raise ScanError("%s is not valid JSON: %s" % (path, e))
+            raise ScanError("%s is not valid JSON: %s" % (fwd(path), e))
         items = doc.get("hits", []) if isinstance(doc, dict) else doc
         return [clean_symbol(x.get("symbol") if isinstance(x, dict) else x) for x in items if x]
     out = []
@@ -1783,7 +1789,7 @@ def read_config(path):
         with open(path, encoding="utf-8") as fh:
             cfg = json.load(fh)
     except ValueError as e:
-        raise ScanError("%s is not valid JSON: %s" % (path, e))
+        raise ScanError("%s is not valid JSON: %s" % (fwd(path), e))
     return cfg if isinstance(cfg, dict) else {}
 
 
@@ -1874,15 +1880,15 @@ def load_daily_cache(symbols, data_dir=None):
     for sym in symbols:
         path = daily_cache_path(sym, data_dir)
         if not os.path.exists(path):
-            missing[sym] = "no daily cache at %s" % path
+            missing[sym] = "no daily cache at %s" % fwd(path)
             continue
         try:
             rows = read_daily_csv(path)
         except OSError as e:
-            missing[sym] = "could not read %s: %s" % (path, e)
+            missing[sym] = "could not read %s: %s" % (fwd(path), e)
             continue
         if not rows:
-            missing[sym] = "%s has no rows" % path
+            missing[sym] = "%s has no rows" % fwd(path)
             continue
         data[sym] = series_from_daily(rows)
         lasts.append(rows[-1][0])
@@ -1895,12 +1901,12 @@ def load_intraday_cache(symbols, data_dir=None):
     for sym in symbols:
         path = intraday_cache_path(sym, data_dir)
         if not os.path.exists(path):
-            missing[sym] = "no intraday cache at %s" % path
+            missing[sym] = "no intraday cache at %s" % fwd(path)
             continue
         try:
             series = parse_chart(_read_maybe_gz(path), sym)
         except (OSError, ScanError) as e:
-            missing[sym] = "%s: %s" % (path, e)
+            missing[sym] = "%s: %s" % (fwd(path), e)
             continue
         data[sym] = series
         ts = [t for t in series["t"] if t]
@@ -1964,9 +1970,9 @@ def fallback_list(why=None):
         with open(path, encoding="utf-8", errors="replace") as fh:
             text = fh.read()
         try:
-            return list_from_any(text, path), "%sused %s (trader-data)" % (lead, path.replace(os.sep, "/"))
+            return list_from_any(text, path), "%sused %s (trader-data)" % (lead, fwd(path))
         except ScanError as e:
-            lead += "%s: %s; " % (path, e)
+            lead += "%s: %s; " % (fwd(path), e)
     if os.path.exists(SNAPSHOT_FILE):
         with open(SNAPSHOT_FILE, encoding="utf-8", errors="replace") as fh:
             text = fh.read()
@@ -2079,7 +2085,7 @@ def read_benchmark(data_dir=None):
     if short:
         return short
     return {}, None, ("no benchmark (neither %s nor NIFTYBEES in %s): mansfield_rs is null and rs_positive is off"
-                      % (os.path.join(base, "index", "nifty-50.csv"), os.path.join(base, "daily")))
+                      % (fwd(os.path.join(base, "index", "nifty-50.csv")), fwd(os.path.join(base, "daily"))))
 
 
 # ---------------------------------------------------------------- market breadth
@@ -2465,7 +2471,7 @@ def cmd_universe(a):
             texts[fname], fb = fallback_list("%s failed (%s)" % (what, e))
             note = (note + " " if note else "") + fb + "."
     if not texts:
-        raise ScanError(("no %s in %s" % (" or ".join(wanted), a.offline)) if a.offline else "no symbol list")
+        raise ScanError(("no %s in %s" % (" or ".join(wanted), fwd(a.offline))) if a.offline else "no symbol list")
     if a.source == "equity" and EQUITY_FILE not in texts and not note:
         note = "no EQUITY_L.csv: fell back to the Nifty 500 list."
     kept, counts, used = build_universe(texts, a.source)
@@ -2482,7 +2488,7 @@ def cmd_universe(a):
         note = note.replace("--cache", "--cache (EQUITY_L.csv is not cached)")
     if a.json:
         print(json.dumps({"count": len(kept), "rows": counts.get("rows", 0), "source": used, "note": note or None,
-                          "dropped": dropped, "out": None if a.no_write else a.out,
+                          "dropped": dropped, "out": None if a.no_write else fwd(a.out),
                           "seconds": round(time.time() - t0, 1)}, indent=2))
     else:
         if note:
@@ -2493,7 +2499,7 @@ def cmd_universe(a):
             print("Dropped: " + ", ".join("%s %s" % (indian(v), k)
                                           for k, v in sorted(dropped.items(), key=lambda kv: -kv[1])) + ".")
         if not a.no_write:
-            print("Wrote %s (one SYMBOL|Name a line)." % a.out)
+            print("Wrote %s (one SYMBOL|Name a line)." % fwd(a.out))
     return 0 if kept else 1
 
 
@@ -2589,7 +2595,7 @@ def cmd_daily(a):
     if len(hits) > a.show:
         print("  ... and %d more in the watchlist (--show N for more)." % (len(hits) - a.show))
     if not a.no_write:
-        print("Wrote %s (mode daily, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
+        print("Wrote %s (mode daily, %d hit%s)." % (fwd(a.out), len(hits), "" if len(hits) == 1 else "s"))
     print(NOTE + " Next: pick one chart, then /trader-news SYMBOL.")
     return 0 if hits else 1
 
@@ -2766,7 +2772,7 @@ def cmd_orb(a):
     else:
         print("No chart closed above its opening-range high by %s." % clock_label(cutoff))
     if not a.no_write:
-        print("Wrote %s (mode orb, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
+        print("Wrote %s (mode orb, %d hit%s)." % (fwd(a.out), len(hits), "" if len(hits) == 1 else "s"))
     print(NOTE + " Next: pick one chart, then /trader-news SYMBOL and /trader-entry SYMBOL.")
     return 0 if hits else 1
 
@@ -2798,12 +2804,12 @@ def read_cache_rows(symbols, data_dir):
     for sym in symbols:
         path = daily_cache_path(sym, data_dir)
         if not os.path.exists(path):
-            missing[sym] = path
+            missing[sym] = fwd(path)
             continue
         try:
             rows[sym] = read_daily_csv(path)
         except OSError as e:
-            missing[sym] = "%s (%s)" % (path, e)
+            missing[sym] = "%s (%s)" % (fwd(path), e)
     return rows, missing
 
 
@@ -2815,7 +2821,7 @@ def cmd_longterm(a):
     rows, missing = read_cache_rows(symbols, data_dir)
     if not rows:
         raise ScanError("no daily cache in %s for these symbols. Next: run `python3 trader-data/data.py daily "
-                        "SYMBOL [SYMBOL ...]`, or %s" % (daily_dir, DATA_HINT))
+                        "SYMBOL [SYMBOL ...]`, or %s" % (fwd(daily_dir), DATA_HINT))
     bench, bench_name, bench_note = read_benchmark(data_dir)
     delivery = load_delivery(sorted(rows), data_dir)
     hits, counts, last_date = scan_longterm(rows, symbols, a.min_price, a.min_volume, a.screen, a.near_high,
@@ -2874,11 +2880,11 @@ def cmd_longterm(a):
                 ("%+.1f" % h["mansfield_rs"]) if h["mansfield_rs"] is not None else "-", swing_text(h),
                 ", ".join(LT_LABEL[t] for t in h["setups"])))
         if len(hits) > a.show:
-            print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, a.out))
+            print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, fwd(a.out)))
     else:
         print("Nothing matched.")
     if not a.no_write:
-        print("Wrote %s (mode longterm, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
+        print("Wrote %s (mode longterm, %d hit%s)." % (fwd(a.out), len(hits), "" if len(hits) == 1 else "s"))
     print(NOTE + " Not financial advice. Next: /trader-news SYMBOL, then read the company's filings.")
     return 0 if hits else 1
 
@@ -2963,11 +2969,11 @@ def cmd_patterns_intraday(a):
                 h["symbol"], h["pattern"], h["state"], h["at"], money(h["price"]), money(h["level"]),
                 money(h["stop"]), h["risk_pct"], money(h["target"]) if h["target"] is not None else "-"))
         if len(hits) > a.show:
-            print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, a.out))
+            print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, fwd(a.out)))
     else:
         print("Nothing matched.")
     if not a.no_write:
-        print("Wrote %s (mode patterns-intraday, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
+        print("Wrote %s (mode patterns-intraday, %d hit%s)." % (fwd(a.out), len(hits), "" if len(hits) == 1 else "s"))
     print(NOTE + " Not financial advice. Next: /trader-news SYMBOL, then /trader-entry watchlist --setup level.")
     return 0 if hits else 1
 
@@ -2986,7 +2992,7 @@ def cmd_patterns(a):
     rows, missing = read_cache_rows(symbols, data_dir)
     if not rows:
         raise ScanError("no daily cache in %s for these symbols. Next: run `python3 trader-data/data.py daily "
-                        "SYMBOL [SYMBOL ...]`, or %s" % (daily_dir, DATA_HINT))
+                        "SYMBOL [SYMBOL ...]`, or %s" % (fwd(daily_dir), DATA_HINT))
     only = [a.pattern] if a.pattern else None
     hits, counts, last_date = scan_patterns(rows, symbols, a.min_price, a.min_volume, only,
                                             None if a.state == "any" else a.state)
@@ -3047,11 +3053,11 @@ def cmd_patterns(a):
                 h["risk_pct"], money(h["target"]) if h["target"] is not None else "-", h["first_seen"],
                 "  (new)" if h["first_seen"] == h["close_date"] else ""))
         if len(hits) > a.show:
-            print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, a.out))
+            print("  ... and %d more in %s (--show N for more)." % (len(hits) - a.show, fwd(a.out)))
     else:
         print("Nothing matched.")
     if not a.no_write:
-        print("Wrote %s (mode patterns, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
+        print("Wrote %s (mode patterns, %d hit%s)." % (fwd(a.out), len(hits), "" if len(hits) == 1 else "s"))
     print(NOTE + " Not financial advice. Next: /trader-news SYMBOL, then /trader-entry SYMBOL for the level.")
     return 0 if hits else 1
 
@@ -3068,23 +3074,23 @@ def cmd_breadth(a):
             if os.path.exists(daily_cache_path(sym, data_dir)):
                 unadjusted.append(sym)
             else:
-                missing[sym] = adj
+                missing[sym] = fwd(adj)
             continue
         path = daily_cache_path(sym, data_dir)
         if not os.path.exists(path):
-            missing[sym] = path
+            missing[sym] = fwd(path)
             continue
         try:
             got = read_daily_csv(path)
         except OSError as e:
-            missing[sym] = "%s (%s)" % (path, e)
+            missing[sym] = "%s (%s)" % (fwd(path), e)
             continue
         if got:
             rows[sym] = got
     if not rows:
         raise ScanError("no adjusted daily cache (<SYMBOL>.adj.csv) in %s for these symbols%s. Next: run `python3 "
                         "trader-data/data.py daily SYMBOL [SYMBOL ...]`, or %s" % (
-                            daily_dir, (" (%s have only an unadjusted .csv: --unadjusted uses them, but a split "
+                            fwd(daily_dir), (" (%s have only an unadjusted .csv: --unadjusted uses them, but a split "
                                         "then fakes a new low)" % indian(len(unadjusted))) if unadjusted else "",
                             DATA_HINT))
     series = breadth_series(rows, days=BREADTH_DAYS if a.days is None else a.days)
@@ -3094,7 +3100,7 @@ def cmd_breadth(a):
     last = series[-1] if series else None
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "breadth",
            "symbols": len(rows), "skipped_unadjusted": len(unadjusted), "missing": len(missing),
-           "rows": len(series), "out": None if a.no_write else out, "last": last, "caveat": BREADTH_CAVEAT,
+           "rows": len(series), "out": None if a.no_write else fwd(out), "last": last, "caveat": BREADTH_CAVEAT,
            "unadjusted_included": bool(a.unadjusted)}
     if a.json:
         print(json.dumps(doc, indent=2))
@@ -3119,7 +3125,7 @@ def cmd_breadth(a):
         print("No dates with a previous close to compare.")
     print("Caveat: %s." % BREADTH_CAVEAT)
     if not a.no_write:
-        print("Wrote %s (%d rows). The other scans print a one-line regime note from it." % (out, len(series)))
+        print("Wrote %s (%d rows). The other scans print a one-line regime note from it." % (fwd(out), len(series)))
     return 0 if series else 1
 
 
@@ -3142,7 +3148,7 @@ def main(argv=None):
         g = p.add_mutually_exclusive_group()
         g.add_argument("--symbols", help="comma-separated NSE symbols instead of the universe (RELIANCE,TCS)")
         g.add_argument("--watchlist", metavar="FILE", help="a watchlist.json (hits) or a text file of NSE symbols")
-        p.add_argument("--universe", help="symbol list, one SYMBOL|Name a line (default %s)" % DEFAULT_UNIVERSE)
+        p.add_argument("--universe", help="symbol list, one SYMBOL|Name a line (default %s)" % fwd(DEFAULT_UNIVERSE))
         p.add_argument("--limit", type=int, help="scan only the first N symbols")
         p.add_argument("--min-price", type=float, default=min_price)
         p.add_argument("--min-volume", type=int, default=min_volume)
@@ -3169,20 +3175,20 @@ def main(argv=None):
     p.add_argument("--config", default="trader/config.json")
     p.add_argument("--trend-filter", action="store_true",
                    help="drop names whose daily swing trend (trader-data daily cache) is down; no cache = kept, flagged")
-    p.add_argument("--data-dir", help="the trader-data folder for --trend-filter (default %s)" % DATA_DIR)
+    p.add_argument("--data-dir", help="the trader-data folder for --trend-filter (default %s)" % fwd(DATA_DIR))
     p = sub.add_parser("longterm", help="long-term screen of the trader-data daily cache (no network)")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--symbols", help="comma-separated NSE symbols instead of the universe")
     g.add_argument("--watchlist", metavar="FILE", help="a watchlist.json (hits) or a text file of NSE symbols")
     p.add_argument("--universe", help="symbol list (default %s; without it, every stock in the cache)"
-                   % DEFAULT_UNIVERSE)
+                   % fwd(DEFAULT_UNIVERSE))
     p.add_argument("--limit", type=int)
     p.add_argument("--screen", choices=[k for k, _ in LT_SCREENS], help="keep only this screen (default: any)")
     p.add_argument("--near-high", type=float, default=5.0, help="percent under the 52-week high (5)")
     p.add_argument("--near-low", type=float, default=10.0, help="percent over the 52-week low (10)")
     p.add_argument("--min-price", type=float, default=20.0)
     p.add_argument("--min-volume", type=int, default=100000, help="20-day average volume (1,00,000)")
-    p.add_argument("--data-dir", help="the trader-data folder (default %s)" % DATA_DIR)
+    p.add_argument("--data-dir", help="the trader-data folder (default %s)" % fwd(DATA_DIR))
     p.add_argument("--now", help='pretend it is this time ("2026-10-29 08:30" IST)')
     p.add_argument("--out", default="trader/longterm.json")
     p.add_argument("--no-write", action="store_true")
@@ -3193,7 +3199,7 @@ def main(argv=None):
     g.add_argument("--symbols", help="comma-separated NSE symbols instead of the universe")
     g.add_argument("--watchlist", metavar="FILE", help="a watchlist.json (hits) or a text file of NSE symbols")
     p.add_argument("--universe", help="symbol list (default %s; without it, every stock in the cache)"
-                   % DEFAULT_UNIVERSE)
+                   % fwd(DEFAULT_UNIVERSE))
     p.add_argument("--limit", type=int)
     p.add_argument("--pattern", choices=[k for k, _ in PATTERNS], help="look for this pattern only (default: all)")
     p.add_argument("--state", choices=["coiled", "breakout", "any"], default="any",
@@ -3201,7 +3207,7 @@ def main(argv=None):
     p.add_argument("--min-price", type=float, help="last close (20; 50 with --intraday)")
     p.add_argument("--min-volume", type=int,
                    help="20-day average volume (1,00,000); with --intraday the volume so far (0)")
-    p.add_argument("--data-dir", help="the trader-data folder (default %s)" % DATA_DIR)
+    p.add_argument("--data-dir", help="the trader-data folder (default %s)" % fwd(DATA_DIR))
     p.add_argument("--now", help='pretend it is this time ("2026-10-29 08:30" IST)')
     p.add_argument("--out", default="trader/watchlist.json")
     p.add_argument("--no-write", action="store_true")
@@ -3225,12 +3231,12 @@ def main(argv=None):
     g.add_argument("--symbols", help="comma-separated NSE symbols instead of the universe")
     g.add_argument("--watchlist", metavar="FILE", help="a watchlist.json (hits) or a text file of NSE symbols")
     p.add_argument("--universe", help="symbol list (default %s; without it, every stock in the cache)"
-                   % DEFAULT_UNIVERSE)
+                   % fwd(DEFAULT_UNIVERSE))
     p.add_argument("--limit", type=int)
     p.add_argument("--unadjusted", action="store_true",
                    help="also use symbols that have only an unadjusted <SYMBOL>.csv (a split fakes a new low)")
     p.add_argument("--days", type=int, help="dates to write (%d; 0 = every date in the cache)" % BREADTH_DAYS)
-    p.add_argument("--data-dir", help="the trader-data folder (default %s)" % DATA_DIR)
+    p.add_argument("--data-dir", help="the trader-data folder (default %s)" % fwd(DATA_DIR))
     p.add_argument("--now", help='pretend it is this time ("2026-10-29 08:30" IST)')
     p.add_argument("--out", help="default <data-dir>/breadth.csv")
     p.add_argument("--no-write", action="store_true")

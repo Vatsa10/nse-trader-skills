@@ -2151,6 +2151,82 @@ class IntradayPatternsCli(unittest.TestCase):
         self.assertIn("no daily cache", err)
 
 
+class UserPaths(unittest.TestCase):
+    """Every path printed to the user has forward slashes, on every OS (Windows printed trader\\data\\breadth.csv)."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        os.chdir(self.d)
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def no_backslash(self, *texts):
+        for t in texts:
+            self.assertNotIn("\\", t.replace("\\u", ""), t)
+
+    def test_the_helper(self):
+        self.assertEqual(scan.fwd("trader\\data\\breadth.csv"), "trader/data/breadth.csv")
+        self.assertEqual(scan.fwd(os.path.join("trader", "data", "daily")), "trader/data/daily")
+        self.assertEqual(scan.fwd("already/fine"), "already/fine")
+
+    def test_errors_name_forward_slash_paths(self):
+        for argv in (["longterm"], ["patterns", "--symbols", "GONE"], ["breadth", "--symbols", "GONE"],
+                     ["longterm", "--data-dir", os.path.join("trader", "data"), "--symbols", "GONE"],
+                     ["daily", "--offline", os.path.join("nope", "dir")],
+                     ["daily", "--watchlist", os.path.join("trader", "nofile.json")],
+                     ["daily", "--universe", os.path.join("trader", "nolist.txt")]):
+            code, text, err = run(argv)
+            self.assertEqual(code, 1, argv)
+            self.assertIn("/", err, argv)
+            self.no_backslash(text, err)
+
+    def test_wrote_lines_and_json_out(self):
+        out = os.path.join("trader", "sub", "w.json")
+        code, text, _ = run(["daily", "--offline", DAILY, "--now", "2026-10-19 08:45", "--min-price", "0",
+                             "--min-volume", "0", "--out", out])
+        self.assertIn("Wrote trader/sub/w.json (mode daily", text)
+        self.no_backslash(text)
+        code, text, _ = run(["universe", "--offline", LISTS, "--out", os.path.join("trader", "u.txt")])
+        self.assertIn("Wrote trader/u.txt", text)
+        self.no_backslash(text)
+        code, text, _ = run(["universe", "--offline", LISTS, "--out", os.path.join("trader", "u.txt"), "--json"])
+        self.assertEqual(json.loads(text)["out"], "trader/u.txt")
+
+    def test_breadth_names_its_file_with_forward_slashes(self):
+        base = os.path.join("trader", "data", "daily")
+        os.makedirs(base)
+        for sym in ("AAA", "BBB"):
+            with open(os.path.join(base, "%s.adj.csv" % sym), "w", encoding="utf-8") as fh:
+                fh.write("date,open,high,low,close,volume\n")
+                for i in range(5):
+                    c = 100 + i * (1 if sym == "AAA" else -1)
+                    fh.write("2026-10-%02d,%s,%s,%s,%s,1000\n" % (12 + i, c, c, c, c))
+        code, text, _ = run(["breadth", "--symbols", "AAA,BBB"])
+        self.assertIn("Wrote trader/data/breadth.csv (", text)
+        self.no_backslash(text)
+        code, text, _ = run(["breadth", "--symbols", "AAA,BBB", "--json"])
+        self.assertEqual(json.loads(text)["out"], "trader/data/breadth.csv")
+        code, text, err = run(["longterm", "--symbols", "AAA", "--no-write"])      # 5 sessions: under 200
+        self.no_backslash(text, err)
+
+    def test_notes_and_help(self):
+        note = scan.read_benchmark(os.path.join("trader", "data"))[2]
+        self.assertIn("trader/data/index/nifty-50.csv", note)
+        self.no_backslash(note)
+        for cmd in ("orb", "longterm", "patterns", "breadth"):
+            out = io.StringIO()
+            with redirect_stdout(out), self.assertRaises(SystemExit):
+                scan.main([cmd, "--help"])
+            self.assertIn("trader/data", out.getvalue())
+            self.no_backslash(out.getvalue())
+        _, _, err = run(["longterm", "--symbols", "BAD", "--no-write"])
+        self.assertIn("trader/data/daily", err)
+        self.no_backslash(err)
+
+
 class MarketContext(unittest.TestCase):
     """trader/data/flows.csv and trader/data/preopen.json (written by trader-data): a header line and fields;
     a missing or corrupt file is no line and no crash."""

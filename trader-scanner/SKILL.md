@@ -425,6 +425,9 @@ cache, under 41 daily bars, or no trend yet stays in the list, marked
   covers 2024, 2025, 2026 only: check nseindia.com". NSE has no early
   closes. The Diwali Muhurat session (an hour in the evening, timings by
   circular) is treated as closed for the 09:15 to 15:30 scans.
+- Every path the scanner prints (the "Wrote ..." line, errors, notes, `--help`
+  defaults, the `out` field of `--json`) uses forward slashes on every OS, so
+  Windows prints `trader/data/breadth.csv`, not `trader\data\breadth.csv`.
 - Circuit limits: NSE stocks have daily price bands (2, 5, 10 or 20 %). A
   breakout into the upper circuit may not be fillable; say so.
 
