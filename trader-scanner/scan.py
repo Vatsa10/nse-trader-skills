@@ -3457,7 +3457,7 @@ def main(argv=None):
     p.add_argument("--trigger-bars", type=int, default=STUDY["trigger_bars"],
                    help="--study: sessions a setup may wait for its trigger close (%d)" % STUDY["trigger_bars"])
     p.add_argument("--cost-pct", type=float, default=STUDY["cost_pct"],
-                   help="--study: round-trip costs in %% of the entry (%.2f)" % STUDY["cost_pct"])
+                   help="--study: round-trip costs in percent of the entry (%.2f)" % STUDY["cost_pct"])
     p.add_argument("--split", type=float, default=STUDY["split"],
                    help="--study: share of the date span that is in-sample (%.1f)" % STUDY["split"])
     p.add_argument("--param", action="append", metavar="KEY=VALUE",
