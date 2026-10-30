@@ -17,6 +17,8 @@ saved yourself (Kite MCP JSON, Kite Console / NSE website CSV).
     python3 data.py chain NIFTY [--expiry 29-Oct-2026]
     python3 data.py index ["NIFTY 50" "NIFTY BANK" ...] [--days 30] [--years 1] [--pe-expensive 25 --pe-cheap 20]
     python3 data.py delivery RELIANCE TCS [--window 30] [--no-fetch]
+    python3 data.py flows [--no-fetch]
+    python3 data.py preopen [--key NIFTY50|ALL|FO|SME|OTHERS]
     python3 data.py doctor
     python3 data.py record RELIANCE [--date 2026-10-23]
     python3 data.py status
@@ -34,6 +36,8 @@ Writes (shared contracts, see PORT_V4_SPEC.md):
   trader/data/actions.json           {"fetched_at","symbols":{SYM:{"from","fetched_through","actions":[...]}}}
   trader/data/chain-<SYMBOL>.json    option chain summary: underlying, expiry, PCR, OI walls, ATM, max pain
   trader/data/index/<slug>.csv       date,open,high,low,close,volume,pe,pb,div_yield (nifty-50, nifty-bank, india-vix)
+  trader/data/flows.csv              date,category,buy_cr,sell_cr,net_cr (FII/FPI and DII, Rs crore, one row per date and category)
+  trader/data/preopen.json           {"key","timestamp","date","fetched_at","advances","declines","unchanged","stocks":[{symbol,series,iep,prev_close,change_pct,final_qty,total_buy_qty,total_sell_qty,turnover}]}
 
 NSE requests (www.nseindia.com, nsearchives) retry up to 5 times on a 429, 502, 503, 504
 or a timeout, waiting 2^n seconds with jitter (never over 8 s, or the Retry-After the server
@@ -54,7 +58,6 @@ import email.utils
 import gzip
 import http.client
 import http.cookiejar
-import importlib.util
 import io
 import json
 import os
@@ -131,10 +134,21 @@ INDEX_DAYS = 30               # snapshot files fetched for an index with nothing
 INDEX_REFERER = NSE + "/reports-indices-historical-index-data"
 VIX_REFERER = NSE + "/reports-indices-historical-vix"
 VIX_NAME = "India VIX"
+INDEX_CHUNK_DAYS = 120        # one index/VIX history request spans this many calendar days (about 85 sessions)
+HISTORY_CAP = 100             # NSE sends at most this many rows a history request: a full chunk may be cut short
 VALUATION_INDEX = "NIFTY 50"
 PE_EXPENSIVE = 25.0           # Nifty 50 P/E at or above this is flagged expensive (eod2's rule of thumb)
 PE_CHEAP = 20.0               # at or below this, cheap
-PE_MIN_ROWS = 250             # P/E rows needed before a percentile means anything
+FLOWS_FILE = "flows.csv"
+FLOWS_HEADER = ["date", "category", "buy_cr", "sell_cr", "net_cr"]
+FLOWS_REFERER = NSE + "/reports/fii-dii"
+FLOW_WINDOWS = (5, 20)        # sessions the net FII/DII sums are taken over
+PREOPEN_FILE = "preopen.json"
+PREOPEN_KEYS = {"NIFTY50": "NIFTY 50", "ALL": "ALL", "FO": "FO", "SME": "SME", "OTHERS": "OTHERS"}   # --key -> NSE's key
+PREOPEN_REFERER = NSE + "/market-data/pre-open-market-cm-and-emerge-market"
+PREOPEN_TOP = 5               # gap-ups and gap-downs printed
+PREOPEN_ORDERS_END = datetime.time(9, 8)   # order entry, change and cancel close; before this the book is indicative
+PE_MIN_ROWS = 250            # P/E rows needed before a percentile means anything
 REPORTS_REFERER = NSE + "/all-reports"
 CHAIN_REFERER = NSE + "/option-chain"
 INDEX_SYMBOLS = ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50")   # option-chain type=Indices
@@ -143,70 +157,147 @@ VIX_ELEVATED, VIX_CALM = 1.15, 0.85   # India VIX against its recent average
 VIX_AVG_ROWS = 20
 REPORT_KEYS = {"sec_bhavdata_full": "CM-BHAVDATA-FULL", "BhavCopy_NSE_CM": "CM-UDIFF-BHAVCOPY-CSV"}
 
-# ---------------------------------------------------------------- NSE trading calendar
-# 2026 comes from trader-alerts/alerts.py (loaded below, with this copy as the fallback).
-NSE_HOLIDAYS_2026_COPY = {
-    "2026-01-15": "Maharashtra municipal elections (special holiday)",
-    "2026-01-26": "Republic Day", "2026-03-03": "Holi", "2026-03-26": "Shri Ram Navami",
-    "2026-03-31": "Shri Mahavir Jayanti", "2026-04-03": "Good Friday",
-    "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti", "2026-05-01": "Maharashtra Day",
-    "2026-05-28": "Bakri Id", "2026-06-26": "Muharram", "2026-09-14": "Ganesh Chaturthi",
-    "2026-10-02": "Mahatma Gandhi Jayanti", "2026-10-20": "Dussehra",
-    "2026-11-10": "Diwali Balipratipada", "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
-    "2026-12-25": "Christmas",
-}
-# Special closure announced later: NSE circular CMTR72260 (Jan 2026), Maharashtra municipal elections.
-NSE_EXTRA_2026 = {"2026-01-15": "Maharashtra municipal elections (special holiday)"}
-# 2025: NSE circular 170/2024, NSE/CMTR/65587, 13 Dec 2024
-# (https://nsearchives.nseindia.com/content/circulars/CMTR65587.pdf). Oct 21 is a holiday
-# with a Muhurat session, listed in SPECIAL_SESSIONS so its bar is accepted.
-NSE_HOLIDAYS_2025 = {
-    "2025-02-26": "Mahashivratri", "2025-03-14": "Holi", "2025-03-31": "Id-Ul-Fitr (Ramadan Eid)",
-    "2025-04-10": "Shri Mahavir Jayanti", "2025-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
-    "2025-04-18": "Good Friday", "2025-05-01": "Maharashtra Day", "2025-08-15": "Independence Day",
-    "2025-08-27": "Ganesh Chaturthi", "2025-10-02": "Mahatma Gandhi Jayanti/Dussehra",
-    "2025-10-21": "Diwali Laxmi Pujan (Muhurat session)", "2025-10-22": "Diwali-Balipratipada",
-    "2025-11-05": "Prakash Gurpurb Sri Guru Nanak Dev", "2025-12-25": "Christmas",
-}
-# 2024: NSE circular 154/2023, NSE/CMTR/59722, 12 Dec 2023, plus three special closures
-# announced during the year (Jan 22, May 20, Nov 20). Cross-checked against bhavcopy history.
-NSE_HOLIDAYS_2024 = {
+# --- nse calendar: keep byte-identical in every script that has it (tests/test_repo.py checks) ---
+# The NSE equity-segment trading calendar. Built-in tables for 2024 to 2026 (NSE circulars), then
+# trader/data/calendar.json (trader-data: data.py calendar, from NSE's holiday master and its trading
+# circulars) laid on top: for a year the file lists, its holidays replace the built-in ones. A missing or
+# unreadable file means the built-in tables; nothing here raises.
+BUILTIN_HOLIDAYS = {   # weekday closures of the regular 09:15-15:30 market
     "2024-01-22": "Special holiday (Ram Mandir)", "2024-01-26": "Republic Day",
     "2024-03-08": "Mahashivratri", "2024-03-25": "Holi", "2024-03-29": "Good Friday",
     "2024-04-11": "Id-Ul-Fitr (Ramadan Eid)", "2024-04-17": "Shri Ram Navmi",
     "2024-05-01": "Maharashtra Day", "2024-05-20": "Lok Sabha election (Mumbai)",
     "2024-06-17": "Bakri Id", "2024-07-17": "Moharram", "2024-08-15": "Independence Day",
-    "2024-10-02": "Mahatma Gandhi Jayanti", "2024-11-01": "Diwali Laxmi Pujan (Muhurat session)",
+    "2024-10-02": "Mahatma Gandhi Jayanti", "2024-11-01": "Diwali Laxmi Pujan",
     "2024-11-15": "Gurunanak Jayanti", "2024-11-20": "Maharashtra assembly election",
     "2024-12-25": "Christmas",
+    "2025-02-26": "Mahashivratri", "2025-03-14": "Holi", "2025-03-31": "Id-Ul-Fitr (Ramadan Eid)",
+    "2025-04-10": "Shri Mahavir Jayanti", "2025-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2025-04-18": "Good Friday", "2025-05-01": "Maharashtra Day", "2025-08-15": "Independence Day",
+    "2025-08-27": "Ganesh Chaturthi", "2025-10-02": "Mahatma Gandhi Jayanti/Dussehra",
+    "2025-10-21": "Diwali Laxmi Pujan", "2025-10-22": "Diwali-Balipratipada",
+    "2025-11-05": "Prakash Gurpurb Sri Guru Nanak Dev", "2025-12-25": "Christmas",
+    "2026-01-15": "Maharashtra municipal elections (special holiday)", "2026-01-26": "Republic Day",
+    "2026-03-03": "Holi", "2026-03-26": "Shri Ram Navami", "2026-03-31": "Shri Mahavir Jayanti",
+    "2026-04-03": "Good Friday", "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2026-05-01": "Maharashtra Day", "2026-05-28": "Bakri Id", "2026-06-26": "Muharram",
+    "2026-09-14": "Ganesh Chaturthi", "2026-10-02": "Mahatma Gandhi Jayanti", "2026-10-20": "Dussehra",
+    "2026-11-10": "Diwali-Balipratipada", "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
+    "2026-12-25": "Christmas",
 }
-# Sessions on a weekend or a holiday: a bar on these dates is real, not an error.
-SPECIAL_SESSIONS = {
-    "2023-11-12": "Muhurat (Sunday)", "2024-01-20": "Saturday special session",
-    "2024-03-02": "Saturday DR session", "2024-05-18": "Saturday DR session",
-    "2024-11-01": "Muhurat", "2025-02-01": "Budget day (Saturday)", "2025-10-21": "Muhurat",
-    "2026-02-01": "Budget day (Sunday)", "2026-11-08": "Muhurat (Sunday)",
+BUILTIN_YEARS = (2024, 2025, 2026)
+BUILTIN_SPECIAL = {    # normal-hours sessions on a weekend or a holiday
+    "2024-01-20": "Saturday special session", "2024-03-02": "Saturday DR session",
+    "2024-05-18": "Saturday DR session", "2025-02-01": "Union Budget (Saturday)",
+    "2026-02-01": "Union Budget (Sunday)",
 }
+BUILTIN_MUHURAT = {    # one evening hour at times set by circular: the regular market is closed that day
+    "2023-11-12": "Diwali Laxmi Pujan (Muhurat), Sunday", "2024-11-01": "Diwali Laxmi Pujan (Muhurat)",
+    "2025-10-21": "Diwali Laxmi Pujan (Muhurat)", "2026-11-08": "Diwali Laxmi Pujan (Muhurat), Sunday",
+}
+NSE_HOLIDAYS = dict(BUILTIN_HOLIDAYS)    # these four hold the built-in tables plus calendar.json
+SPECIAL_SESSIONS = dict(BUILTIN_SPECIAL)
+MUHURAT_SESSIONS = dict(BUILTIN_MUHURAT)
+CALENDAR_YEARS = BUILTIN_YEARS
+CALENDAR_PATH = os.path.join("trader", "data", "calendar.json")
 
 
-def _alerts_holidays():
-    path = os.path.join(os.path.dirname(HERE), "trader-alerts", "alerts.py")
+def _cal_dates(m):
+    """{"2027-01-26": "Republic Day"} with bad keys dropped; anything but an object is corrupt."""
+    if m is None:
+        return {}
+    if not isinstance(m, dict):
+        raise ValueError("not an object")
+    out = {}
+    for k, v in m.items():
+        try:
+            datetime.date.fromisoformat(k)
+        except (TypeError, ValueError):
+            continue
+        out[k] = str(v)
+    return out
+
+
+def load_calendar(path=None):
+    """trader/data/calendar.json -> {"years", "holidays", "special_sessions", "fetched_at",
+    "last_circular_check", "warnings"}, or None when it is missing or unreadable."""
     try:
-        spec = importlib.util.spec_from_file_location("trader_alerts_for_data", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        got = {k: v for k, v in getattr(mod, "BUILTIN_HOLIDAYS", mod.NSE_HOLIDAYS).items()
-               if k.startswith("2026-")}
-        return got or dict(NSE_HOLIDAYS_2026_COPY)
-    except Exception:
-        return dict(NSE_HOLIDAYS_2026_COPY)
+        with open(path or CALENDAR_PATH, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        if not isinstance(doc, dict):
+            return None
+        warns = doc.get("warnings")
+        return {"years": sorted(set(int(y) for y in (doc.get("years") or []))),
+                "holidays": _cal_dates(doc.get("holidays")),
+                "special_sessions": _cal_dates(doc.get("special_sessions")),
+                "fetched_at": doc.get("fetched_at"), "last_circular_check": doc.get("last_circular_check"),
+                "warnings": [str(w) for w in warns] if isinstance(warns, list) else []}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
 
 
-NSE_HOLIDAYS_2026 = _alerts_holidays()
-HOLIDAYS = {}
-for _h in (NSE_HOLIDAYS_2024, NSE_HOLIDAYS_2025, NSE_HOLIDAYS_2026, NSE_EXTRA_2026):
-    HOLIDAYS.update(_h)
-CALENDAR_YEARS = (2024, 2025, 2026)
+def is_muhurat(name):
+    low = str(name).lower()
+    return "muhurat" in low or "laxmi pujan" in low
+
+
+def apply_calendar(path=None):
+    """Rebuild NSE_HOLIDAYS, SPECIAL_SESSIONS, MUHURAT_SESSIONS and CALENDAR_YEARS from the built-in
+    tables plus calendar.json (path None = CALENDAR_PATH). Returns the file's contents, or None."""
+    global CALENDAR_YEARS
+    cal = load_calendar(path)
+    for table, base in ((NSE_HOLIDAYS, BUILTIN_HOLIDAYS), (SPECIAL_SESSIONS, BUILTIN_SPECIAL),
+                        (MUHURAT_SESSIONS, BUILTIN_MUHURAT)):
+        table.clear()
+        table.update(base)
+    CALENDAR_YEARS = BUILTIN_YEARS
+    if not cal:
+        return None
+    for y in cal["years"]:
+        for iso in [k for k in NSE_HOLIDAYS if k.startswith("%04d-" % y)]:
+            del NSE_HOLIDAYS[iso]
+    NSE_HOLIDAYS.update(cal["holidays"])
+    for iso, name in cal["special_sessions"].items():
+        SPECIAL_SESSIONS.pop(iso, None)
+        MUHURAT_SESSIONS.pop(iso, None)
+        (MUHURAT_SESSIONS if is_muhurat(name) else SPECIAL_SESSIONS)[iso] = name
+    CALENDAR_YEARS = tuple(sorted(set(BUILTIN_YEARS) | set(cal["years"])))
+    return cal
+
+
+def years_text():
+    return ", ".join(str(y) for y in CALENDAR_YEARS)
+
+
+def trading_day(d):
+    """(open, reason) for the regular 09:15-15:30 market on date d. A normal-hours special session is
+    open; a weekend, a listed holiday and a Muhurat day are closed. Outside CALENDAR_YEARS the weekday
+    rule is a guess, which calendar_known says."""
+    iso = d.isoformat()
+    if iso in MUHURAT_SESSIONS:
+        return False, ("special session: %s, about an hour in the evening at times set by NSE; "
+                       "no normal 09:15-15:30 market" % MUHURAT_SESSIONS[iso])
+    if iso in SPECIAL_SESSIONS:
+        return True, ""
+    if d.weekday() >= 5:
+        return False, "weekend"
+    name = NSE_HOLIDAYS.get(iso)
+    if name:
+        return False, "NSE holiday: " + name
+    return True, ""
+
+
+def calendar_known(d):
+    return d.year in CALENDAR_YEARS
+
+
+def bars_expected(d):
+    """Does NSE publish a daily bar for d? Every regular trading day, and a Muhurat session too."""
+    return trading_day(d)[0] or d.isoformat() in MUHURAT_SESSIONS
+
+
+apply_calendar()   # at import, from trader/data/calendar.json in the working directory when it exists
+# --- end nse calendar ---
 
 
 class DataError(Exception):
@@ -223,70 +314,17 @@ class SourceError(DataError):
         return msg + (" (%s)" % self.hint if self.hint else "")
 
 
-_CAL = None    # calendar.json as load_calendar reads it; None means the built-in tables only
-
-
-def _iso_map(m):
-    """{"2027-01-26": "Republic Day"} with bad keys dropped; a non-object is corrupt."""
-    if m is None:
-        return {}
-    if not isinstance(m, dict):
-        raise ValueError("not an object")
-    out = {}
-    for k, v in m.items():
-        try:
-            datetime.date.fromisoformat(k)
-        except (TypeError, ValueError):
-            continue
-        out[k] = str(v)
-    return out
-
-
-def load_calendar(data_dir):
-    """<data_dir>/calendar.json -> dict, or None when it is missing or corrupt (never raises)."""
-    doc = _read_json(os.path.join(data_dir, CALENDAR_FILE), None)
-    if not isinstance(doc, dict):
-        return None
-    try:
-        warns = doc.get("warnings")
-        return {"years": sorted(set(int(y) for y in (doc.get("years") or []))),
-                "holidays": _iso_map(doc.get("holidays")),
-                "special_sessions": _iso_map(doc.get("special_sessions")),
-                "fetched_at": doc.get("fetched_at"), "last_circular_check": doc.get("last_circular_check"),
-                "warnings": [str(w) for w in warns] if isinstance(warns, list) else []}
-    except (TypeError, ValueError, AttributeError):
-        return None
-
-
-def calendar_known(year):
-    return year in CALENDAR_YEARS or bool(_CAL and year in _CAL["years"])
+_CAL = None    # calendar.json as apply_calendar read it for this run; None means the built-in tables only
 
 
 def closed_name(iso):
-    return (_CAL and _CAL["holidays"].get(iso)) or HOLIDAYS.get(iso, "weekend")
-
-
-def trading_day(d):
-    """Is NSE open on d? A special session is open, a weekend is closed, then calendar.json (a listed
-    holiday is closed, any other day of a year it covers is open), then the built-in tables."""
-    iso = d.isoformat()
-    cal = _CAL
-    if iso in SPECIAL_SESSIONS or (cal and iso in cal["special_sessions"]):
-        return True
-    if d.weekday() >= 5:
-        return False
-    if cal:
-        if iso in cal["holidays"]:
-            return False
-        if d.year in cal["years"]:
-            return True
-    return iso not in HOLIDAYS
+    return NSE_HOLIDAYS.get(iso, "weekend")
 
 
 def trading_days(start, end):
     out, d = [], start
     while d <= end:
-        if trading_day(d):
+        if bars_expected(d):
             out.append(d)
         d += datetime.timedelta(days=1)
     return out
@@ -294,7 +332,7 @@ def trading_days(start, end):
 
 def prev_trading_day(d):
     d -= datetime.timedelta(days=1)
-    while not trading_day(d):
+    while not bars_expected(d):
         d -= datetime.timedelta(days=1)
     return d
 
@@ -330,7 +368,7 @@ def ist_to_ts(dt):
 def last_complete_session(now_ist):
     """The latest session whose EOD data should exist (bhavcopy appears in the evening)."""
     d = now_ist.date()
-    if trading_day(d) and d.weekday() < 5 and now_ist.time() >= datetime.time(18, 0):
+    if bars_expected(d) and d.weekday() < 5 and now_ist.time() >= datetime.time(18, 0):
         return d
     return prev_trading_day(d)
 
@@ -400,6 +438,11 @@ def fmt(x):
     return s if s not in ("", "-0") else "0"
 
 
+def show_path(path):
+    """A path as printed to the user: forward slashes on every OS (file operations keep the native form)."""
+    return str(path).replace("\\", "/")
+
+
 def norm_symbol(sym):
     s = str(sym or "").strip().upper()
     for suf in (".NS", "-EQ"):
@@ -458,13 +501,13 @@ def validate_daily(rows):
             errors.append("%s: %s" % (d, p))
         if r.get("volume") is not None and r["volume"] < 0:
             errors.append("%s: negative volume" % d)
-        if not trading_day(day) and calendar_known(day.year):
+        if not bars_expected(day) and calendar_known(day):
             warnings.append("%s has a bar but NSE was closed (%s)" % (d, closed_name(d)))
     if rows and not errors:
         first = datetime.date.fromisoformat(rows[0]["date"])
         last = datetime.date.fromisoformat(rows[-1]["date"])
-        known = [x for x in trading_days(first, last) if calendar_known(x.year) and x.isoformat() not in seen]
-        unknown = [x for x in trading_days(first, last) if not calendar_known(x.year)
+        known = [x for x in trading_days(first, last) if calendar_known(x) and x.isoformat() not in seen]
+        unknown = [x for x in trading_days(first, last) if not calendar_known(x)
                    and x.isoformat() not in seen]
         if known:
             warnings.append("gap: %d NSE trading day(s) missing: %s" % (len(known), compress(known)))
@@ -523,7 +566,7 @@ def read_daily(path):
                 rows.append(bar(r["date"], float(r["open"]), float(r["high"]), float(r["low"]),
                                 float(r["close"]), num(r.get("volume")) or 0))
             except (KeyError, TypeError, ValueError):
-                raise DataError("%s has a bad row: %r" % (path, r))
+                raise DataError("%s has a bad row: %r" % (show_path(path), r))
     return rows
 
 
@@ -540,7 +583,7 @@ def write_daily(path, rows):
     rows = sorted(rows, key=lambda r: r["date"])
     errors, warnings = validate_daily(rows)
     if errors:
-        raise DataError("refusing to write %s: %s" % (path, "; ".join(errors[:5])))
+        raise DataError("refusing to write %s: %s" % (show_path(path), "; ".join(errors[:5])))
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\n")
     w.writerow(HEADER)
@@ -643,7 +686,7 @@ def write_intraday(path, sym, new_bars, meta=None, source="", keep_sessions=60):
     bars = [b for b in bars if ts_to_ist(b[0]).date() in keep]
     errors, warnings = validate_intraday(bars)
     if errors:
-        raise DataError("refusing to write %s: %s" % (path, "; ".join(errors[:5])))
+        raise DataError("refusing to write %s: %s" % (show_path(path), "; ".join(errors[:5])))
     m = dict(old_meta)
     m.update(meta or {})
     _write_json(path, build_chart(sym, bars, m, source))
@@ -1304,7 +1347,7 @@ def window(rows, years, now_ist, fill_gaps):
         have = set(r["date"] for r in rows)
         if fill_gaps:
             first = datetime.date.fromisoformat(rows[0]["date"])
-            miss = [d for d in trading_days(first, end) if d.isoformat() not in have and calendar_known(d.year)]
+            miss = [d for d in trading_days(first, end) if d.isoformat() not in have and calendar_known(d)]
         else:
             miss = trading_days(last + datetime.timedelta(days=1), end)
         return miss, end
@@ -1593,7 +1636,7 @@ def fill_delivery(data_dir, bhav, syms, today):
     done = store_delivery(data_dir, bhav, names)
     if done:
         lines.append("delivery: %d row(s) written for %d symbol(s) in %s" % (
-            sum(done.values()), len(done), delivery_dir(data_dir)))
+            sum(done.values()), len(done), show_path(delivery_dir(data_dir))))
     keep = set()
     for d in sorted(pend):
         if d in bhav.full:
@@ -1826,7 +1869,7 @@ def cmd_bands(a):
     if unknown:
         print("Unknown bands stay unknown. Kite MCP get_quotes gives lower_circuit_limit / upper_circuit_limit: "
               "save it and run import-kite --kind quotes.")
-    print("Wrote %s (%d known)." % (os.path.join(a.data, "bands.json"), len(doc["bands"])))
+    print("Wrote %s (%d known)." % (show_path(os.path.join(a.data, "bands.json")), len(doc["bands"])))
     return 0 if not unknown else 1
 
 
@@ -1860,7 +1903,7 @@ def import_kite_historical(a, doc):
     sym = norm_symbol(a.symbol)
     cs = kite_candles(doc)
     if not cs:
-        raise DataError("no candles in %s" % a.file)
+        raise DataError("no candles in %s" % show_path(a.file))
     daily = all(c[0].time() == datetime.time(0, 0) for c in cs)
     raw_p, adj_p, intra_p = data_paths(a.data, sym)
     if daily:
@@ -1873,8 +1916,8 @@ def import_kite_historical(a, doc):
                                          "file": os.path.basename(target)})
         if a.adjusted:
             note_meta(a.data, "adjusted", sym, {"source": "kite-mcp", "fetched_at": stamp()})
-        print("%s: %d daily bar(s) from Kite into %s (%s to %s)." % (sym, len(rows), target, rows[0]["date"],
-                                                                     rows[-1]["date"]))
+        print("%s: %d daily bar(s) from Kite into %s (%s to %s)." % (sym, len(rows), show_path(target),
+                                                                     rows[0]["date"], rows[-1]["date"]))
     else:
         steps = sorted(set(int((b[0] - x[0]).total_seconds()) for x, b in zip(cs, cs[1:])
                            if b[0].date() == x[0].date()))
@@ -1887,7 +1930,7 @@ def import_kite_historical(a, doc):
         note_meta(a.data, "intraday", sym, {"source": "kite-mcp", "fetched_at": stamp(), "bars": len(allbars),
                                             "sessions": len(sessions), "last": sessions[-1].isoformat()})
         bad = []
-        print("%s: %d 5m bar(s) from Kite (%d-second candles) into %s." % (sym, len(bars), step, intra_p))
+        print("%s: %d 5m bar(s) from Kite (%d-second candles) into %s." % (sym, len(bars), step, show_path(intra_p)))
     for b in bad:
         print("  dropped bad bar " + b)
     for w in warns:
@@ -1924,7 +1967,7 @@ def import_kite_quotes(a, doc, kind):
             when = now
         last = num(q.get("last_price"))
         o, h, low = num(ohlc.get("open")), num(ohlc.get("high")), num(ohlc.get("low"))
-        if when.time() >= CLOSE_T and trading_day(when.date()) and None not in (o, h, low, last):
+        if when.time() >= CLOSE_T and bars_expected(when.date()) and None not in (o, h, low, last):
             raw_p = data_paths(a.data, sym)[0]
             row = bar(when.date(), o, h, low, last, num(q.get("volume")) or num(q.get("volume_traded")) or 0)
             p = ohlc_problem(o, h, low, last)
@@ -1944,7 +1987,7 @@ def import_kite_quotes(a, doc, kind):
             print("%s: band %s, lower %s, upper %s -> bands.json" % (
                 sym, "?" if e["band_pct"] is None else "%s%%" % e["band_pct"], fmt(e["lower"]), fmt(e["upper"])))
     if not entries and not wrote:
-        raise DataError("nothing usable in %s" % a.file)
+        raise DataError("nothing usable in %s" % show_path(a.file))
     return 0
 
 
@@ -1953,7 +1996,7 @@ def cmd_import_kite(a):
         try:
             doc = json.load(fh)
         except ValueError:
-            raise DataError("%s is not JSON (save the tool output as-is)" % a.file)
+            raise DataError("%s is not JSON (save the tool output as-is)" % show_path(a.file))
     if a.kind == "historical":
         return import_kite_historical(a, doc)
     return import_kite_quotes(a, doc, a.kind)
@@ -2028,7 +2071,7 @@ def cmd_import_csv(a):
     with open(a.file, encoding="utf-8-sig", newline="") as fh:
         rows, notes = parse_ohlc_csv(fh.read(), sym)
     if not rows:
-        raise DataError("no bars in %s" % a.file)
+        raise DataError("no bars in %s" % show_path(a.file))
     good, bad = split_valid(rows)
     if bad and not a.drop_bad:
         raise DataError("%d bar(s) fail OHLC checks, e.g. %s; fix the file or pass --drop-bad" % (len(bad), bad[0]))
@@ -2042,7 +2085,7 @@ def cmd_import_csv(a):
     if a.adjusted:
         note_meta(a.data, "adjusted", sym, {"source": "import-csv:" + os.path.basename(a.file), "fetched_at": stamp()})
     print("%s: imported %d bar(s) (%s to %s) into %s; %d cached." % (
-        sym, len(good), good[0]["date"], good[-1]["date"], target, len(merged)))
+        sym, len(good), good[0]["date"], good[-1]["date"], show_path(target), len(merged)))
     for n in notes + ["dropped bad bar " + b for b in bad]:
         print("  note: " + n)
     for w in warns:
@@ -2178,9 +2221,9 @@ def calendar_changes(old, new):
 def builtin_disagreement(new, years):
     """Where NSE's list and the built-in tables differ, for the years both cover."""
     out = []
-    for y in sorted(set(years) & set(CALENDAR_YEARS)):
+    for y in sorted(set(years) & set(BUILTIN_YEARS)):
         pre = "%04d-" % y
-        built = {k for k in HOLIDAYS if k.startswith(pre) and k not in SPECIAL_SESSIONS}
+        built = {k for k in BUILTIN_HOLIDAYS if k.startswith(pre) and k not in BUILTIN_MUHURAT}
         live = {k for k in new["holidays"] if k.startswith(pre)}
         if built - live:
             out.append("%d: closed in the built-in table only: %s" % (y, compress(sorted(built - live))))
@@ -2215,7 +2258,7 @@ def cmd_calendar(a):
     now = parse_now(a.now)
     today = now.date()
     path = os.path.join(a.data, CALENDAR_FILE)
-    old = load_calendar(a.data)
+    old = load_calendar(path)
     if old is None and os.path.exists(path):
         print("calendar.json is unreadable; building it again from NSE.")
     need_master, need_circ = calendar_needs(old, today, now, a.refresh)
@@ -2256,7 +2299,7 @@ def cmd_calendar(a):
         bits.append("holiday list %s" % ", ".join(str(y) for y in sorted(master[2])))
     if circ:
         bits.append("circulars %s to %s" % (checked_from, today))
-    print("Wrote %s (%s)." % (path, "; ".join(bits)))
+    print("Wrote %s (%s)." % (show_path(path), "; ".join(bits)))
     changes = calendar_changes(old, new)
     for line in changes[:40]:
         print(line)
@@ -2507,7 +2550,7 @@ def cmd_actions(a):
                     x["ex_date"], x["subject"][:90]))
         if cached and adjusting:
             print("  next: data.py adjust %s" % sym)
-    print("Actions file: %s." % actions_path(a.data))
+    print("Actions file: %s." % show_path(actions_path(a.data)))
     return rc
 
 
@@ -2761,7 +2804,7 @@ def history_records(doc):
 
 
 def parse_index_history(doc):
-    """historicalOR/indicesHistory or vixhistory answer (newest first) -> rows ascending. NSE sends no
+    """historicalOR/indicesHistory or vixhistory answer (either order, upper-case months) -> rows ascending. NSE sends no
     volume, P/E, P/B or yield here, so those cells stay empty."""
     rows = {}
     for r in history_records(doc):
@@ -2777,13 +2820,25 @@ def parse_index_history(doc):
     return [rows[k] for k in sorted(rows)]
 
 
-def fetch_index_history(sess, name, lo, hi):
+def fetch_index_history(sess, name, lo, hi, notes=None):
+    """Index or VIX levels for lo..hi. NSE cuts every answer at HISTORY_CAP rows, so a chunk that comes
+    back that full is split in two and asked again; a single day that still fills it is reported in
+    `notes`, never accepted silently."""
     lo_s, hi_s = lo.strftime("%d-%m-%Y"), hi.strftime("%d-%m-%Y")
     if index_slug(name) == index_slug(VIX_NAME):
         doc = nse_api(sess, "/api/historicalOR/vixhistory?from=%s&to=%s" % (lo_s, hi_s), VIX_REFERER)
     else:
         doc = nse_api(sess, "/api/historicalOR/indicesHistory?indexType=%s&from=%s&to=%s" % (
             urllib.parse.quote(str(name).upper()), lo_s, hi_s), INDEX_REFERER)
+    if len(history_records(doc)) < HISTORY_CAP:
+        return parse_index_history(doc)
+    if lo < hi:
+        mid = lo + (hi - lo) // 2
+        return merge_index(fetch_index_history(sess, name, lo, mid, notes),
+                           fetch_index_history(sess, name, mid + datetime.timedelta(days=1), hi, notes))
+    if notes is not None:
+        notes.append("%s history for %s came back with %d rows, NSE's cap; rows may be missing" % (
+            name, lo, HISTORY_CAP))
     return parse_index_history(doc)
 
 
@@ -2886,8 +2941,8 @@ def cmd_index(a):
             if dates and hi <= start + datetime.timedelta(days=7):
                 continue    # the cache already reaches back that far
             try:
-                for c0, c1 in chunk_range(start, hi):
-                    got[slug] += fetch_index_history(sess, name, c0, c1)
+                for c0, c1 in chunk_range(start, hi, INDEX_CHUNK_DAYS):
+                    got[slug] += fetch_index_history(sess, name, c0, c1, notes)
             except (SourceError, DataError) as e:
                 rc = 1
                 notes.append("%s history: %s" % (name, e))
@@ -2896,7 +2951,7 @@ def cmd_index(a):
             after = write_index(a.data, name, got[slug])
             print("%s: +%d row(s), %d cached (%s to %s) -> %s" % (
                 name, len(after) - before, len(after), after[0]["date"], after[-1]["date"],
-                index_path(a.data, slug)))
+                show_path(index_path(a.data, slug))))
         elif not days and not a.years:
             print("%s: up to date." % name)
     for n in notes:
@@ -3102,7 +3157,239 @@ def cmd_chain(a):
     if vix:
         print("  " + vix)
     print("PCR is a sentiment hint, never a signal; OI walls and max pain are levels where positions sit, not "
-          "guarantees. Wrote %s." % path)
+          "guarantees. Wrote %s." % show_path(path))
+    return 0
+
+
+# ---------------------------------------------------------------- FII / DII flows
+
+def flows_path(data_dir):
+    return os.path.join(data_dir, FLOWS_FILE)
+
+
+def flow_category(text):
+    """NSE's "FII/FPI" and "DII" (any case or spacing) -> the name kept in flows.csv, else None."""
+    low = " ".join(str(text or "").upper().split())
+    return "FII/FPI" if low.startswith("FII") or low.startswith("FPI") else "DII" if low.startswith("DII") else None
+
+
+def parse_flows(doc):
+    """/api/fiidiiTradeReact answer (a list of {"buyValue", "category", "date", "netValue", "sellValue"},
+    values as strings in rupee crore) -> rows [{date, category, buy_cr, sell_cr, net_cr}] ascending.
+    A row with an unknown category, an unreadable date or no buy and sell value is skipped; a missing net
+    value is buy minus sell. An empty list is a valid, empty answer."""
+    rows = doc.get("data") if isinstance(doc, dict) else doc
+    if not isinstance(rows, list):
+        raise SourceError("nse-api", "the FII/DII answer is not a list", "NSE changed the feed, or this is a bot wall")
+    by = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        cat = flow_category(r.get("category"))
+        try:
+            day = parse_date(r.get("date"))
+        except DataError:
+            continue
+        buy, sell = num(r.get("buyValue")), num(r.get("sellValue"))
+        if cat is None or buy is None or sell is None:
+            continue
+        net = num(r.get("netValue"))
+        by[(day.isoformat(), cat)] = {"date": day.isoformat(), "category": cat, "buy_cr": buy, "sell_cr": sell,
+                                      "net_cr": buy - sell if net is None else net}
+    return [by[k] for k in sorted(by)]
+
+
+def read_flows(path):
+    """flows.csv -> rows ascending by date then category; a row that does not read is left out."""
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, newline="", encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            try:
+                datetime.date.fromisoformat(r["date"])
+                row = {"date": r["date"], "category": r["category"].strip(), "buy_cr": num(r.get("buy_cr")),
+                       "sell_cr": num(r.get("sell_cr")), "net_cr": num(r.get("net_cr"))}
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+            if row["category"] and row["net_cr"] is not None:
+                rows.append(row)
+    return sorted(rows, key=lambda r: (r["date"], r["category"]))
+
+
+def write_flows(data_dir, new_rows):
+    """Merge rows into flows.csv: one row per date and category, a later run for the same day replaces it.
+    Header date,category,buy_cr,sell_cr,net_cr, ISO dates, ascending. -> rows now in the file."""
+    by = dict(((r["date"], r["category"]), r) for r in read_flows(flows_path(data_dir)))
+    for r in new_rows:
+        by[(r["date"], r["category"])] = r
+    rows = [by[k] for k in sorted(by)]
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(FLOWS_HEADER)
+    for r in rows:
+        w.writerow([r["date"], r["category"], fmt(r["buy_cr"]), fmt(r["sell_cr"]), fmt(r["net_cr"])])
+    _atomic_write(flows_path(data_dir), buf.getvalue())
+    return rows
+
+
+def flow_sums(rows, windows=FLOW_WINDOWS):
+    """{category: {n: (net sum over the last n recorded sessions, first date, last date) or None}}."""
+    out = {}
+    for cat in sorted(set(r["category"] for r in rows)):
+        mine = [r for r in rows if r["category"] == cat]
+        out[cat] = dict((n, (sum(r["net_cr"] for r in mine[-n:]), mine[-n]["date"], mine[-1]["date"])
+                         if len(mine) >= n else None) for n in windows)
+    return out
+
+
+def crore(x):
+    return format(x, ",.2f")
+
+
+def cmd_flows(a):
+    now = parse_now(a.now)
+    wrote = ""
+    if not a.no_fetch:
+        rows = parse_flows(nse_api(Session(a.data), "/api/fiidiiTradeReact", FLOWS_REFERER))
+        if not rows:
+            raise DataError("NSE sent no FII/DII figures (empty answer: stale cookies, a bot wall, or none "
+                            "published yet); nothing written")
+        latest = rows[-1]["date"]
+        before = len(read_flows(flows_path(a.data)))
+        kept = write_flows(a.data, rows)
+        wrote = "Wrote %s (%+d row(s), %d kept, %s to %s)." % (
+            show_path(flows_path(a.data)), len(kept) - before, len(kept), kept[0]["date"], kept[-1]["date"])
+        print("FII/DII cash-market flows for %s (Rs crore, NSE provisional figures)" % latest)
+        for r in [x for x in rows if x["date"] == latest]:
+            print("  %-8s buy %12s  sell %12s  net %12s" % (
+                r["category"], crore(r["buy_cr"]), crore(r["sell_cr"]), crore(r["net_cr"])))
+        session = last_complete_session(now)
+        if latest < session.isoformat():
+            print("  note: NSE still shows %s; the figures for %s appear after the close." % (latest, session))
+    kept = read_flows(flows_path(a.data))
+    if not kept:
+        raise DataError("no flows cached: run flows without --no-fetch first")
+    if a.no_fetch:
+        print("FII/DII cash-market flows cached in %s (Rs crore)" % show_path(flows_path(a.data)))
+    for cat, got in flow_sums(kept).items():
+        bits = []
+        for n in FLOW_WINDOWS:
+            if got[n] is None:
+                bits.append("%d-session needs %d recorded days" % (n, n))
+            else:
+                bits.append("%d-session net %s (%s to %s)" % (n, crore(got[n][0]), got[n][1], got[n][2]))
+        print("  %-8s %s" % (cat, "; ".join(bits)))
+    days = len(set(r["date"] for r in kept))
+    if days < max(FLOW_WINDOWS):
+        print("  NSE shows only the latest day, so the sums build up as you run flows each day (%d day(s) "
+              "recorded)." % days)
+    if wrote:
+        print(wrote)
+    print("A context hint, not a signal: foreign and domestic institutions' net buying or selling says who "
+          "was active, not what price does next. Confirm with price and your own plan.")
+    return 0
+
+
+# ---------------------------------------------------------------- pre-open book
+
+def preopen_path(data_dir):
+    return os.path.join(data_dir, PREOPEN_FILE)
+
+
+def preopen_stock(r):
+    """One row of market-data-pre-open (metadata and detail.preOpenMarket) -> the preopen.json stock, or None."""
+    meta = r.get("metadata") if isinstance(r, dict) else None
+    if not isinstance(meta, dict) or not str(meta.get("symbol") or "").strip():
+        return None
+    book = ((r.get("detail") or {}).get("preOpenMarket") or {}) if isinstance(r.get("detail"), dict) else {}
+    iep = num(meta.get("iep"))
+    return {"symbol": str(meta["symbol"]).strip().upper(), "series": str(meta.get("series") or "").strip().upper(),
+            "iep": num(book.get("IEP")) if iep is None else iep, "prev_close": num(meta.get("previousClose")),
+            "change_pct": num(meta.get("pChange")), "final_qty": _int(meta.get("finalQuantity")),
+            "total_buy_qty": _int(book.get("totalBuyQuantity")), "total_sell_qty": _int(book.get("totalSellQuantity")),
+            "turnover": num(meta.get("totalTurnover"))}
+
+
+def parse_preopen(doc, key):
+    """/api/market-data-pre-open answer -> the preopen.json document (without fetched_at). `key` is the
+    name kept in the file (NIFTY50, ALL, FO, SME, OTHERS). An empty data list ("No Data Found") raises."""
+    rows = doc.get("data") if isinstance(doc, dict) else None
+    if not isinstance(rows, list):
+        raise SourceError("nse-api", "the pre-open answer has no data list", "NSE changed the feed, or this is a bot wall")
+    stocks = sorted((s for s in map(preopen_stock, rows) if s), key=lambda s: s["symbol"])
+    if not stocks:
+        raise DataError("NSE has no pre-open data for %s (%s); nothing written. The book fills 09:00 to 09:08 IST "
+                        "on a trading day; the key must be one of %s" % (
+                            key, doc.get("msg") or "empty list", ", ".join(PREOPEN_KEYS)))
+    stamp_text = str(doc.get("timestamp") or "").strip()
+    try:
+        day = parse_date(stamp_text).isoformat()
+    except DataError:
+        day = None
+
+    def count(name, test):
+        given = _int(doc.get(name))
+        return given if given is not None else sum(1 for s in stocks if s["change_pct"] is not None
+                                                   and test(s["change_pct"]))
+    return {"key": key, "timestamp": stamp_text or None, "date": day,
+            "advances": count("advances", lambda p: p > 0), "declines": count("declines", lambda p: p < 0),
+            "unchanged": count("unchanged", lambda p: p == 0), "stocks": stocks}
+
+
+def preopen_clock(stamp_text):
+    """The time of day in NSE's pre-open timestamp ("30-Oct-2026 09:09:07"), or None."""
+    m = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*$", str(stamp_text or ""))
+    return datetime.time(int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)) if m else None
+
+
+def preopen_line(s):
+    ratio = (s["total_buy_qty"] / float(s["total_sell_qty"])
+             if s["total_buy_qty"] is not None and s["total_sell_qty"] else None)
+    return "  %-12s IEP %9s  prev %9s  %+6.2f%%  matched %10s  turnover Rs %7.2f cr  buy/sell %s" % (
+        s["symbol"], fmt(s["iep"]) or "?", fmt(s["prev_close"]) or "?", s["change_pct"],
+        format(s["final_qty"] or 0, ","), (s["turnover"] or 0) / 1e7, "n/a" if ratio is None else "%.2fx" % ratio)
+
+
+def cmd_preopen(a):
+    now = parse_now(a.now)
+    key = a.key
+    got = nse_api(Session(a.data), "/api/market-data-pre-open?key=%s" % urllib.parse.quote(PREOPEN_KEYS[key]),
+                  PREOPEN_REFERER)
+    doc = parse_preopen(got, key)
+    doc["fetched_at"] = stamp(now)
+    order = ["key", "timestamp", "date", "fetched_at", "advances", "declines", "unchanged", "stocks"]
+    _write_json(preopen_path(a.data), dict((k, doc[k]) for k in order))
+    stocks = doc["stocks"]
+    print("Pre-open book for %s at %s: %d stock(s), %d advancing, %d declining, %d unchanged" % (
+        key, doc["timestamp"] or "an unknown time", len(stocks), doc["advances"], doc["declines"], doc["unchanged"]))
+    clock = preopen_clock(doc["timestamp"])
+    if clock is not None and clock < PREOPEN_ORDERS_END:
+        print("  INDICATIVE: the order window (09:00 to 09:08 IST) is still open, so orders can be changed or "
+              "cancelled and every IEP below can move.")
+    else:
+        print("  The order window (09:00 to 09:08 IST) has closed; these are the matched prices, but the 09:15 "
+              "open can still differ.")
+    live = [s for s in stocks if s["change_pct"] is not None and s["final_qty"]]
+    ups = sorted((s for s in live if s["change_pct"] > 0), key=lambda s: -s["change_pct"])[:PREOPEN_TOP]
+    downs = sorted((s for s in live if s["change_pct"] < 0), key=lambda s: s["change_pct"])[:PREOPEN_TOP]
+    for title, rows in (("Top gap-ups (indicative equilibrium price over the previous close)", ups),
+                        ("Top gap-downs", downs)):
+        print(title + (":" if rows else ": none"))
+        for s in rows:
+            print(preopen_line(s))
+    buy = sum(s["total_buy_qty"] or 0 for s in stocks)
+    sell = sum(s["total_sell_qty"] or 0 for s in stocks)
+    if buy and sell:
+        print("Order imbalance: buy quantity %s, sell quantity %s (buy/sell %.2fx, %s)" % (
+            format(buy, ","), format(sell, ","), buy / float(sell),
+            "more buyers than sellers" if buy > sell * 1.05 else "more sellers than buyers" if sell > buy * 1.05
+            else "balanced"))
+    else:
+        print("Order imbalance: no buy and sell quantities in the answer.")
+    print("Pre-open runs 09:00 to 09:08 IST (orders in, changed and cancelled), matching to 09:12, the normal market "
+          "opens at 09:15. Gaps are a hint to look closer, not a signal; thin stocks gap on a few lots. Wrote %s." % (
+              show_path(preopen_path(a.data))))
     return 0
 
 
@@ -3125,6 +3412,9 @@ def probes(now_ist):
         ("nse-index", "index", index_url(bd), "index"),
         ("nse-chain", "cal", NSE + "/api/option-chain-contract-info?symbol=NIFTY", "chain"),
         ("nse-reports", "cal", NSE + "/api/daily-reports?key=CM", "reports"),
+        ("nse-flows", "market", NSE + "/api/fiidiiTradeReact", "flows"),
+        ("nse-preopen", "market", NSE + "/api/market-data-pre-open?key=" + urllib.parse.quote(PREOPEN_KEYS["NIFTY50"]),
+         "preopen"),
         ("nsearchives", "price", bhav_urls(bd)[0], "bhav"),
         ("niftyindices", "list", NIFTY_LIST, "csv"),
         ("google-news", "news", GNEWS, "rss"),
@@ -3148,6 +3438,18 @@ def check_body(kind, code, body):
             return "priceInfo" in json.loads(body), ""
         except ValueError:
             return False, "not JSON (bot wall)"
+    if kind == "flows":
+        try:
+            doc = json.loads(body)
+        except ValueError:
+            return False, "not JSON (bot wall)"
+        return bool(parse_flows(doc)) if isinstance(doc, list) else False, "no FII/DII rows in the answer"
+    if kind == "preopen":
+        try:
+            rows = json.loads(body).get("data")
+        except (ValueError, AttributeError):
+            return False, "not JSON (bot wall)"
+        return isinstance(rows, list) and bool(rows), "no pre-open rows (empty outside the pre-open session, or a changed feed)"
     if kind in ("holidays", "circulars", "actions", "reports", "chain"):
         try:
             doc = json.loads(body)
@@ -3187,9 +3489,9 @@ def cmd_doctor(a):
                 hdr["Range"] = "bytes=0-2047"
             if name == "nse-api":
                 hdr.update({"Accept": "application/json", "Referer": NSE + "/get-quotes/equity?symbol=RELIANCE"})
-            if check in ("holidays", "circulars", "actions", "reports", "chain"):
-                ref = {"actions": ACTIONS_REFERER, "reports": REPORTS_REFERER, "chain": CHAIN_REFERER}.get(
-                    check, CAL_REFERER)
+            if check in ("holidays", "circulars", "actions", "reports", "chain", "flows", "preopen"):
+                ref = {"actions": ACTIONS_REFERER, "reports": REPORTS_REFERER, "chain": CHAIN_REFERER,
+                       "flows": FLOWS_REFERER, "preopen": PREOPEN_REFERER}.get(check, CAL_REFERER)
                 hdr.update({"Accept": "application/json", "Referer": ref, "X-Requested-With": "XMLHttpRequest"})
             code, body = sess.get(url, hdr, timeout=a.timeout, gap=0, retries=0)   # a probe reports the first answer
             ok, why = check_body(check, code, body)
@@ -3210,7 +3512,7 @@ def cmd_doctor(a):
     doc = {"checked_at": stamp(), "price_sources_ok": price_ok, "sources": results}
     _write_json(os.path.join(a.data, "sources.json"), doc)
     if price_ok:
-        print("Price data OK via: %s. Wrote %s." % (", ".join(price_ok), os.path.join(a.data, "sources.json")))
+        print("Price data OK via: %s. Wrote %s." % (", ".join(price_ok), show_path(os.path.join(a.data, "sources.json"))))
         return 0
     print("No free price source works from this machine. Use the Kite MCP connector (get_historical_data, "
           "get_quotes) + import-kite, or download CSVs and import-csv.")
@@ -3270,7 +3572,7 @@ def cmd_record(a):
     prov["source"] = sorted(set(str(v.get("source")) for v in prov["files"].values() if v.get("source")))
     prov["problems"] = errors
     _write_json(os.path.join(out, "provenance.json"), prov)
-    print("Recorded %s into %s: %s." % (sym, out, ", ".join(sorted(prov["files"]))))
+    print("Recorded %s into %s: %s." % (sym, show_path(out), ", ".join(sorted(prov["files"]))))
     for e in errors:
         print("  " + e)
     return 0
@@ -3285,7 +3587,7 @@ def cmd_status(a):
     files = sorted(f for f in (os.listdir(dd) if os.path.isdir(dd) else []) if f.endswith(".csv"))
     print("Last complete NSE session: %s" % end)
     if not files:
-        print("No daily cache in %s. Run: data.py daily RELIANCE" % dd)
+        print("No daily cache in %s. Run: data.py daily RELIANCE" % show_path(dd))
     for f in files:
         rows = read_daily(os.path.join(dd, f))
         if not rows:
@@ -3324,8 +3626,8 @@ def cmd_status(a):
             ", ".join(str(y) for y in cal["years"]) or "none", len(cal["holidays"]), cal["fetched_at"],
             cal["last_circular_check"]))
     else:
-        print("calendar.json: none (built-in tables cover %s)" % ", ".join(str(y) for y in CALENDAR_YEARS))
-    if not calendar_known(now.year):
+        print("calendar.json: none (built-in tables cover %s)" % years_text())
+    if not calendar_known(now.date()):
         print("  no holiday list for %d: run data.py calendar" % now.year)
     b = _read_json(os.path.join(a.data, "bands.json"), None)
     if b:
@@ -3395,6 +3697,12 @@ def main(argv=None):
     p.add_argument("symbols", nargs="*", help="default: every symbol with a delivery file")
     p.add_argument("--window", type=int, default=DELIVERY_WINDOW, help="sessions for the means (default 30)")
     p.add_argument("--no-fetch", action="store_true", help="use the cached delivery files only")
+    p = sub.add_parser("flows", help="FII/DII cash-market flows into flows.csv (a context hint)")
+    common(p)
+    p.add_argument("--no-fetch", action="store_true", help="summarise the cached flows.csv only")
+    p = sub.add_parser("preopen", help="pre-open book: gap-ups, gap-downs, order imbalance into preopen.json")
+    common(p)
+    p.add_argument("--key", default="NIFTY50", choices=list(PREOPEN_KEYS), help="which book (default NIFTY50)")
     p = sub.add_parser("calendar", help="refresh the NSE holiday calendar (calendar.json)")
     common(p)
     p.add_argument("--refresh", action="store_true", help="refetch the holiday list and the circulars now")
@@ -3436,20 +3744,22 @@ def main(argv=None):
         ap.print_help()
         return 1
     global _CAL
-    saved, _CAL = _CAL, load_calendar(a.data)
+    saved, _CAL = _CAL, apply_calendar(os.path.join(a.data, CALENDAR_FILE))
     try:
         return {"daily": cmd_daily, "intraday": cmd_intraday, "bands": cmd_bands, "import-kite": cmd_import_kite,
                 "import-csv": cmd_import_csv, "calendar": cmd_calendar, "delivery": cmd_delivery,
                 "actions": cmd_actions, "adjust": cmd_adjust, "index": cmd_index, "chain": cmd_chain,
-                "doctor": cmd_doctor, "record": cmd_record, "status": cmd_status}[a.cmd](a)
+                "flows": cmd_flows, "preopen": cmd_preopen, "doctor": cmd_doctor, "record": cmd_record,
+                "status": cmd_status}[a.cmd](a)
     except DataError as e:
-        print("data.py: %s" % e, file=sys.stderr)
+        print("data.py: %s" % show_path(e), file=sys.stderr)
         return 1
     except OSError as e:
-        print("data.py: %s" % e, file=sys.stderr)
+        print("data.py: %s" % show_path(e), file=sys.stderr)
         return 1
     finally:
         _CAL = saved
+        apply_calendar()      # back to the built-in tables plus the working directory's calendar.json
 
 
 if __name__ == "__main__":

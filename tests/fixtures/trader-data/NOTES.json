@@ -1,6 +1,7 @@
 {
  "what": "format samples for trader-data tests",
  "real_values": "OHLCV numbers are NSE bhavcopy values for a few October 2026 sessions",
+ "live_captures": "the *-live.json files are real NSE answers recorded on 2026-10-30, trimmed to a few rows",
  "synthetic": [
   "yahoo-5m-RELIANCE.json",
   "nse-chart-RELIANCE.json",

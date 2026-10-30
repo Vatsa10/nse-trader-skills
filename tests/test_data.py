@@ -6,6 +6,7 @@ import http.cookiejar
 import io
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -96,7 +97,7 @@ class Net(unittest.TestCase):
         px = {"RELIANCE": 1185.0, "TCS": 2520.0}[sym]   # near the bhavcopy fixtures, so no split warning
         d, rows = datetime.date(2026, 9, 1), []
         while d.isoformat() <= upto:
-            if d.weekday() < 5 and d.isoformat() not in data.NSE_HOLIDAYS_2026:
+            if d.weekday() < 5 and d.isoformat() not in data.NSE_HOLIDAYS:
                 rows.append(data.bar(d.isoformat(), px, px + 5, px - 5, px, 1000000))
             d += datetime.timedelta(days=1)
         data.write_daily(data.data_paths(self.dd, sym)[0], rows)
@@ -105,25 +106,54 @@ class Net(unittest.TestCase):
 # ---------------------------------------------------------------- calendar
 
 class Calendar(unittest.TestCase):
-    def test_2026_reuses_trader_alerts(self):
-        self.assertEqual(data.NSE_HOLIDAYS_2026, {k: v for k, v in alerts.NSE_HOLIDAYS.items()
-                                                  if k.startswith("2026-")})
-        self.assertEqual(data.NSE_HOLIDAYS_2026_COPY, data.NSE_HOLIDAYS_2026)
-        self.assertIn("2026-01-15", data.HOLIDAYS)   # BMC election closure
+    def test_2026_holds_the_bmc_election_closure(self):
+        self.assertIn("2026-01-15", data.BUILTIN_HOLIDAYS)
+        self.assertEqual(data.BUILTIN_YEARS, (2024, 2025, 2026))
+        self.assertEqual(data.CALENDAR_YEARS, data.BUILTIN_YEARS)           # no calendar.json in the working directory
 
     def test_2025_matches_the_nse_circular(self):
         want = ["2025-02-26", "2025-03-14", "2025-03-31", "2025-04-10", "2025-04-14", "2025-04-18", "2025-05-01",
                 "2025-08-15", "2025-08-27", "2025-10-02", "2025-10-21", "2025-10-22", "2025-11-05", "2025-12-25"]
-        self.assertEqual(sorted(data.NSE_HOLIDAYS_2025), want)
-        for d in list(data.NSE_HOLIDAYS_2025) + list(data.NSE_HOLIDAYS_2024):
+        self.assertEqual(sorted(k for k in data.BUILTIN_HOLIDAYS if k.startswith("2025-")), want)
+        for d in data.BUILTIN_HOLIDAYS:
             self.assertLess(datetime.date.fromisoformat(d).weekday(), 5, d)
+
+    def test_the_canonical_block_is_in_place_verbatim(self):
+        begin, end = "# --- nse calendar: keep byte-identical", "# --- end nse calendar ---"
+
+        def block(path):
+            text = rd(path).replace("\\r\\n", "\\n")
+            return text[text.index(begin):text.index(end) + len(end)]
+        self.assertEqual(block(os.path.join(ROOT, "trader-data", "data.py")),
+                         block(os.path.join(ROOT, "reference", "specs", "nse_calendar.py")))
+
+    def test_a_muhurat_bar_is_valid(self):
+        self.assertFalse(data.trading_day(datetime.date(2025, 10, 21))[0])         # the regular market is closed
+        rows = [data.bar("2025-10-20", 1, 1, 1, 1, 1), data.bar("2025-10-21", 1, 1, 1, 1, 1),
+                data.bar("2025-10-23", 1, 1, 1, 1, 1)]
+        errs, warns = data.validate_daily(rows)
+        self.assertEqual(errs, [])
+        self.assertFalse(any("NSE was closed" in w for w in warns), warns)
+        self.assertEqual(data.closed_name("2026-01-26"), "Republic Day")
+        self.assertEqual(data.closed_name("2026-10-24"), "weekend")
+
+    def test_a_run_restores_the_calendar(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        wr(os.path.join(tmp, "calendar.json"), json.dumps({"years": [2027], "holidays": {"2027-01-26": "Republic Day"}}))
+        code, out, _ = run(["status", "--data", tmp, "--now", "2027-03-08 10:00"])
+        self.assertIn("calendar.json: years 2027", out)
+        self.assertEqual(data.CALENDAR_YEARS, data.BUILTIN_YEARS)                  # back to the built-in tables
+        self.assertNotIn("2027-01-26", data.NSE_HOLIDAYS)
+        self.assertIsNone(data._CAL)
 
     def test_trading_days(self):
         D = datetime.date
-        self.assertFalse(data.trading_day(D(2026, 10, 20)))       # Dussehra
-        self.assertFalse(data.trading_day(D(2026, 10, 24)))       # Saturday
-        self.assertTrue(data.trading_day(D(2025, 2, 1)))          # budget Saturday
-        self.assertTrue(data.trading_day(D(2025, 10, 21)))        # Muhurat
+        self.assertFalse(data.bars_expected(D(2026, 10, 20)))       # Dussehra
+        self.assertFalse(data.bars_expected(D(2026, 10, 24)))       # Saturday
+        self.assertTrue(data.bars_expected(D(2025, 2, 1)))          # budget Saturday
+        self.assertTrue(data.bars_expected(D(2025, 10, 21)))      # Muhurat: a bar exists
+        self.assertFalse(data.trading_day(D(2025, 10, 21))[0])    # but the regular market is closed
         self.assertEqual(data.prev_trading_day(D(2026, 10, 21)), D(2026, 10, 19))
         self.assertEqual(data.last_complete_session(datetime.datetime(2026, 10, 23, 17, 0)), D(2026, 10, 22))
         self.assertEqual(data.last_complete_session(datetime.datetime(2026, 10, 23, 18, 30)), D(2026, 10, 23))
@@ -139,6 +169,7 @@ class CalendarFile(Net):
         Net.setUp(self)
         self.cal_path = os.path.join(self.dd, "calendar.json")
         self.addCleanup(setattr, data, "_CAL", None)
+        self.addCleanup(data.apply_calendar)
 
     def feed(self, master=None, circ=None):
         return self.net([("api/holiday-master", 200, master if master is not None else fx("nse-holiday-master.json")),
@@ -149,7 +180,7 @@ class CalendarFile(Net):
         return json.loads(rd(self.cal_path))
 
     def use(self):
-        data._CAL = data.load_calendar(self.dd)
+        data._CAL = data.apply_calendar(self.cal_path)
         return data._CAL
 
     def test_fetch_writes_the_contract(self):
@@ -183,21 +214,21 @@ class CalendarFile(Net):
         self.feed()
         self.run_d("calendar", "--now", self.NOW)
         self.assertIsNotNone(self.use())
-        self.assertFalse(data.trading_day(D(2027, 1, 26)))      # listed holiday
-        self.assertFalse(data.trading_day(D(2027, 4, 8)))       # closure from a circular
-        self.assertTrue(data.trading_day(D(2027, 3, 6)))        # Saturday with a live session
-        self.assertTrue(data.trading_day(D(2027, 10, 29)))      # Muhurat: bars exist
-        self.assertFalse(data.trading_day(D(2027, 2, 14)))      # Sunday
-        self.assertFalse(data.trading_day(D(2027, 8, 15)))      # Sunday holiday: weekend either way
-        self.assertTrue(data.trading_day(D(2027, 8, 16)))       # a covered year: unlisted weekday is open
-        self.assertTrue(data.trading_day(D(2027, 12, 24)))
-        self.assertFalse(data.trading_day(D(2026, 10, 20)))     # 2026 not in the file: built-in Dussehra
-        self.assertTrue(data.trading_day(D(2028, 1, 26)))       # uncovered year: built-in tables say open
-        self.assertTrue(data.calendar_known(2027))
-        self.assertFalse(data.calendar_known(2028))
+        self.assertFalse(data.bars_expected(D(2027, 1, 26)))      # listed holiday
+        self.assertFalse(data.bars_expected(D(2027, 4, 8)))       # closure from a circular
+        self.assertTrue(data.bars_expected(D(2027, 3, 6)))        # Saturday with a live session
+        self.assertTrue(data.bars_expected(D(2027, 10, 29)))      # Muhurat: bars exist
+        self.assertFalse(data.bars_expected(D(2027, 2, 14)))      # Sunday
+        self.assertFalse(data.bars_expected(D(2027, 8, 15)))      # Sunday holiday: weekend either way
+        self.assertTrue(data.bars_expected(D(2027, 8, 16)))       # a covered year: unlisted weekday is open
+        self.assertTrue(data.bars_expected(D(2027, 12, 24)))
+        self.assertFalse(data.bars_expected(D(2026, 10, 20)))     # 2026 not in the file: built-in Dussehra
+        self.assertTrue(data.bars_expected(D(2028, 1, 26)))       # uncovered year: built-in tables say open
+        self.assertTrue(data.calendar_known(D(2027, 6, 1)))
+        self.assertFalse(data.calendar_known(D(2028, 6, 1)))
         self.assertEqual(data.prev_trading_day(D(2027, 1, 27)), D(2027, 1, 25))
-        data._CAL = None
-        self.assertTrue(data.trading_day(D(2027, 1, 26)))       # without the file Jan 2027 is not known
+        data._CAL = data.apply_calendar(os.path.join(self.tmp, "none.json"))
+        self.assertTrue(data.bars_expected(D(2027, 1, 26)))       # without the file Jan 2027 is not known
 
     def test_a_failed_fetch_leaves_the_builtin_answer(self):
         self.net([("", 403, b"Access Denied")])
@@ -205,9 +236,9 @@ class CalendarFile(Net):
         self.assertEqual(code, 1)
         self.assertIn("built-in tables stay in force", out)
         self.assertFalse(os.path.exists(self.cal_path))
-        self.assertIsNone(data.load_calendar(self.dd))
-        self.assertTrue(data.trading_day(datetime.date(2027, 1, 26)))
-        self.assertFalse(data.trading_day(datetime.date(2026, 10, 20)))
+        self.assertIsNone(data.load_calendar(self.cal_path))
+        self.assertTrue(data.bars_expected(datetime.date(2027, 1, 26)))
+        self.assertFalse(data.bars_expected(datetime.date(2026, 10, 20)))
 
     def test_bot_wall_html_is_not_a_calendar(self):
         self.net([("api/holiday-master", 200, b"<html>Access Denied</html>"), ("api/circulars", 200, b"[]"),
@@ -270,17 +301,17 @@ class CalendarFile(Net):
         self.use()
         self.assertEqual(self.cal()["special_sessions"]["2027-10-31"], "Diwali Laxmi Pujan (Muhurat)")
         self.assertNotIn("2027-10-31", self.cal()["holidays"])
-        self.assertTrue(data.trading_day(datetime.date(2027, 10, 31)))
+        self.assertTrue(data.bars_expected(datetime.date(2027, 10, 31)))
 
     def test_corrupt_or_wrong_shape_file_means_builtin(self):
         os.makedirs(self.dd)
         for text in ("{not json", "[]", '{"years": [2027], "holidays": [1, 2]}', '{"years": "x"}', ""):
             wr(self.cal_path, text)
-            self.assertIsNone(data.load_calendar(self.dd), text)
+            self.assertIsNone(data.load_calendar(self.cal_path), text)
             code, out, _ = self.run_d("status", "--now", self.NOW)
             self.assertEqual(code, 0)
             self.assertIn("calendar.json: none", out)
-            self.assertTrue(data.trading_day(datetime.date(2027, 1, 26)))
+            self.assertTrue(data.bars_expected(datetime.date(2027, 1, 26)))
         wr(self.cal_path, "{not json")
         self.feed()
         code, out, _ = self.run_d("calendar", "--now", self.NOW)
@@ -297,15 +328,15 @@ class CalendarFile(Net):
         self.use()
         for d in (D(2027, 1, 26), D(2027, 4, 8), D(2027, 3, 22), D(2027, 2, 14)):
             self.assertFalse(alerts.trading_day(d)[0], d)
-            self.assertFalse(data.trading_day(d), d)
+            self.assertFalse(data.bars_expected(d), d)
         self.assertTrue(alerts.trading_day(D(2027, 3, 6))[0])                       # live Saturday session
         self.assertTrue(alerts.trading_day(D(2027, 10, 29))[1].startswith("special session"))   # Muhurat
-        self.assertTrue(data.trading_day(D(2027, 10, 29)))
+        self.assertTrue(data.bars_expected(D(2027, 10, 29)))
 
     def test_bad_keys_in_the_file_are_dropped(self):
         os.makedirs(self.dd)
         wr(self.cal_path, json.dumps({"years": [2027], "holidays": {"2027-01-26": "Republic Day", "soon": "x"}}))
-        cal = data.load_calendar(self.dd)
+        cal = data.load_calendar(self.cal_path)
         self.assertEqual(cal["holidays"], {"2027-01-26": "Republic Day"})
         self.assertEqual(cal["special_sessions"], {})
         self.assertEqual(cal["warnings"], [])
@@ -1938,6 +1969,17 @@ class IndexParse(unittest.TestCase):
         self.assertEqual(data.parse_index_history({"data": []}), [])
         self.assertEqual(data.parse_index_history({}), [])
 
+    def test_history_live_shapes(self):
+        # real captures: {"data": [...]}, upper-case months; indices come newest first, the VIX oldest first
+        idx = data.parse_index_history(json.loads(fx("nse-index-history-live.json")))
+        self.assertEqual([(r["date"], r["close"]) for r in idx], [
+            ("2026-10-26", 22753.2), ("2026-10-27", 22749.75), ("2026-10-28", 22698.85), ("2026-10-29", 22936.75)])
+        self.assertEqual((idx[-1]["open"], idx[-1]["high"], idx[-1]["low"]), (22690.65, 22961.95, 22656.75))
+        vix = data.parse_index_history(json.loads(fx("nse-vix-history-live.json")))
+        self.assertEqual([(r["date"], r["close"]) for r in vix], [
+            ("2026-10-26", 17.16), ("2026-10-27", 16.4), ("2026-10-28", 16.25), ("2026-10-29", 15.12)])
+        self.assertEqual((vix[0]["open"], vix[0]["high"], vix[0]["low"]), (16.86, 18.0025, 16.86))
+
     def test_valuation_rule_of_thumb(self):
         v = data.pe_verdict
         self.assertEqual((data.PE_EXPENSIVE, data.PE_CHEAP, data.PE_MIN_ROWS), (25.0, 20.0, 250))
@@ -2074,16 +2116,17 @@ class IndexCommand(Net):
         self.assertEqual(code, 1)
         self.assertIn("not the index snapshot", out)
 
-    def test_history_backfill_in_yearly_chunks(self):
+    def test_history_backfill_in_short_chunks(self):
         f = self.archive()
         f = self.net([("historicalOR/indicesHistory", 200, fx("nse-index-history-NIFTY50.json")),
                       ("historicalOR/vixhistory", 200, fx("nse-vix-history.json"))] + f.rules)
         code, out, _ = self.run_d("index", "NIFTY 50", "--days", "2", "--years", "1", "--now", self.NOW)
         self.assertEqual(code, 0, out)
         hist = f.urls("indicesHistory")
-        self.assertEqual(len(hist), 1)
-        self.assertIn("indexType=NIFTY%2050&from=23-10-2025&to=21-10-2026", hist[0])          # up to the first cached day
-        self.assertIn("from=23-10-2025&to=21-10-2026", f.urls("vixhistory")[0])
+        self.assertEqual(len(hist), 4)                          # 364 days up to the first cached day, 120 a request
+        self.assertIn("indexType=NIFTY%2050&from=23-10-2025&to=19-02-2026", hist[0])
+        self.assertIn("&to=21-10-2026", hist[-1])
+        self.assertIn("from=23-10-2025&to=19-02-2026", f.urls("vixhistory")[0])
         rows = data.read_index(data.index_path(self.dd, "NIFTY 50"))
         self.assertEqual([r["date"] for r in rows], ["2026-10-19", "2026-10-21", "2026-10-22", "2026-10-23"])
         self.assertEqual([r["pe"] for r in rows], [None, None, 24.8, 25.0])        # history has no P/E, the archive does
@@ -2093,14 +2136,69 @@ class IndexCommand(Net):
                          [("2026-10-19", 13.1), ("2026-10-21", 13.2), ("2026-10-22", 13.4), ("2026-10-23", 12.95)])
         self.assertEqual(self.csv_text("India VIX").splitlines()[1], "2026-10-19,13.2,13.4,12.9,13.1,,,,")
 
-    def test_a_long_backfill_is_chunked_by_year(self):
+    def test_a_long_backfill_is_chunked(self):
         f = self.net([("indicesHistory", 200, b'{"data": {"indexCloseOnlineRecords": []}}'),
                       ("vixhistory", 200, b'{"data": []}'), ("ind_close_all", 404, b""),
                       ("www.nseindia.com/", 200, b"home")])
         code, out, _ = self.run_d("index", "NIFTY 50", "--years", "3", "--now", self.NOW)
         hist = f.urls("indicesHistory")
-        self.assertEqual(len(hist), 4)                                              # 3 years and a day: 4 yearly chunks
+        self.assertEqual(len(hist), 10)                                             # 1097 days in chunks of 120
         self.assertIn("&to=23-10-2026", hist[-1])
+
+    def serve_history(self, tag, cap=data.HISTORY_CAP):
+        """A fake of NSE's history endpoint: every trading day in the asked range in the real answer shape
+        (upper-case month, newest first), cut off at `cap` rows the way NSE does."""
+        live = json.loads(fx("nse-%s-history-live.json" % tag))["data"][0]
+
+        def serve(url):
+            lo, hi = [datetime.datetime.strptime(re.search(k + r"=([\d-]+)", url).group(1), "%d-%m-%Y").date()
+                      for k in ("from", "to")]
+            recs = []
+            for d in reversed(data.trading_days(lo, hi)):
+                r = dict(live)
+                r["EOD_TIMESTAMP"] = d.strftime("%d-%b-%Y").upper()
+                r["EOD_CLOSE_INDEX_VAL"] = 20000.0 + d.toordinal() - 739000
+                recs.append(r)
+            return 200, json.dumps({"data": recs[:cap]}).encode()
+        return serve
+
+    def test_a_one_year_backfill_gets_every_session(self):
+        f = self.net([("indicesHistory", None, self.serve_history("index")),
+                      ("vixhistory", None, self.serve_history("vix")),
+                      ("ind_close_all", 404, b""), ("www.nseindia.com/", 200, b"home")])
+        code, out, _ = self.run_d("index", "NIFTY 50", "--years", "1", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        want = [d.isoformat() for d in data.trading_days(datetime.date(2025, 10, 23), datetime.date(2026, 10, 23))]
+        self.assertGreater(len(want), 200)                                          # far more than one 100 row answer
+        self.assertGreaterEqual(len(f.urls("indicesHistory")), 3)
+        self.assertGreaterEqual(len(f.urls("vixhistory")), 3)
+        for name in ("NIFTY 50", "India VIX"):
+            got = [r["date"] for r in data.read_index(data.index_path(self.dd, name))]
+            self.assertEqual(got, want, name)
+
+    def test_a_full_chunk_is_split_again(self):
+        self.addCleanup(setattr, data, "INDEX_CHUNK_DAYS", data.INDEX_CHUNK_DAYS)
+        data.INDEX_CHUNK_DAYS = 400                                                 # one request would be cut at 100 rows
+        f = self.net([("indicesHistory", None, self.serve_history("index")),
+                      ("vixhistory", None, self.serve_history("vix")),
+                      ("ind_close_all", 404, b""), ("www.nseindia.com/", 200, b"home")])
+        code, out, _ = self.run_d("index", "NIFTY 50", "--years", "1", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("NSE's cap", out)
+        want = [d.isoformat() for d in data.trading_days(datetime.date(2025, 10, 23), datetime.date(2026, 10, 23))]
+        self.assertEqual([r["date"] for r in data.read_index(data.index_path(self.dd, "NIFTY 50"))], want)
+        self.assertGreater(len(f.urls("indicesHistory")), 3)
+
+    def test_a_day_that_still_fills_the_cap_is_reported(self):
+        full = json.loads(fx("nse-index-history-live.json"))["data"][0]
+        recs = [dict(full, EOD_TIMESTAMP="%02d-OCT-2026" % (i % 28 + 1)) for i in range(100)]
+        self.net([("indicesHistory", 200, json.dumps({"data": recs}).encode()), ("www.nseindia.com/", 200, b"home")])
+        notes = []
+        rows = data.fetch_index_history(data.Session(self.dd), "NIFTY 50", datetime.date(2026, 10, 5),
+                                        datetime.date(2026, 10, 5), notes)
+        self.assertEqual(len(rows), 28)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("NSE's cap", notes[0])
 
     def test_history_failure_is_reported_and_keeps_the_archive_rows(self):
         self.archive()
@@ -2139,6 +2237,278 @@ class IndexCommand(Net):
         _, out, _ = self.run_d("status", "--now", self.NOW)
         self.assertIn("index/nifty-50.csv", out)
         self.assertIn("2 rows 2026-10-22..2026-10-23", out)
+
+
+# ---------------------------------------------------------------- FII / DII flows
+
+class FlowsCommand(Net):
+    NOW = "2026-10-29 19:00"
+    HEAD = "date,category,buy_cr,sell_cr,net_cr"
+
+    def feed(self, body=None, code=200):
+        return self.net([("api/fiidiiTradeReact", code, body if body is not None else fx("nse-fiidii-live.json")),
+                         ("www.nseindia.com/", 200, b"home")])
+
+    def lines(self):
+        return rd(data.flows_path(self.dd)).splitlines()
+
+    def test_parse_the_live_shape(self):
+        rows = data.parse_flows(json.loads(fx("nse-fiidii-live.json")))
+        self.assertEqual(rows, [
+            {"date": "2026-10-29", "category": "DII", "buy_cr": 18458.64, "sell_cr": 16534.23, "net_cr": 1924.41},
+            {"date": "2026-10-29", "category": "FII/FPI", "buy_cr": 13400.29, "sell_cr": 14343.89, "net_cr": -943.6}])
+        self.assertEqual(data.parse_flows([]), [])
+        junk = [{"category": "XYZ", "date": "29-Oct-2026", "buyValue": "1", "sellValue": "1"},
+                {"category": "DII", "date": "bad", "buyValue": "1", "sellValue": "1"},
+                {"category": "DII", "date": "29-Oct-2026", "buyValue": "-", "sellValue": "1"},
+                {"category": "FII/FPI", "date": "29-Oct-2026", "buyValue": "10", "sellValue": "4"}]
+        self.assertEqual([(r["category"], r["net_cr"]) for r in data.parse_flows(junk)], [("FII/FPI", 6.0)])
+        with self.assertRaises(data.DataError):
+            data.parse_flows({"oops": 1})
+
+    def test_writes_the_contract(self):
+        f = self.feed()
+        code, out, err = self.run_d("flows", "--now", self.NOW)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.lines(), [self.HEAD, "2026-10-29,DII,18458.64,16534.23,1924.41",
+                                        "2026-10-29,FII/FPI,13400.29,14343.89,-943.6"])
+        self.assertEqual(f.urls("fiidii")[0].split("nseindia.com")[1], "/api/fiidiiTradeReact")
+        self.assertIn("FII/DII cash-market flows for 2026-10-29", out)
+        self.assertIn("FII/FPI  buy    13,400.29  sell    14,343.89  net      -943.60", out)
+        self.assertIn("5-session needs 5 recorded days", out)
+        self.assertIn("1 day(s) recorded", out)                       # history is short and says so
+        self.assertIn("A context hint, not a signal", out)
+        self.assertIn("flows.csv (+2 row(s)", out)
+        self.assertNotIn("\\", out)
+
+    def test_the_same_day_replaces_and_never_duplicates(self):
+        self.feed()
+        self.run_d("flows", "--now", self.NOW)
+        revised = json.loads(fx("nse-fiidii-live.json"))
+        revised[1]["netValue"], revised[1]["sellValue"] = "-900.5", "14300.79"
+        self.feed(json.dumps(revised).encode())
+        code, out, _ = self.run_d("flows", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.lines(), [self.HEAD, "2026-10-29,DII,18458.64,16534.23,1924.41",
+                                        "2026-10-29,FII/FPI,13400.29,14300.79,-900.5"])
+        self.assertIn("(+0 row(s)", out)
+
+    def test_history_is_kept_ascending_and_summed(self):
+        days = data.trading_days(datetime.date(2026, 9, 1), datetime.date(2026, 10, 28))[-24:]
+        old = []
+        for d in days:
+            old.append({"date": d.isoformat(), "category": "FII/FPI", "buy_cr": 100.0, "sell_cr": 110.0, "net_cr": -10.0})
+            old.append({"date": d.isoformat(), "category": "DII", "buy_cr": 105.0, "sell_cr": 100.0, "net_cr": 5.0})
+        data.write_flows(self.dd, old[::-1])                                  # written out of order on purpose
+        self.feed()
+        code, out, _ = self.run_d("flows", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        got = self.lines()
+        self.assertEqual(len(got), 1 + 25 * 2)
+        dates = [x.split(",")[0] for x in got[1:]]
+        self.assertEqual(dates, sorted(dates))
+        self.assertEqual(got[-1], "2026-10-29,FII/FPI,13400.29,14343.89,-943.6")
+        self.assertIn("5-session net -983.60 (2026-10-23 to 2026-10-29)", out)
+        self.assertIn("20-session net -1,133.60", out)
+        self.assertIn("5-session net 1,944.41", out)
+        self.assertIn("20-session net 2,019.41", out)
+        self.assertNotIn("needs", out)
+
+    def test_an_old_answer_is_flagged_and_no_fetch_reads_the_cache(self):
+        self.feed()
+        code, out, _ = self.run_d("flows", "--now", "2026-10-30 19:00")
+        self.assertIn("NSE still shows 2026-10-29", out)
+        f = self.net([])
+        code, out, _ = self.run_d("flows", "--no-fetch")
+        self.assertEqual((code, f.calls), (0, []))
+        self.assertIn("DII", out)
+        code, _, err = run(["flows", "--no-fetch", "--data", os.path.join(self.tmp, "empty")])
+        self.assertEqual(code, 1)
+        self.assertIn("no flows cached", err)
+
+    def test_an_empty_answer_or_a_bot_wall_writes_nothing(self):
+        for body in (b"[]", b"<html>Access Denied</html>", b'{"x": 1}'):
+            self.feed(body)
+            code, out, err = self.run_d("flows", "--now", self.NOW)
+            self.assertEqual(code, 1, body)
+            self.assertFalse(os.path.exists(data.flows_path(self.dd)), body)
+        self.feed(b"", 403)
+        code, out, err = self.run_d("flows", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertIn("403", err)
+
+    def test_doctor_probes_it(self):
+        self.net([("api/fiidiiTradeReact", 200, fx("nse-fiidii-live.json")), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertTrue(s["nse-flows"]["ok"])
+        self.net([("api/fiidiiTradeReact", 200, b"[]"), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertFalse(s["nse-flows"]["ok"])
+        self.assertIn("no FII/DII rows", s["nse-flows"]["error"])
+
+
+# ---------------------------------------------------------------- pre-open book
+
+class PreopenCommand(Net):
+    NOW = "2026-10-30 09:10"
+    STOCK_KEYS = ["symbol", "series", "iep", "prev_close", "change_pct", "final_qty", "total_buy_qty",
+                  "total_sell_qty", "turnover"]
+
+    def feed(self, body=None, code=200):
+        return self.net([("api/market-data-pre-open", code,
+                          body if body is not None else fx("nse-preopen-NIFTY50-live.json")),
+                         ("www.nseindia.com/", 200, b"home")])
+
+    def saved(self):
+        return json.loads(rd(os.path.join(self.dd, "preopen.json")))
+
+    def test_writes_the_contract(self):
+        f = self.feed()
+        code, out, err = self.run_d("preopen", "--now", self.NOW)
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(f.urls("pre-open")[0].endswith("/api/market-data-pre-open?key=NIFTY%2050"))
+        doc = self.saved()
+        self.assertEqual(list(doc), ["key", "timestamp", "date", "fetched_at", "advances", "declines", "unchanged",
+                                     "stocks"])
+        self.assertEqual((doc["key"], doc["timestamp"], doc["date"], doc["fetched_at"]),
+                         ("NIFTY50", "30-Oct-2026 09:09:07", "2026-10-30", "2026-10-30T03:40:00Z"))
+        self.assertEqual((doc["advances"], doc["declines"], doc["unchanged"]), (21, 21, 8))
+        self.assertEqual([s["symbol"] for s in doc["stocks"]],
+                         ["BAJFINANCE", "COALINDIA", "NESTLEIND", "TATACONSUM", "TATASTEEL", "TRENT"])
+        for s in doc["stocks"]:
+            self.assertEqual(list(s), self.STOCK_KEYS)
+        self.assertEqual(doc["stocks"][-1], {
+            "symbol": "TRENT", "series": "EQ", "iep": 3018.0, "prev_close": 2861.7, "change_pct": 5.46,
+            "final_qty": 30201, "total_buy_qty": 82070, "total_sell_qty": 58165, "turnover": 91146618.0})
+
+    def test_prints_gaps_and_the_imbalance(self):
+        self.feed()
+        code, out, _ = self.run_d("preopen", "--now", self.NOW)
+        lines = out.splitlines()
+        up = [l for l in lines if l.startswith("  ") and "%" in l]
+        self.assertTrue(up[0].lstrip().startswith("TRENT"), out)                   # biggest gap-up first
+        self.assertIn("+5.46%", up[0])
+        self.assertTrue(up[3].lstrip().startswith("NESTLEIND"), out)               # then the biggest gap-down first
+        self.assertIn("Top gap-ups", out)
+        self.assertIn("Top gap-downs", out)
+        self.assertIn("buy quantity 931,852, sell quantity 801,209 (buy/sell 1.16x, more buyers than sellers)", out)
+        self.assertIn("Pre-open runs 09:00 to 09:08 IST", out)
+        self.assertIn("not a signal", out)
+        self.assertIn("The order window (09:00 to 09:08 IST) has closed", out)
+        self.assertNotIn("INDICATIVE", out)
+
+    def test_before_09_08_it_says_indicative(self):
+        doc = json.loads(fx("nse-preopen-NIFTY50-live.json"))
+        doc["timestamp"] = "30-Oct-2026 09:05:30"
+        self.feed(json.dumps(doc).encode())
+        _, out, _ = self.run_d("preopen", "--now", "2026-10-30 09:06")
+        self.assertIn("INDICATIVE", out)
+        self.assertEqual(self.saved()["date"], "2026-10-30")
+
+    def test_keys_map_to_nse_keys(self):
+        for key, want in (("ALL", "key=ALL"), ("FO", "key=FO"), ("SME", "key=SME"), ("OTHERS", "key=OTHERS"),
+                          ("NIFTY50", "key=NIFTY%2050")):
+            f = self.feed(fx("nse-preopen-fo-live.json"))
+            code, out, err = self.run_d("preopen", "--key", key, "--now", self.NOW)
+            self.assertEqual(code, 0, out + err)
+            self.assertTrue(f.urls("pre-open")[0].endswith(want), (key, f.urls("pre-open")))
+            self.assertEqual(self.saved()["key"], key)
+        with self.assertRaises(SystemExit):
+            with redirect_stderr(io.StringIO()):
+                data.main(["preopen", "--key", "NIFTY", "--data", self.dd])            # plain NIFTY is not a key
+
+    def test_iep_falls_back_to_the_order_book(self):
+        doc = json.loads(fx("nse-preopen-NIFTY50-live.json"))
+        for r in doc["data"]:
+            del r["metadata"]["iep"]
+        s = data.parse_preopen(doc, "NIFTY50")["stocks"][-1]
+        self.assertEqual((s["symbol"], s["iep"]), ("TRENT", 3018.0))
+        self.assertEqual(data.parse_preopen({"data": [{"metadata": {"symbol": "X"}}], "timestamp": "bad"}, "FO")["date"],
+                         None)
+
+    def test_no_data_found_is_a_clear_message_and_writes_nothing(self):
+        for body in (b'{"data": [], "msg": "No Data Found"}', b'{"data": []}'):
+            self.feed(body)
+            code, out, err = self.run_d("preopen", "--key", "FO", "--now", self.NOW)
+            self.assertEqual(code, 1)
+            self.assertIn("NSE has no pre-open data for FO", err)
+            self.assertIn("nothing written", err)
+            self.assertFalse(os.path.exists(os.path.join(self.dd, "preopen.json")))
+        self.feed(b'{"data": [], "msg": "No Data Found"}')
+        _, _, err = self.run_d("preopen", "--now", self.NOW)
+        self.assertIn("No Data Found", err)
+        self.feed(b"<html>wall</html>")
+        code, _, err = self.run_d("preopen", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertFalse(os.path.exists(os.path.join(self.dd, "preopen.json")))
+
+    def test_doctor_probes_it(self):
+        f = self.net([("api/market-data-pre-open", 200, fx("nse-preopen-NIFTY50-live.json")), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertTrue(s["nse-preopen"]["ok"])
+        self.assertIn("key=NIFTY%2050", f.urls("pre-open")[0])
+        self.net([("api/market-data-pre-open", 200, b'{"data": [], "msg": "No Data Found"}'), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertFalse(s["nse-preopen"]["ok"])
+        self.assertIn("no pre-open rows", s["nse-preopen"]["error"])
+
+
+# ---------------------------------------------------------------- printed paths
+
+class PrintedPaths(Net):
+    """Every path shown to the user uses forward slashes, whatever the OS."""
+
+    def setUp(self):
+        Net.setUp(self)
+        self.dd = os.path.join(self.tmp, "sub\\data")        # a backslash in the folder name: it must not reach the screen
+
+    def clean(self, *argv, **kw):
+        code, out, err = self.run_d(*argv)
+        self.assertNotIn("\\", out + err, argv)
+        if kw.get("shows"):
+            self.assertIn(kw["shows"], out + err, argv)
+        return code, out, err
+
+    def test_helper(self):
+        self.assertEqual(data.show_path("trader/data\\calendar.json"), "trader/data/calendar.json")
+        self.assertEqual(data.show_path("C:\\a\\b.csv"), "C:/a/b.csv")
+        self.assertEqual(data.show_path(ValueError("[WinError 2] 'x\\y'")), "[WinError 2] 'x/y'")
+
+    def test_representative_commands(self):
+        self.clean("status", "--now", "2026-10-23 19:00", shows="No daily cache in ")
+        self.net([("api/fiidiiTradeReact", 200, fx("nse-fiidii-live.json")), ("www.nseindia.com/", 200, b"home")])
+        self.clean("flows", shows="flows.csv")
+        self.net([("api/market-data-pre-open", 200, fx("nse-preopen-NIFTY50-live.json")),
+                  ("www.nseindia.com/", 200, b"home")])
+        self.clean("preopen", shows="preopen.json")
+        self.net([("api/holiday-master", 200, fx("nse-holiday-master.json")),
+                  ("api/circulars", 200, fx("nse-circulars-cmtr.json")), ("www.nseindia.com/", 200, b"home")])
+        self.clean("calendar", "--now", "2027-03-08 10:00", shows="calendar.json")
+        self.net([("ind_close_all", 200, fx("ind_close_all_23102026.csv")), ("www.nseindia.com/", 200, b"home")])
+        self.clean("index", "--days", "1", "--now", "2026-10-23 19:00", shows="nifty-50.csv")
+        self.net([("quote-equity", 200, fx("nse-quote-RELIANCE.json")), ("www.nseindia.com/", 200, b"home")])
+        self.clean("bands", "RELIANCE", "--now", "2026-10-23 19:00", shows="bands.json")
+        self.clean("import-csv", os.path.join(DFIX, "nse-website-RELIANCE.csv"), "--symbol", "RELIANCE", shows="into ")
+        self.clean("record", "RELIANCE", "--no-fetch", "--out", os.path.join(self.tmp, "re\\al"), shows="Recorded")
+        self.net([("query1", 200, fx("yahoo-daily-RELIANCE.json")), ("", 403, b"")])
+        self.clean("doctor", "--now", "2026-10-23 19:00", shows="sources.json")
+
+    def test_errors_and_help(self):
+        code, out, err = self.clean("import-csv", os.path.join(self.tmp, "no\\such.csv"), "--symbol", "RELIANCE")
+        self.assertEqual(code, 1)
+        self.assertIn("such.csv", err)
+        code, out, err = self.clean("record", "ZZZZ", "--no-fetch", "--out", os.path.join(self.tmp, "r\\x"))
+        self.assertEqual(code, 1)
+        for cmd in ("daily", "index", "flows"):
+            with self.assertRaises(SystemExit):
+                with redirect_stdout(io.StringIO()) as buf:
+                    data.main([cmd, "--help"])
+            self.assertNotIn("\\", buf.getvalue())
+            self.assertIn("(default trader/data)", buf.getvalue())
 
 
 # ---------------------------------------------------------------- report readiness

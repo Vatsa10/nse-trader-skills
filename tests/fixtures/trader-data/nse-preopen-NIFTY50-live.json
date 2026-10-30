@@ -1,0 +1,568 @@
+{
+ "declines": 21,
+ "unchanged": 8,
+ "data": [
+  {
+   "metadata": {
+    "symbol": "NESTLEIND",
+    "identifier": "NESTLEINDEQN",
+    "series": "EQ",
+    "purpose": null,
+    "lastPrice": 1181,
+    "change": -7.6,
+    "pChange": -0.64,
+    "previousClose": 1188.6,
+    "finalQuantity": 1670,
+    "totalTurnover": 1972270,
+    "marketCap": 844505699956.29,
+    "yearHigh": 1553,
+    "yearLow": 1147.4,
+    "iep": 1181
+   },
+   "detail": {
+    "preOpenMarket": {
+     "preopen": [
+      {
+       "price": 1179,
+       "buyQty": 42,
+       "sellQty": 0
+      },
+      {
+       "price": 1179.3,
+       "buyQty": 12,
+       "sellQty": 0
+      },
+      {
+       "price": 1180,
+       "buyQty": 59,
+       "sellQty": 0
+      },
+      {
+       "price": 1180.1,
+       "buyQty": 91,
+       "sellQty": 0
+      },
+      {
+       "price": 1181,
+       "buyQty": 349,
+       "sellQty": 0,
+       "iep": true
+      },
+      {
+       "price": 1182.7,
+       "buyQty": 0,
+       "sellQty": 3
+      },
+      {
+       "price": 1184,
+       "buyQty": 0,
+       "sellQty": 20
+      },
+      {
+       "price": 1185,
+       "buyQty": 0,
+       "sellQty": 93
+      },
+      {
+       "price": 1186.4,
+       "buyQty": 0,
+       "sellQty": 601
+      },
+      {
+       "price": 1187,
+       "buyQty": 0,
+       "sellQty": 2
+      }
+     ],
+     "ato": {
+      "totalBuyQuantity": 0,
+      "totalSellQuantity": 0
+     },
+     "IEP": 1181,
+     "totalTradedVolume": 1670,
+     "finalPrice": 1181,
+     "finalQuantity": 1670,
+     "lastUpdateTime": "30-Oct-2026 09:09:21",
+     "totalSellQuantity": 20072,
+     "totalBuyQuantity": 15756,
+     "atoBuyQty": 0,
+     "atoSellQty": 0,
+     "Change": -7.6,
+     "perChange": -0.64,
+     "prevClose": 1188.6
+    }
+   }
+  },
+  {
+   "metadata": {
+    "symbol": "TATASTEEL",
+    "identifier": "TATASTEELEQN",
+    "series": "EQ",
+    "purpose": null,
+    "lastPrice": 168.5,
+    "change": -0.96,
+    "pChange": -0.57,
+    "previousClose": 169.46,
+    "finalQuantity": 79013,
+    "totalTurnover": 13313690,
+    "marketCap": 1394262716830.66,
+    "yearHigh": 224.4,
+    "yearLow": 160.06,
+    "iep": 168.5
+   },
+   "detail": {
+    "preOpenMarket": {
+     "preopen": [
+      {
+       "price": 168.43,
+       "buyQty": 50,
+       "sellQty": 0
+      },
+      {
+       "price": 168.45,
+       "buyQty": 10,
+       "sellQty": 0
+      },
+      {
+       "price": 168.46,
+       "buyQty": 16,
+       "sellQty": 0
+      },
+      {
+       "price": 168.49,
+       "buyQty": 30,
+       "sellQty": 0
+      },
+      {
+       "price": 168.5,
+       "buyQty": 2647,
+       "sellQty": 0,
+       "iep": true
+      },
+      {
+       "price": 168.51,
+       "buyQty": 0,
+       "sellQty": 3071
+      },
+      {
+       "price": 168.52,
+       "buyQty": 0,
+       "sellQty": 99
+      },
+      {
+       "price": 168.6,
+       "buyQty": 0,
+       "sellQty": 3
+      },
+      {
+       "price": 168.62,
+       "buyQty": 0,
+       "sellQty": 761
+      },
+      {
+       "price": 168.65,
+       "buyQty": 0,
+       "sellQty": 830
+      }
+     ],
+     "ato": {
+      "totalBuyQuantity": 0,
+      "totalSellQuantity": 0
+     },
+     "IEP": 168.5,
+     "totalTradedVolume": 79013,
+     "finalPrice": 168.5,
+     "finalQuantity": 79013,
+     "lastUpdateTime": "30-Oct-2026 09:09:08",
+     "totalSellQuantity": 340421,
+     "totalBuyQuantity": 203580,
+     "atoBuyQty": 0,
+     "atoSellQty": 0,
+     "Change": -0.96,
+     "perChange": -0.57,
+     "prevClose": 169.46
+    }
+   }
+  },
+  {
+   "metadata": {
+    "symbol": "BAJFINANCE",
+    "identifier": "BAJFINANCEEQN",
+    "series": "EQ",
+    "purpose": null,
+    "lastPrice": 934,
+    "change": -4.9,
+    "pChange": -0.52,
+    "previousClose": 938.9,
+    "finalQuantity": 12140,
+    "totalTurnover": 11338760,
+    "marketCap": 2541603369869.71,
+    "yearHigh": 1176.4,
+    "yearLow": 787.9,
+    "iep": 934
+   },
+   "detail": {
+    "preOpenMarket": {
+     "preopen": [
+      {
+       "price": 931,
+       "buyQty": 1117,
+       "sellQty": 0
+      },
+      {
+       "price": 932,
+       "buyQty": 535,
+       "sellQty": 0
+      },
+      {
+       "price": 932.5,
+       "buyQty": 25,
+       "sellQty": 0
+      },
+      {
+       "price": 933,
+       "buyQty": 16,
+       "sellQty": 0
+      },
+      {
+       "price": 933.4,
+       "buyQty": 10,
+       "sellQty": 0
+      },
+      {
+       "price": 933.9,
+       "buyQty": 0,
+       "sellQty": 1799
+      },
+      {
+       "price": 934,
+       "buyQty": 0,
+       "sellQty": 0,
+       "iep": true
+      },
+      {
+       "price": 934.2,
+       "buyQty": 0,
+       "sellQty": 1
+      },
+      {
+       "price": 934.25,
+       "buyQty": 0,
+       "sellQty": 19
+      },
+      {
+       "price": 935,
+       "buyQty": 0,
+       "sellQty": 1
+      },
+      {
+       "price": 936.9,
+       "buyQty": 0,
+       "sellQty": 100
+      }
+     ],
+     "ato": {
+      "totalBuyQuantity": 0,
+      "totalSellQuantity": 0
+     },
+     "IEP": 934,
+     "totalTradedVolume": 12140,
+     "finalPrice": 934,
+     "finalQuantity": 12140,
+     "lastUpdateTime": "30-Oct-2026 09:09:07",
+     "totalSellQuantity": 39460,
+     "totalBuyQuantity": 32357,
+     "atoBuyQty": 0,
+     "atoSellQty": 0,
+     "Change": -4.9,
+     "perChange": -0.52,
+     "prevClose": 938.9
+    }
+   }
+  },
+  {
+   "metadata": {
+    "symbol": "TATACONSUM",
+    "identifier": "TATACONSUMEQN",
+    "series": "EQ",
+    "purpose": null,
+    "lastPrice": 1028.45,
+    "change": 7.45,
+    "pChange": 0.73,
+    "previousClose": 1021,
+    "finalQuantity": 3531,
+    "totalTurnover": 3631456,
+    "marketCap": 667891977024,
+    "yearHigh": 1282.7,
+    "yearLow": 916,
+    "iep": 1028.45
+   },
+   "detail": {
+    "preOpenMarket": {
+     "preopen": [
+      {
+       "price": 1021,
+       "buyQty": 469,
+       "sellQty": 0
+      },
+      {
+       "price": 1021.05,
+       "buyQty": 5,
+       "sellQty": 0
+      },
+      {
+       "price": 1021.5,
+       "buyQty": 95,
+       "sellQty": 0
+      },
+      {
+       "price": 1026.1,
+       "buyQty": 50,
+       "sellQty": 0
+      },
+      {
+       "price": 1028.45,
+       "buyQty": 127,
+       "sellQty": 0,
+       "iep": true
+      },
+      {
+       "price": 1029,
+       "buyQty": 0,
+       "sellQty": 250
+      },
+      {
+       "price": 1029.5,
+       "buyQty": 0,
+       "sellQty": 50
+      },
+      {
+       "price": 1029.8,
+       "buyQty": 0,
+       "sellQty": 55
+      },
+      {
+       "price": 1029.9,
+       "buyQty": 0,
+       "sellQty": 2
+      },
+      {
+       "price": 1030,
+       "buyQty": 0,
+       "sellQty": 478
+      }
+     ],
+     "ato": {
+      "totalBuyQuantity": 0,
+      "totalSellQuantity": 0
+     },
+     "IEP": 1028.45,
+     "totalTradedVolume": 3531,
+     "finalPrice": 1028.45,
+     "finalQuantity": 3531,
+     "lastUpdateTime": "30-Oct-2026 09:09:07",
+     "totalSellQuantity": 17585,
+     "totalBuyQuantity": 19548,
+     "atoBuyQty": 0,
+     "atoSellQty": 0,
+     "Change": 7.45,
+     "perChange": 0.73,
+     "prevClose": 1021
+    }
+   }
+  },
+  {
+   "metadata": {
+    "symbol": "COALINDIA",
+    "identifier": "COALINDIAEQN",
+    "series": "EQ",
+    "purpose": null,
+    "lastPrice": 398,
+    "change": 4.9,
+    "pChange": 1.25,
+    "previousClose": 393.1,
+    "finalQuantity": 248238,
+    "totalTurnover": 98798724,
+    "marketCap": 950846577069.06,
+    "yearHigh": 491.25,
+    "yearLow": 369.6,
+    "iep": 398
+   },
+   "detail": {
+    "preOpenMarket": {
+     "preopen": [
+      {
+       "price": 397.5,
+       "buyQty": 30,
+       "sellQty": 0
+      },
+      {
+       "price": 397.6,
+       "buyQty": 150,
+       "sellQty": 0
+      },
+      {
+       "price": 397.65,
+       "buyQty": 162,
+       "sellQty": 0
+      },
+      {
+       "price": 397.8,
+       "buyQty": 12,
+       "sellQty": 0
+      },
+      {
+       "price": 398,
+       "buyQty": 579,
+       "sellQty": 0,
+       "iep": true
+      },
+      {
+       "price": 398.35,
+       "buyQty": 0,
+       "sellQty": 48
+      },
+      {
+       "price": 398.5,
+       "buyQty": 0,
+       "sellQty": 149
+      },
+      {
+       "price": 398.85,
+       "buyQty": 0,
+       "sellQty": 10
+      },
+      {
+       "price": 398.95,
+       "buyQty": 0,
+       "sellQty": 10
+      },
+      {
+       "price": 399,
+       "buyQty": 0,
+       "sellQty": 1447
+      }
+     ],
+     "ato": {
+      "totalBuyQuantity": 0,
+      "totalSellQuantity": 0
+     },
+     "IEP": 398,
+     "totalTradedVolume": 248238,
+     "finalPrice": 398,
+     "finalQuantity": 248238,
+     "lastUpdateTime": "30-Oct-2026 09:09:07",
+     "totalSellQuantity": 325506,
+     "totalBuyQuantity": 578541,
+     "atoBuyQty": 0,
+     "atoSellQty": 0,
+     "Change": 4.9,
+     "perChange": 1.25,
+     "prevClose": 393.1
+    }
+   }
+  },
+  {
+   "metadata": {
+    "symbol": "TRENT",
+    "identifier": "TRENTEQN",
+    "series": "EQ",
+    "purpose": null,
+    "lastPrice": 3018,
+    "change": 156.3,
+    "pChange": 5.46,
+    "previousClose": 2861.7,
+    "finalQuantity": 30201,
+    "totalTurnover": 91146618,
+    "marketCap": 1001321103770.81,
+    "yearHigh": 3399.7,
+    "yearLow": 2183.67,
+    "iep": 3018
+   },
+   "detail": {
+    "preOpenMarket": {
+     "preopen": [
+      {
+       "price": 3012,
+       "buyQty": 895,
+       "sellQty": 0
+      },
+      {
+       "price": 3015,
+       "buyQty": 618,
+       "sellQty": 0
+      },
+      {
+       "price": 3016,
+       "buyQty": 2,
+       "sellQty": 0
+      },
+      {
+       "price": 3017,
+       "buyQty": 370,
+       "sellQty": 0
+      },
+      {
+       "price": 3018,
+       "buyQty": 35614,
+       "sellQty": 0,
+       "iep": true
+      },
+      {
+       "price": 3019,
+       "buyQty": 0,
+       "sellQty": 20
+      },
+      {
+       "price": 3019.8,
+       "buyQty": 0,
+       "sellQty": 1
+      },
+      {
+       "price": 3019.9,
+       "buyQty": 0,
+       "sellQty": 7
+      },
+      {
+       "price": 3020,
+       "buyQty": 0,
+       "sellQty": 2404
+      },
+      {
+       "price": 3020.1,
+       "buyQty": 0,
+       "sellQty": 7
+      }
+     ],
+     "ato": {
+      "totalBuyQuantity": 0,
+      "totalSellQuantity": 0
+     },
+     "IEP": 3018,
+     "totalTradedVolume": 30201,
+     "finalPrice": 3018,
+     "finalQuantity": 30201,
+     "lastUpdateTime": "30-Oct-2026 09:09:08",
+     "totalSellQuantity": 58165,
+     "totalBuyQuantity": 82070,
+     "atoBuyQty": 0,
+     "atoSellQty": 0,
+     "Change": 156.3,
+     "perChange": 5.46,
+     "prevClose": 2861.7
+    }
+   }
+  }
+ ],
+ "advances": 21,
+ "timestamp": "30-Oct-2026 09:09:07",
+ "totalTradedValue": 1451100419,
+ "totalmarketcap": 105986466134523.55,
+ "totalTradedVolume": 1506064,
+ "niftyPreopenStatus": {
+  "pChange": "0.12",
+  "change": "27.75",
+  "lastPrice": "22964.5",
+  "status": "CLOSED"
+ }
+}
