@@ -21,16 +21,18 @@ description: >-
   with the Nifty 50 P/E, P/B, dividend yield and India VIX (`index`), summarises
   an index option chain (`chain`: put-call ratio, open interest walls, max
   pain, at-the-money strike), keeps the FII and DII cash-market flows day by
-  day (`flows`, a context hint), and
+  day (`flows`, a context hint), reads the pre-open book for gap-ups, gap-downs
+  and the buy/sell imbalance (`preopen`), and
   records real data as test fixtures. Use when the user says "get me
   RELIANCE history", "update my data", "download prices", "Yahoo is not
   working", "NSE blocked me", "what is the price band / circuit limit",
   "import this CSV", "is my data fresh", "corporate actions", "split",
   "bonus", "adjust for the split", "ex-date", "nifty pe", "is the market
   expensive", "vix", "option chain", "pcr", "max pain", "fii", "dii",
-  "fpi flows", "what are the institutions doing", or before a backtest,
+  "fpi flows", "what are the institutions doing", "pre-open", "preopen",
+  "gap up", "gap down", "how will the market open", or before a backtest,
   an investment check or a scan that needs daily bars.
-argument-hint: "[daily|intraday|bands|calendar|delivery|actions|adjust|index|chain|flows|doctor|status] [symbol]"
+argument-hint: "[daily|intraday|bands|calendar|delivery|actions|adjust|index|chain|flows|preopen|doctor|status] [symbol]"
 ---
 
 # trader-data
@@ -67,6 +69,8 @@ python3 "${CLAUDE_SKILL_DIR}/data.py" chain NIFTY                          # opt
 python3 "${CLAUDE_SKILL_DIR}/data.py" chain BANKNIFTY --expiry 29-Oct-2026
 python3 "${CLAUDE_SKILL_DIR}/data.py" flows                                # FII/DII flows: latest day + 5 and 20 session sums -> flows.csv
 python3 "${CLAUDE_SKILL_DIR}/data.py" flows --no-fetch                     # summarise the cached flows.csv only
+python3 "${CLAUDE_SKILL_DIR}/data.py" preopen                              # pre-open book of the Nifty 50 -> preopen.json (run 09:08 to 09:15 IST)
+python3 "${CLAUDE_SKILL_DIR}/data.py" preopen --key FO                     # NIFTY50 (default), ALL, FO, SME or OTHERS
 python3 "${CLAUDE_SKILL_DIR}/data.py" status                              # cached, fresh, gaps
 python3 "${CLAUDE_SKILL_DIR}/data.py" record RELIANCE --date 2026-10-23   # real data -> test fixtures
 ```
@@ -90,6 +94,7 @@ Every command takes `--data DIR` (default `trader/data`) and `--now
 | `trader/data/index/<slug>.csv` | `date,open,high,low,close,volume,pe,pb,div_yield` per index (contract below) | invest, scanner, risk, entry |
 | `trader/data/chain-<SYMBOL>.json` | option chain summary for one expiry (contract below), intraday | entry, risk |
 | `trader/data/flows.csv` | `date,category,buy_cr,sell_cr,net_cr`: FII/FPI and DII cash-market flows in rupee crore, one row per date and category (contract below) | scanner, invest |
+| `trader/data/preopen.json` | the latest pre-open book: advances, declines and one entry per stock with its indicative price (contract below) | scanner, entry |
 | `trader/data/nse_cookies.txt` | the NSE cookie jar (Mozilla format), reused between runs | data.py only |
 | `trader/data/calendar.json` | NSE holidays and special sessions (contract below) | data, alerts, and the skills that load alerts |
 
@@ -419,6 +424,46 @@ date,category,buy_cr,sell_cr,net_cr
   not a signal. They say who was buying or selling, not what price does next.
 - `doctor` probes the endpoint as `nse-flows`.
 
+## Pre-open book (`preopen`, `preopen.json`)
+
+`preopen [--key NIFTY50|ALL|FO|SME|OTHERS]` (default NIFTY50) asks `GET
+/api/market-data-pre-open?key=K`. The verified keys are `NIFTY 50` (URL
+encoded, with the space; plain `NIFTY` answers `{"data": [], "msg": "No Data
+Found"}`), `ALL`, `FO`, `SME` and `OTHERS`; `--key NIFTY50` is the command
+line spelling of the first. The answer is `metadata` (symbol, series, iep,
+previousClose, pChange, finalQuantity, totalTurnover) plus
+`detail.preOpenMarket` (the order book, `IEP`, `totalBuyQuantity`,
+`totalSellQuantity`) per stock, with the advances, declines and unchanged
+counts and NSE's timestamp on top. It overwrites `trader/data/preopen.json`
+(the key it holds says which book):
+
+```json
+{"key": "NIFTY50", "timestamp": "30-Oct-2026 09:09:07", "date": "2026-10-30",
+ "fetched_at": "2026-10-30T03:40:00Z", "advances": 21, "declines": 21, "unchanged": 8,
+ "stocks": [{"symbol": "TRENT", "series": "EQ", "iep": 3018.0, "prev_close": 2861.7,
+             "change_pct": 5.46, "final_qty": 30201, "total_buy_qty": 82070,
+             "total_sell_qty": 58165, "turnover": 91146618.0}]}
+```
+
+- `iep` is the indicative equilibrium price (`metadata.iep`, else
+  `detail.preOpenMarket.IEP`); `change_pct` is its move over `prev_close`;
+  `final_qty` is the quantity matched at it; `turnover` is in rupees. `date`
+  is the day of NSE's timestamp (ISO). Stocks are sorted by symbol; a value
+  NSE did not send is `null`.
+- It prints the top 5 gap-ups and gap-downs (only stocks with a matched
+  quantity, so a price nobody trades at does not top the list) and the total
+  buy against sell quantity as an imbalance.
+- The pre-open session: 09:00 to 09:08 IST orders are entered, changed and
+  cancelled (so a book read before about 09:08 is INDICATIVE and the IEP moves
+  with every order), 09:08 to 09:12 matching, and the normal market opens at
+  09:15. A book from 09:08 on is the matched one, but the 09:15 open can still
+  differ. Outside the session NSE serves the last book it has.
+- "No Data Found" or an empty list prints a clear message, exits 1 and writes
+  nothing. Thin stocks (SME, OTHERS, small caps in ALL) gap on a few lots:
+  read the matched quantity and turnover before trusting a gap. A hint to look
+  closer, not a signal.
+- `doctor` probes the endpoint as `nse-preopen`.
+
 ## The NSE calendar (`calendar`, `calendar.json`)
 
 The built-in holiday tables stop at 2026. `data.py calendar` keeps a cache,
@@ -468,7 +513,7 @@ trader-alerts the skills that load it by path.
 ## doctor
 
 Probes Yahoo query1 and query2, the NSE home page and quote API, the NSE
-holiday-master, circulars, corporate-actions, daily-reports, FII/DII flows and option-chain contract-info endpoints (a changed shape
+holiday-master, circulars, corporate-actions, daily-reports, FII/DII flows, pre-open and option-chain contract-info endpoints (a changed shape
 is reported, not silently empty), the index snapshot archive
 (`ind_close_all_DDMMYYYY.csv`), the nsearchives bhavcopy, the niftyindices
 Nifty 500 list, Google News RSS and the Kite MCP endpoint, each with a timeout, prints a table (ok / FAIL,

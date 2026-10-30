@@ -18,6 +18,7 @@ saved yourself (Kite MCP JSON, Kite Console / NSE website CSV).
     python3 data.py index ["NIFTY 50" "NIFTY BANK" ...] [--days 30] [--years 1] [--pe-expensive 25 --pe-cheap 20]
     python3 data.py delivery RELIANCE TCS [--window 30] [--no-fetch]
     python3 data.py flows [--no-fetch]
+    python3 data.py preopen [--key NIFTY50|ALL|FO|SME|OTHERS]
     python3 data.py doctor
     python3 data.py record RELIANCE [--date 2026-10-23]
     python3 data.py status
@@ -36,6 +37,7 @@ Writes (shared contracts, see PORT_V4_SPEC.md):
   trader/data/chain-<SYMBOL>.json    option chain summary: underlying, expiry, PCR, OI walls, ATM, max pain
   trader/data/index/<slug>.csv       date,open,high,low,close,volume,pe,pb,div_yield (nifty-50, nifty-bank, india-vix)
   trader/data/flows.csv              date,category,buy_cr,sell_cr,net_cr (FII/FPI and DII, Rs crore, one row per date and category)
+  trader/data/preopen.json           {"key","timestamp","date","fetched_at","advances","declines","unchanged","stocks":[{symbol,series,iep,prev_close,change_pct,final_qty,total_buy_qty,total_sell_qty,turnover}]}
 
 NSE requests (www.nseindia.com, nsearchives) retry up to 5 times on a 429, 502, 503, 504
 or a timeout, waiting 2^n seconds with jitter (never over 8 s, or the Retry-After the server
@@ -142,6 +144,11 @@ FLOWS_FILE = "flows.csv"
 FLOWS_HEADER = ["date", "category", "buy_cr", "sell_cr", "net_cr"]
 FLOWS_REFERER = NSE + "/reports/fii-dii"
 FLOW_WINDOWS = (5, 20)        # sessions the net FII/DII sums are taken over
+PREOPEN_FILE = "preopen.json"
+PREOPEN_KEYS = {"NIFTY50": "NIFTY 50", "ALL": "ALL", "FO": "FO", "SME": "SME", "OTHERS": "OTHERS"}   # --key -> NSE's key
+PREOPEN_REFERER = NSE + "/market-data/pre-open-market-cm-and-emerge-market"
+PREOPEN_TOP = 5               # gap-ups and gap-downs printed
+PREOPEN_ORDERS_END = datetime.time(9, 8)   # order entry, change and cancel close; before this the book is indicative
 PE_MIN_ROWS = 250            # P/E rows needed before a percentile means anything
 REPORTS_REFERER = NSE + "/all-reports"
 CHAIN_REFERER = NSE + "/option-chain"
@@ -3261,6 +3268,108 @@ def cmd_flows(a):
     return 0
 
 
+# ---------------------------------------------------------------- pre-open book
+
+def preopen_path(data_dir):
+    return os.path.join(data_dir, PREOPEN_FILE)
+
+
+def preopen_stock(r):
+    """One row of market-data-pre-open (metadata and detail.preOpenMarket) -> the preopen.json stock, or None."""
+    meta = r.get("metadata") if isinstance(r, dict) else None
+    if not isinstance(meta, dict) or not str(meta.get("symbol") or "").strip():
+        return None
+    book = ((r.get("detail") or {}).get("preOpenMarket") or {}) if isinstance(r.get("detail"), dict) else {}
+    iep = num(meta.get("iep"))
+    return {"symbol": str(meta["symbol"]).strip().upper(), "series": str(meta.get("series") or "").strip().upper(),
+            "iep": num(book.get("IEP")) if iep is None else iep, "prev_close": num(meta.get("previousClose")),
+            "change_pct": num(meta.get("pChange")), "final_qty": _int(meta.get("finalQuantity")),
+            "total_buy_qty": _int(book.get("totalBuyQuantity")), "total_sell_qty": _int(book.get("totalSellQuantity")),
+            "turnover": num(meta.get("totalTurnover"))}
+
+
+def parse_preopen(doc, key):
+    """/api/market-data-pre-open answer -> the preopen.json document (without fetched_at). `key` is the
+    name kept in the file (NIFTY50, ALL, FO, SME, OTHERS). An empty data list ("No Data Found") raises."""
+    rows = doc.get("data") if isinstance(doc, dict) else None
+    if not isinstance(rows, list):
+        raise SourceError("nse-api", "the pre-open answer has no data list", "NSE changed the feed, or this is a bot wall")
+    stocks = sorted((s for s in map(preopen_stock, rows) if s), key=lambda s: s["symbol"])
+    if not stocks:
+        raise DataError("NSE has no pre-open data for %s (%s); nothing written. The book fills 09:00 to 09:08 IST "
+                        "on a trading day; the key must be one of %s" % (
+                            key, doc.get("msg") or "empty list", ", ".join(PREOPEN_KEYS)))
+    stamp_text = str(doc.get("timestamp") or "").strip()
+    try:
+        day = parse_date(stamp_text).isoformat()
+    except DataError:
+        day = None
+
+    def count(name, test):
+        given = _int(doc.get(name))
+        return given if given is not None else sum(1 for s in stocks if s["change_pct"] is not None
+                                                   and test(s["change_pct"]))
+    return {"key": key, "timestamp": stamp_text or None, "date": day,
+            "advances": count("advances", lambda p: p > 0), "declines": count("declines", lambda p: p < 0),
+            "unchanged": count("unchanged", lambda p: p == 0), "stocks": stocks}
+
+
+def preopen_clock(stamp_text):
+    """The time of day in NSE's pre-open timestamp ("30-Oct-2026 09:09:07"), or None."""
+    m = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*$", str(stamp_text or ""))
+    return datetime.time(int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)) if m else None
+
+
+def preopen_line(s):
+    ratio = (s["total_buy_qty"] / float(s["total_sell_qty"])
+             if s["total_buy_qty"] is not None and s["total_sell_qty"] else None)
+    return "  %-12s IEP %9s  prev %9s  %+6.2f%%  matched %10s  turnover Rs %7.2f cr  buy/sell %s" % (
+        s["symbol"], fmt(s["iep"]) or "?", fmt(s["prev_close"]) or "?", s["change_pct"],
+        format(s["final_qty"] or 0, ","), (s["turnover"] or 0) / 1e7, "n/a" if ratio is None else "%.2fx" % ratio)
+
+
+def cmd_preopen(a):
+    now = parse_now(a.now)
+    key = a.key
+    got = nse_api(Session(a.data), "/api/market-data-pre-open?key=%s" % urllib.parse.quote(PREOPEN_KEYS[key]),
+                  PREOPEN_REFERER)
+    doc = parse_preopen(got, key)
+    doc["fetched_at"] = stamp(now)
+    order = ["key", "timestamp", "date", "fetched_at", "advances", "declines", "unchanged", "stocks"]
+    _write_json(preopen_path(a.data), dict((k, doc[k]) for k in order))
+    stocks = doc["stocks"]
+    print("Pre-open book for %s at %s: %d stock(s), %d advancing, %d declining, %d unchanged" % (
+        key, doc["timestamp"] or "an unknown time", len(stocks), doc["advances"], doc["declines"], doc["unchanged"]))
+    clock = preopen_clock(doc["timestamp"])
+    if clock is not None and clock < PREOPEN_ORDERS_END:
+        print("  INDICATIVE: the order window (09:00 to 09:08 IST) is still open, so orders can be changed or "
+              "cancelled and every IEP below can move.")
+    else:
+        print("  The order window (09:00 to 09:08 IST) has closed; these are the matched prices, but the 09:15 "
+              "open can still differ.")
+    live = [s for s in stocks if s["change_pct"] is not None and s["final_qty"]]
+    ups = sorted((s for s in live if s["change_pct"] > 0), key=lambda s: -s["change_pct"])[:PREOPEN_TOP]
+    downs = sorted((s for s in live if s["change_pct"] < 0), key=lambda s: s["change_pct"])[:PREOPEN_TOP]
+    for title, rows in (("Top gap-ups (indicative equilibrium price over the previous close)", ups),
+                        ("Top gap-downs", downs)):
+        print(title + (":" if rows else ": none"))
+        for s in rows:
+            print(preopen_line(s))
+    buy = sum(s["total_buy_qty"] or 0 for s in stocks)
+    sell = sum(s["total_sell_qty"] or 0 for s in stocks)
+    if buy and sell:
+        print("Order imbalance: buy quantity %s, sell quantity %s (buy/sell %.2fx, %s)" % (
+            format(buy, ","), format(sell, ","), buy / float(sell),
+            "more buyers than sellers" if buy > sell * 1.05 else "more sellers than buyers" if sell > buy * 1.05
+            else "balanced"))
+    else:
+        print("Order imbalance: no buy and sell quantities in the answer.")
+    print("Pre-open runs 09:00 to 09:08 IST (orders in, changed and cancelled), matching to 09:12, the normal market "
+          "opens at 09:15. Gaps are a hint to look closer, not a signal; thin stocks gap on a few lots. Wrote %s." % (
+              show_path(preopen_path(a.data))))
+    return 0
+
+
 # ---------------------------------------------------------------- doctor
 
 def probes(now_ist):
@@ -3281,6 +3390,8 @@ def probes(now_ist):
         ("nse-chain", "cal", NSE + "/api/option-chain-contract-info?symbol=NIFTY", "chain"),
         ("nse-reports", "cal", NSE + "/api/daily-reports?key=CM", "reports"),
         ("nse-flows", "market", NSE + "/api/fiidiiTradeReact", "flows"),
+        ("nse-preopen", "market", NSE + "/api/market-data-pre-open?key=" + urllib.parse.quote(PREOPEN_KEYS["NIFTY50"]),
+         "preopen"),
         ("nsearchives", "price", bhav_urls(bd)[0], "bhav"),
         ("niftyindices", "list", NIFTY_LIST, "csv"),
         ("google-news", "news", GNEWS, "rss"),
@@ -3310,6 +3421,12 @@ def check_body(kind, code, body):
         except ValueError:
             return False, "not JSON (bot wall)"
         return bool(parse_flows(doc)) if isinstance(doc, list) else False, "no FII/DII rows in the answer"
+    if kind == "preopen":
+        try:
+            rows = json.loads(body).get("data")
+        except (ValueError, AttributeError):
+            return False, "not JSON (bot wall)"
+        return isinstance(rows, list) and bool(rows), "no pre-open rows (empty outside the pre-open session, or a changed feed)"
     if kind in ("holidays", "circulars", "actions", "reports", "chain"):
         try:
             doc = json.loads(body)
@@ -3349,9 +3466,9 @@ def cmd_doctor(a):
                 hdr["Range"] = "bytes=0-2047"
             if name == "nse-api":
                 hdr.update({"Accept": "application/json", "Referer": NSE + "/get-quotes/equity?symbol=RELIANCE"})
-            if check in ("holidays", "circulars", "actions", "reports", "chain", "flows"):
+            if check in ("holidays", "circulars", "actions", "reports", "chain", "flows", "preopen"):
                 ref = {"actions": ACTIONS_REFERER, "reports": REPORTS_REFERER, "chain": CHAIN_REFERER,
-                       "flows": FLOWS_REFERER}.get(check, CAL_REFERER)
+                       "flows": FLOWS_REFERER, "preopen": PREOPEN_REFERER}.get(check, CAL_REFERER)
                 hdr.update({"Accept": "application/json", "Referer": ref, "X-Requested-With": "XMLHttpRequest"})
             code, body = sess.get(url, hdr, timeout=a.timeout, gap=0, retries=0)   # a probe reports the first answer
             ok, why = check_body(check, code, body)
@@ -3560,6 +3677,9 @@ def main(argv=None):
     p = sub.add_parser("flows", help="FII/DII cash-market flows into flows.csv (a context hint)")
     common(p)
     p.add_argument("--no-fetch", action="store_true", help="summarise the cached flows.csv only")
+    p = sub.add_parser("preopen", help="pre-open book: gap-ups, gap-downs, order imbalance into preopen.json")
+    common(p)
+    p.add_argument("--key", default="NIFTY50", choices=list(PREOPEN_KEYS), help="which book (default NIFTY50)")
     p = sub.add_parser("calendar", help="refresh the NSE holiday calendar (calendar.json)")
     common(p)
     p.add_argument("--refresh", action="store_true", help="refetch the holiday list and the circulars now")
@@ -3606,7 +3726,7 @@ def main(argv=None):
         return {"daily": cmd_daily, "intraday": cmd_intraday, "bands": cmd_bands, "import-kite": cmd_import_kite,
                 "import-csv": cmd_import_csv, "calendar": cmd_calendar, "delivery": cmd_delivery,
                 "actions": cmd_actions, "adjust": cmd_adjust, "index": cmd_index, "chain": cmd_chain,
-                "flows": cmd_flows, "doctor": cmd_doctor, "record": cmd_record, "status": cmd_status}[a.cmd](a)
+                "flows": cmd_flows, "preopen": cmd_preopen, "doctor": cmd_doctor, "record": cmd_record, "status": cmd_status}[a.cmd](a)
     except DataError as e:
         print("data.py: %s" % e, file=sys.stderr)
         return 1

@@ -2319,6 +2319,114 @@ class FlowsCommand(Net):
         self.assertIn("no FII/DII rows", s["nse-flows"]["error"])
 
 
+# ---------------------------------------------------------------- pre-open book
+
+class PreopenCommand(Net):
+    NOW = "2026-10-30 09:10"
+    STOCK_KEYS = ["symbol", "series", "iep", "prev_close", "change_pct", "final_qty", "total_buy_qty",
+                  "total_sell_qty", "turnover"]
+
+    def feed(self, body=None, code=200):
+        return self.net([("api/market-data-pre-open", code,
+                          body if body is not None else fx("nse-preopen-NIFTY50-live.json")),
+                         ("www.nseindia.com/", 200, b"home")])
+
+    def saved(self):
+        return json.loads(rd(os.path.join(self.dd, "preopen.json")))
+
+    def test_writes_the_contract(self):
+        f = self.feed()
+        code, out, err = self.run_d("preopen", "--now", self.NOW)
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(f.urls("pre-open")[0].endswith("/api/market-data-pre-open?key=NIFTY%2050"))
+        doc = self.saved()
+        self.assertEqual(list(doc), ["key", "timestamp", "date", "fetched_at", "advances", "declines", "unchanged",
+                                     "stocks"])
+        self.assertEqual((doc["key"], doc["timestamp"], doc["date"], doc["fetched_at"]),
+                         ("NIFTY50", "30-Oct-2026 09:09:07", "2026-10-30", "2026-10-30T03:40:00Z"))
+        self.assertEqual((doc["advances"], doc["declines"], doc["unchanged"]), (21, 21, 8))
+        self.assertEqual([s["symbol"] for s in doc["stocks"]],
+                         ["BAJFINANCE", "COALINDIA", "NESTLEIND", "TATACONSUM", "TATASTEEL", "TRENT"])
+        for s in doc["stocks"]:
+            self.assertEqual(list(s), self.STOCK_KEYS)
+        self.assertEqual(doc["stocks"][-1], {
+            "symbol": "TRENT", "series": "EQ", "iep": 3018.0, "prev_close": 2861.7, "change_pct": 5.46,
+            "final_qty": 30201, "total_buy_qty": 82070, "total_sell_qty": 58165, "turnover": 91146618.0})
+
+    def test_prints_gaps_and_the_imbalance(self):
+        self.feed()
+        code, out, _ = self.run_d("preopen", "--now", self.NOW)
+        lines = out.splitlines()
+        up = [l for l in lines if l.startswith("  ") and "%" in l]
+        self.assertTrue(up[0].lstrip().startswith("TRENT"), out)                   # biggest gap-up first
+        self.assertIn("+5.46%", up[0])
+        self.assertTrue(up[3].lstrip().startswith("NESTLEIND"), out)               # then the biggest gap-down first
+        self.assertIn("Top gap-ups", out)
+        self.assertIn("Top gap-downs", out)
+        self.assertIn("buy quantity 931,852, sell quantity 801,209 (buy/sell 1.16x, more buyers than sellers)", out)
+        self.assertIn("Pre-open runs 09:00 to 09:08 IST", out)
+        self.assertIn("not a signal", out)
+        self.assertIn("The order window (09:00 to 09:08 IST) has closed", out)
+        self.assertNotIn("INDICATIVE", out)
+
+    def test_before_09_08_it_says_indicative(self):
+        doc = json.loads(fx("nse-preopen-NIFTY50-live.json"))
+        doc["timestamp"] = "30-Oct-2026 09:05:30"
+        self.feed(json.dumps(doc).encode())
+        _, out, _ = self.run_d("preopen", "--now", "2026-10-30 09:06")
+        self.assertIn("INDICATIVE", out)
+        self.assertEqual(self.saved()["date"], "2026-10-30")
+
+    def test_keys_map_to_nse_keys(self):
+        for key, want in (("ALL", "key=ALL"), ("FO", "key=FO"), ("SME", "key=SME"), ("OTHERS", "key=OTHERS"),
+                          ("NIFTY50", "key=NIFTY%2050")):
+            f = self.feed(fx("nse-preopen-fo-live.json"))
+            code, out, err = self.run_d("preopen", "--key", key, "--now", self.NOW)
+            self.assertEqual(code, 0, out + err)
+            self.assertTrue(f.urls("pre-open")[0].endswith(want), (key, f.urls("pre-open")))
+            self.assertEqual(self.saved()["key"], key)
+        with self.assertRaises(SystemExit):
+            with redirect_stderr(io.StringIO()):
+                data.main(["preopen", "--key", "NIFTY", "--data", self.dd])            # plain NIFTY is not a key
+
+    def test_iep_falls_back_to_the_order_book(self):
+        doc = json.loads(fx("nse-preopen-NIFTY50-live.json"))
+        for r in doc["data"]:
+            del r["metadata"]["iep"]
+        s = data.parse_preopen(doc, "NIFTY50")["stocks"][-1]
+        self.assertEqual((s["symbol"], s["iep"]), ("TRENT", 3018.0))
+        self.assertEqual(data.parse_preopen({"data": [{"metadata": {"symbol": "X"}}], "timestamp": "bad"}, "FO")["date"],
+                         None)
+
+    def test_no_data_found_is_a_clear_message_and_writes_nothing(self):
+        for body in (b'{"data": [], "msg": "No Data Found"}', b'{"data": []}'):
+            self.feed(body)
+            code, out, err = self.run_d("preopen", "--key", "FO", "--now", self.NOW)
+            self.assertEqual(code, 1)
+            self.assertIn("NSE has no pre-open data for FO", err)
+            self.assertIn("nothing written", err)
+            self.assertFalse(os.path.exists(os.path.join(self.dd, "preopen.json")))
+        self.feed(b'{"data": [], "msg": "No Data Found"}')
+        _, _, err = self.run_d("preopen", "--now", self.NOW)
+        self.assertIn("No Data Found", err)
+        self.feed(b"<html>wall</html>")
+        code, _, err = self.run_d("preopen", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertFalse(os.path.exists(os.path.join(self.dd, "preopen.json")))
+
+    def test_doctor_probes_it(self):
+        f = self.net([("api/market-data-pre-open", 200, fx("nse-preopen-NIFTY50-live.json")), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertTrue(s["nse-preopen"]["ok"])
+        self.assertIn("key=NIFTY%2050", f.urls("pre-open")[0])
+        self.net([("api/market-data-pre-open", 200, b'{"data": [], "msg": "No Data Found"}'), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertFalse(s["nse-preopen"]["ok"])
+        self.assertIn("no pre-open rows", s["nse-preopen"]["error"])
+
+
 # ---------------------------------------------------------------- report readiness
 
 class Readiness(Net):
