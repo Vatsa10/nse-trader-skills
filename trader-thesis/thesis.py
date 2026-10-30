@@ -536,7 +536,7 @@ def cmd_brief(a):
         print(json.dumps(brief, indent=2, ensure_ascii=False))
     else:
         print("%s brief (%s): %d source(s) read, %d missing -> %s" % (sym, a.mode, len(brief["sources"]),
-                                                                    len(brief["missing"]), out))
+                                                                    len(brief["missing"]), out.replace("\\", "/")))
         for name, s in brief["sources"].items():
             print("  ok       %-16s %s  (%s)" % (name, s["date"] or "no date", s["file"]))
         for m in brief["missing"]:
@@ -573,7 +573,7 @@ def cmd_render(a):
     if a.out:
         with open(a.out, "w", encoding="utf-8") as fh:
             fh.write(md)
-        print("wrote %s" % a.out)
+        print("wrote %s" % a.out.replace("\\", "/"))
     else:
         sys.stdout.write(md)
     return 0

@@ -127,6 +127,7 @@ class Brief(unittest.TestCase):
         code, text, _ = run(["brief", "ioc", "--data", self.data, "--out", out, "--today", "2026-10-30"])
         self.assertEqual(code, 0)
         self.assertIn("MISSING", text)
+        self.assertNotIn("\\", text)        # paths print with forward slashes on every OS
         with open(out, encoding="utf-8") as fh:
             self.assertEqual(json.load(fh)["symbol"], "IOC")
 
