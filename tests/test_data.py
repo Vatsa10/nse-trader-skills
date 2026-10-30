@@ -2209,6 +2209,116 @@ class IndexCommand(Net):
         self.assertIn("2 rows 2026-10-22..2026-10-23", out)
 
 
+# ---------------------------------------------------------------- FII / DII flows
+
+class FlowsCommand(Net):
+    NOW = "2026-10-29 19:00"
+    HEAD = "date,category,buy_cr,sell_cr,net_cr"
+
+    def feed(self, body=None, code=200):
+        return self.net([("api/fiidiiTradeReact", code, body if body is not None else fx("nse-fiidii-live.json")),
+                         ("www.nseindia.com/", 200, b"home")])
+
+    def lines(self):
+        return rd(data.flows_path(self.dd)).splitlines()
+
+    def test_parse_the_live_shape(self):
+        rows = data.parse_flows(json.loads(fx("nse-fiidii-live.json")))
+        self.assertEqual(rows, [
+            {"date": "2026-10-29", "category": "DII", "buy_cr": 18458.64, "sell_cr": 16534.23, "net_cr": 1924.41},
+            {"date": "2026-10-29", "category": "FII/FPI", "buy_cr": 13400.29, "sell_cr": 14343.89, "net_cr": -943.6}])
+        self.assertEqual(data.parse_flows([]), [])
+        junk = [{"category": "XYZ", "date": "29-Oct-2026", "buyValue": "1", "sellValue": "1"},
+                {"category": "DII", "date": "bad", "buyValue": "1", "sellValue": "1"},
+                {"category": "DII", "date": "29-Oct-2026", "buyValue": "-", "sellValue": "1"},
+                {"category": "FII/FPI", "date": "29-Oct-2026", "buyValue": "10", "sellValue": "4"}]
+        self.assertEqual([(r["category"], r["net_cr"]) for r in data.parse_flows(junk)], [("FII/FPI", 6.0)])
+        with self.assertRaises(data.DataError):
+            data.parse_flows({"oops": 1})
+
+    def test_writes_the_contract(self):
+        f = self.feed()
+        code, out, err = self.run_d("flows", "--now", self.NOW)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.lines(), [self.HEAD, "2026-10-29,DII,18458.64,16534.23,1924.41",
+                                        "2026-10-29,FII/FPI,13400.29,14343.89,-943.6"])
+        self.assertEqual(f.urls("fiidii")[0].split("nseindia.com")[1], "/api/fiidiiTradeReact")
+        self.assertIn("FII/DII cash-market flows for 2026-10-29", out)
+        self.assertIn("FII/FPI  buy    13,400.29  sell    14,343.89  net      -943.60", out)
+        self.assertIn("5-session needs 5 recorded days", out)
+        self.assertIn("1 day(s) recorded", out)                       # history is short and says so
+        self.assertIn("A context hint, not a signal", out)
+        self.assertIn("flows.csv (+2 row(s)", out)
+        self.assertNotIn("\\", out)
+
+    def test_the_same_day_replaces_and_never_duplicates(self):
+        self.feed()
+        self.run_d("flows", "--now", self.NOW)
+        revised = json.loads(fx("nse-fiidii-live.json"))
+        revised[1]["netValue"], revised[1]["sellValue"] = "-900.5", "14300.79"
+        self.feed(json.dumps(revised).encode())
+        code, out, _ = self.run_d("flows", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.lines(), [self.HEAD, "2026-10-29,DII,18458.64,16534.23,1924.41",
+                                        "2026-10-29,FII/FPI,13400.29,14300.79,-900.5"])
+        self.assertIn("(+0 row(s)", out)
+
+    def test_history_is_kept_ascending_and_summed(self):
+        days = data.trading_days(datetime.date(2026, 9, 1), datetime.date(2026, 10, 28))[-24:]
+        old = []
+        for d in days:
+            old.append({"date": d.isoformat(), "category": "FII/FPI", "buy_cr": 100.0, "sell_cr": 110.0, "net_cr": -10.0})
+            old.append({"date": d.isoformat(), "category": "DII", "buy_cr": 105.0, "sell_cr": 100.0, "net_cr": 5.0})
+        data.write_flows(self.dd, old[::-1])                                  # written out of order on purpose
+        self.feed()
+        code, out, _ = self.run_d("flows", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        got = self.lines()
+        self.assertEqual(len(got), 1 + 25 * 2)
+        dates = [x.split(",")[0] for x in got[1:]]
+        self.assertEqual(dates, sorted(dates))
+        self.assertEqual(got[-1], "2026-10-29,FII/FPI,13400.29,14343.89,-943.6")
+        self.assertIn("5-session net -983.60 (2026-10-23 to 2026-10-29)", out)
+        self.assertIn("20-session net -1,133.60", out)
+        self.assertIn("5-session net 1,944.41", out)
+        self.assertIn("20-session net 2,019.41", out)
+        self.assertNotIn("needs", out)
+
+    def test_an_old_answer_is_flagged_and_no_fetch_reads_the_cache(self):
+        self.feed()
+        code, out, _ = self.run_d("flows", "--now", "2026-10-30 19:00")
+        self.assertIn("NSE still shows 2026-10-29", out)
+        f = self.net([])
+        code, out, _ = self.run_d("flows", "--no-fetch")
+        self.assertEqual((code, f.calls), (0, []))
+        self.assertIn("DII", out)
+        code, _, err = run(["flows", "--no-fetch", "--data", os.path.join(self.tmp, "empty")])
+        self.assertEqual(code, 1)
+        self.assertIn("no flows cached", err)
+
+    def test_an_empty_answer_or_a_bot_wall_writes_nothing(self):
+        for body in (b"[]", b"<html>Access Denied</html>", b'{"x": 1}'):
+            self.feed(body)
+            code, out, err = self.run_d("flows", "--now", self.NOW)
+            self.assertEqual(code, 1, body)
+            self.assertFalse(os.path.exists(data.flows_path(self.dd)), body)
+        self.feed(b"", 403)
+        code, out, err = self.run_d("flows", "--now", self.NOW)
+        self.assertEqual(code, 1)
+        self.assertIn("403", err)
+
+    def test_doctor_probes_it(self):
+        self.net([("api/fiidiiTradeReact", 200, fx("nse-fiidii-live.json")), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertTrue(s["nse-flows"]["ok"])
+        self.net([("api/fiidiiTradeReact", 200, b"[]"), ("", 403, b"")])
+        self.run_d("doctor", "--now", self.NOW)
+        s = json.loads(rd(os.path.join(self.dd, "sources.json")))["sources"]
+        self.assertFalse(s["nse-flows"]["ok"])
+        self.assertIn("no FII/DII rows", s["nse-flows"]["error"])
+
+
 # ---------------------------------------------------------------- report readiness
 
 class Readiness(Net):

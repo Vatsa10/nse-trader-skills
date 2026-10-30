@@ -20,15 +20,17 @@ description: >-
   bonus adjusted `.adj.csv` exactly from them (`adjust`), keeps index levels
   with the Nifty 50 P/E, P/B, dividend yield and India VIX (`index`), summarises
   an index option chain (`chain`: put-call ratio, open interest walls, max
-  pain, at-the-money strike), and
+  pain, at-the-money strike), keeps the FII and DII cash-market flows day by
+  day (`flows`, a context hint), and
   records real data as test fixtures. Use when the user says "get me
   RELIANCE history", "update my data", "download prices", "Yahoo is not
   working", "NSE blocked me", "what is the price band / circuit limit",
   "import this CSV", "is my data fresh", "corporate actions", "split",
   "bonus", "adjust for the split", "ex-date", "nifty pe", "is the market
-  expensive", "vix", "option chain", "pcr", "max pain", or before a backtest,
+  expensive", "vix", "option chain", "pcr", "max pain", "fii", "dii",
+  "fpi flows", "what are the institutions doing", or before a backtest,
   an investment check or a scan that needs daily bars.
-argument-hint: "[daily|intraday|bands|calendar|delivery|actions|adjust|index|chain|doctor|status] [symbol]"
+argument-hint: "[daily|intraday|bands|calendar|delivery|actions|adjust|index|chain|flows|doctor|status] [symbol]"
 ---
 
 # trader-data
@@ -63,6 +65,8 @@ python3 "${CLAUDE_SKILL_DIR}/data.py" index "NIFTY IT" --days 260         # anot
 python3 "${CLAUDE_SKILL_DIR}/data.py" index --years 2                      # also backfill index levels (no P/E) from NSE history
 python3 "${CLAUDE_SKILL_DIR}/data.py" chain NIFTY                          # option chain: PCR, OI walls, max pain -> chain-NIFTY.json
 python3 "${CLAUDE_SKILL_DIR}/data.py" chain BANKNIFTY --expiry 29-Oct-2026
+python3 "${CLAUDE_SKILL_DIR}/data.py" flows                                # FII/DII flows: latest day + 5 and 20 session sums -> flows.csv
+python3 "${CLAUDE_SKILL_DIR}/data.py" flows --no-fetch                     # summarise the cached flows.csv only
 python3 "${CLAUDE_SKILL_DIR}/data.py" status                              # cached, fresh, gaps
 python3 "${CLAUDE_SKILL_DIR}/data.py" record RELIANCE --date 2026-10-23   # real data -> test fixtures
 ```
@@ -85,6 +89,7 @@ Every command takes `--data DIR` (default `trader/data`) and `--now
 | `trader/data/actions.json` | corporate actions per symbol: splits, bonus, dividends (contract below) | invest, portfolio, entry, backtest, `adjust` |
 | `trader/data/index/<slug>.csv` | `date,open,high,low,close,volume,pe,pb,div_yield` per index (contract below) | invest, scanner, risk, entry |
 | `trader/data/chain-<SYMBOL>.json` | option chain summary for one expiry (contract below), intraday | entry, risk |
+| `trader/data/flows.csv` | `date,category,buy_cr,sell_cr,net_cr`: FII/FPI and DII cash-market flows in rupee crore, one row per date and category (contract below) | scanner, invest |
 | `trader/data/nse_cookies.txt` | the NSE cookie jar (Mozilla format), reused between runs | data.py only |
 | `trader/data/calendar.json` | NSE holidays and special sessions (contract below) | data, alerts, and the skills that load alerts |
 
@@ -326,11 +331,16 @@ cells in and never wipes a value that is already there.
   yet" and not an error (it appears in the evening); a past day with no file
   is skipped and counted; a 403 stops the run.
 - History backfill, `--years Y`: `/api/historicalOR/indicesHistory?indexType=NIFTY 50&from=DD-MM-YYYY&to=DD-MM-YYYY`
-  in yearly chunks and `/api/historicalOR/vixhistory?from=..&to=..` (India VIX
-  goes to `india-vix.csv` with the same header). Both answer newest first and are
-  reversed to ascending. They carry only the four index values, so `pe`, `pb`
-  and `div_yield` stay empty for those days; the snapshot files are the only
-  source of P/E. The backfill asks only for the span before the first cached row.
+  and `/api/historicalOR/vixhistory?from=..&to=..` (India VIX goes to
+  `india-vix.csv` with the same header). The answer is `{"data": [...]}` with
+  `EOD_TIMESTAMP` like `29-OCT-2026`, in either order, and is sorted ascending.
+  NSE returns at most 100 rows a request, so the span is asked for in 120 day
+  chunks (about 85 sessions); a chunk that still comes back with 100 rows is
+  split in two and asked again, and a single day that fills the cap is reported
+  ("rows may be missing"), never accepted silently. They carry only the four
+  index values, so `pe`, `pb` and `div_yield` stay empty for those days; the
+  snapshot files are the only source of P/E. The backfill asks only for the
+  span before the first cached row.
 - Valuation line for NIFTY 50 (eod2's rule of thumb, not a signal): P/E at or
   above 25 is expensive, at or below 20 cheap, otherwise neutral
   (`--pe-expensive`, `--pe-cheap` change the marks; the defaults are the
@@ -381,6 +391,34 @@ and reused (no contract-info call) until it has passed; an expiry you name with
   max pain are levels where positions sit, not guarantees that price stops
   there.
 
+## FII / DII flows (`flows`, `flows.csv`)
+
+`flows` asks `GET /api/fiidiiTradeReact` for the latest day's cash-market
+figures: a list of `{"buyValue", "category" ("DII" or "FII/FPI"), "date"
+("29-Oct-2026"), "netValue", "sellValue"}` with the values as strings in
+rupee crore. NSE shows only the latest day (provisional, published after the
+close), so the history is yours to build: every run appends to
+`trader/data/flows.csv`.
+
+```
+date,category,buy_cr,sell_cr,net_cr
+2026-10-29,DII,18458.64,16534.23,1924.41
+2026-10-29,FII/FPI,13400.29,14343.89,-943.6
+```
+
+- One row per date and category, ISO dates, ascending (then category).
+  Running it again the same day replaces that day's rows, never duplicates
+  them; an older answer for a day already stored replaces it too.
+- It prints the latest day and, per category, the net sum over the last 5 and
+  20 recorded sessions once that many days are stored (until then it says how
+  many days it has). Run it once a day to build the history; days you did not
+  run it are not recoverable from NSE.
+- An empty or non-JSON answer exits 1 and writes nothing. `--no-fetch`
+  summarises the cached file without asking NSE.
+- Say it plainly when presenting this: FII and DII flows are a context hint,
+  not a signal. They say who was buying or selling, not what price does next.
+- `doctor` probes the endpoint as `nse-flows`.
+
 ## The NSE calendar (`calendar`, `calendar.json`)
 
 The built-in holiday tables stop at 2026. `data.py calendar` keeps a cache,
@@ -430,7 +468,7 @@ trader-alerts the skills that load it by path.
 ## doctor
 
 Probes Yahoo query1 and query2, the NSE home page and quote API, the NSE
-holiday-master, circulars, corporate-actions, daily-reports and option-chain contract-info endpoints (a changed shape
+holiday-master, circulars, corporate-actions, daily-reports, FII/DII flows and option-chain contract-info endpoints (a changed shape
 is reported, not silently empty), the index snapshot archive
 (`ind_close_all_DDMMYYYY.csv`), the nsearchives bhavcopy, the niftyindices
 Nifty 500 list, Google News RSS and the Kite MCP endpoint, each with a timeout, prints a table (ok / FAIL,

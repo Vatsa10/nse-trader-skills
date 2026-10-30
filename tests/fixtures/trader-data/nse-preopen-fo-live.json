@@ -1,0 +1,289 @@
+{
+ "declines": 97,
+ "unchanged": 27,
+ "data": [
+  {
+   "metadata": {
+    "symbol": "GODREJCP",
+    "identifier": "GODREJCPEQN",
+    "series": "EQ",
+    "purpose": null,
+    "lastPrice": 815,
+    "change": -22,
+    "pChange": -2.63,
+    "previousClose": 837,
+    "finalQuantity": 40038,
+    "totalTurnover": 32630970,
+    "marketCap": 326616157315.23,
+    "yearHigh": 1273.9,
+    "yearLow": 810.1,
+    "iep": 815
+   },
+   "detail": {
+    "preOpenMarket": {
+     "preopen": [
+      {
+       "price": 812.5,
+       "buyQty": 10,
+       "sellQty": 0
+      },
+      {
+       "price": 813,
+       "buyQty": 1001,
+       "sellQty": 0
+      },
+      {
+       "price": 813.6,
+       "buyQty": 3,
+       "sellQty": 0
+      },
+      {
+       "price": 814,
+       "buyQty": 3,
+       "sellQty": 0
+      },
+      {
+       "price": 814.8,
+       "buyQty": 23,
+       "sellQty": 0
+      },
+      {
+       "price": 815,
+       "buyQty": 0,
+       "sellQty": 8080,
+       "iep": true
+      },
+      {
+       "price": 817.6,
+       "buyQty": 0,
+       "sellQty": 3824
+      },
+      {
+       "price": 819,
+       "buyQty": 0,
+       "sellQty": 300
+      },
+      {
+       "price": 820,
+       "buyQty": 0,
+       "sellQty": 65000
+      },
+      {
+       "price": 820.3,
+       "buyQty": 0,
+       "sellQty": 355
+      }
+     ],
+     "ato": {
+      "totalBuyQuantity": 0,
+      "totalSellQuantity": 0
+     },
+     "IEP": 815,
+     "totalTradedVolume": 40038,
+     "finalPrice": 815,
+     "finalQuantity": 40038,
+     "lastUpdateTime": "30-Oct-2026 09:09:08",
+     "totalSellQuantity": 140605,
+     "totalBuyQuantity": 8666,
+     "atoBuyQty": 0,
+     "atoSellQty": 0,
+     "Change": -22,
+     "perChange": -2.63,
+     "prevClose": 837
+    }
+   }
+  },
+  {
+   "metadata": {
+    "symbol": "SAGILITY",
+    "identifier": "SAGILITYEQN",
+    "series": "EQ",
+    "purpose": null,
+    "lastPrice": 43.35,
+    "change": -1.16,
+    "pChange": -2.61,
+    "previousClose": 44.66,
+    "finalQuantity": 778676,
+    "totalTurnover": 33755604,
+    "marketCap": 99540311149.26,
+    "yearHigh": 57.89,
+    "yearLow": 35.83,
+    "iep": 43.35
+   },
+   "detail": {
+    "preOpenMarket": {
+     "preopen": [
+      {
+       "price": 43.21,
+       "buyQty": 5000,
+       "sellQty": 0
+      },
+      {
+       "price": 43.22,
+       "buyQty": 25,
+       "sellQty": 0
+      },
+      {
+       "price": 43.25,
+       "buyQty": 3176,
+       "sellQty": 0
+      },
+      {
+       "price": 43.3,
+       "buyQty": 402425,
+       "sellQty": 0
+      },
+      {
+       "price": 43.31,
+       "buyQty": 105,
+       "sellQty": 0
+      },
+      {
+       "price": 43.34,
+       "buyQty": 0,
+       "sellQty": 9413
+      },
+      {
+       "price": 43.35,
+       "buyQty": 0,
+       "sellQty": 0,
+       "iep": true
+      },
+      {
+       "price": 43.4,
+       "buyQty": 0,
+       "sellQty": 65000
+      },
+      {
+       "price": 43.45,
+       "buyQty": 0,
+       "sellQty": 32000
+      },
+      {
+       "price": 43.49,
+       "buyQty": 0,
+       "sellQty": 500
+      },
+      {
+       "price": 43.5,
+       "buyQty": 0,
+       "sellQty": 43100
+      }
+     ],
+     "ato": {
+      "totalBuyQuantity": 0,
+      "totalSellQuantity": 0
+     },
+     "IEP": 43.35,
+     "totalTradedVolume": 778676,
+     "finalPrice": 43.35,
+     "finalQuantity": 778676,
+     "lastUpdateTime": "30-Oct-2026 09:09:07",
+     "totalSellQuantity": 1775059,
+     "totalBuyQuantity": 66136184,
+     "atoBuyQty": 0,
+     "atoSellQty": 0,
+     "Change": -1.16,
+     "perChange": -2.61,
+     "prevClose": 44.66
+    }
+   }
+  },
+  {
+   "metadata": {
+    "symbol": "BLUESTARCO",
+    "identifier": "BLUESTARCOEQN",
+    "series": "EQ",
+    "purpose": null,
+    "lastPrice": 1633.4,
+    "change": -39.6,
+    "pChange": -2.37,
+    "previousClose": 1673,
+    "finalQuantity": 7512,
+    "totalTurnover": 12270100,
+    "marketCap": 211313205651.79,
+    "yearHigh": 2029.6,
+    "yearLow": 1432.3,
+    "iep": 1633.4
+   },
+   "detail": {
+    "preOpenMarket": {
+     "preopen": [
+      {
+       "price": 1629.8,
+       "buyQty": 1,
+       "sellQty": 0
+      },
+      {
+       "price": 1630,
+       "buyQty": 246,
+       "sellQty": 0
+      },
+      {
+       "price": 1631,
+       "buyQty": 100,
+       "sellQty": 0
+      },
+      {
+       "price": 1631.8,
+       "buyQty": 1,
+       "sellQty": 0
+      },
+      {
+       "price": 1633.4,
+       "buyQty": 531,
+       "sellQty": 0,
+       "iep": true
+      },
+      {
+       "price": 1635,
+       "buyQty": 0,
+       "sellQty": 10
+      },
+      {
+       "price": 1639,
+       "buyQty": 0,
+       "sellQty": 2000
+      },
+      {
+       "price": 1639.6,
+       "buyQty": 0,
+       "sellQty": 277
+      },
+      {
+       "price": 1640,
+       "buyQty": 0,
+       "sellQty": 2502
+      },
+      {
+       "price": 1643,
+       "buyQty": 0,
+       "sellQty": 50
+      }
+     ],
+     "ato": {
+      "totalBuyQuantity": 0,
+      "totalSellQuantity": 0
+     },
+     "IEP": 1633.4,
+     "totalTradedVolume": 7512,
+     "finalPrice": 1633.4,
+     "finalQuantity": 7512,
+     "lastUpdateTime": "30-Oct-2026 09:09:08",
+     "totalSellQuantity": 23869,
+     "totalBuyQuantity": 4207,
+     "atoBuyQty": 0,
+     "atoSellQty": 0,
+     "Change": -39.6,
+     "perChange": -2.37,
+     "prevClose": 1673
+    }
+   }
+  }
+ ],
+ "advances": 94,
+ "timestamp": "30-Oct-2026 09:09:07",
+ "totalTradedValue": 2315292124,
+ "totalmarketcap": 162966232282326.16,
+ "totalTradedVolume": 6650940
+}

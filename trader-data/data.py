@@ -17,6 +17,7 @@ saved yourself (Kite MCP JSON, Kite Console / NSE website CSV).
     python3 data.py chain NIFTY [--expiry 29-Oct-2026]
     python3 data.py index ["NIFTY 50" "NIFTY BANK" ...] [--days 30] [--years 1] [--pe-expensive 25 --pe-cheap 20]
     python3 data.py delivery RELIANCE TCS [--window 30] [--no-fetch]
+    python3 data.py flows [--no-fetch]
     python3 data.py doctor
     python3 data.py record RELIANCE [--date 2026-10-23]
     python3 data.py status
@@ -34,6 +35,7 @@ Writes (shared contracts, see PORT_V4_SPEC.md):
   trader/data/actions.json           {"fetched_at","symbols":{SYM:{"from","fetched_through","actions":[...]}}}
   trader/data/chain-<SYMBOL>.json    option chain summary: underlying, expiry, PCR, OI walls, ATM, max pain
   trader/data/index/<slug>.csv       date,open,high,low,close,volume,pe,pb,div_yield (nifty-50, nifty-bank, india-vix)
+  trader/data/flows.csv              date,category,buy_cr,sell_cr,net_cr (FII/FPI and DII, Rs crore, one row per date and category)
 
 NSE requests (www.nseindia.com, nsearchives) retry up to 5 times on a 429, 502, 503, 504
 or a timeout, waiting 2^n seconds with jitter (never over 8 s, or the Retry-After the server
@@ -136,7 +138,11 @@ HISTORY_CAP = 100             # NSE sends at most this many rows a history reque
 VALUATION_INDEX = "NIFTY 50"
 PE_EXPENSIVE = 25.0           # Nifty 50 P/E at or above this is flagged expensive (eod2's rule of thumb)
 PE_CHEAP = 20.0               # at or below this, cheap
-PE_MIN_ROWS = 250             # P/E rows needed before a percentile means anything
+FLOWS_FILE = "flows.csv"
+FLOWS_HEADER = ["date", "category", "buy_cr", "sell_cr", "net_cr"]
+FLOWS_REFERER = NSE + "/reports/fii-dii"
+FLOW_WINDOWS = (5, 20)        # sessions the net FII/DII sums are taken over
+PE_MIN_ROWS = 250            # P/E rows needed before a percentile means anything
 REPORTS_REFERER = NSE + "/all-reports"
 CHAIN_REFERER = NSE + "/option-chain"
 INDEX_SYMBOLS = ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50")   # option-chain type=Indices
@@ -3120,6 +3126,141 @@ def cmd_chain(a):
     return 0
 
 
+# ---------------------------------------------------------------- FII / DII flows
+
+def show_path(path):
+    """A path as printed to the user: forward slashes on every OS (file operations keep the native form)."""
+    return str(path).replace("\\", "/")
+
+
+def flows_path(data_dir):
+    return os.path.join(data_dir, FLOWS_FILE)
+
+
+def flow_category(text):
+    """NSE's "FII/FPI" and "DII" (any case or spacing) -> the name kept in flows.csv, else None."""
+    low = " ".join(str(text or "").upper().split())
+    return "FII/FPI" if low.startswith("FII") or low.startswith("FPI") else "DII" if low.startswith("DII") else None
+
+
+def parse_flows(doc):
+    """/api/fiidiiTradeReact answer (a list of {"buyValue", "category", "date", "netValue", "sellValue"},
+    values as strings in rupee crore) -> rows [{date, category, buy_cr, sell_cr, net_cr}] ascending.
+    A row with an unknown category, an unreadable date or no buy and sell value is skipped; a missing net
+    value is buy minus sell. An empty list is a valid, empty answer."""
+    rows = doc.get("data") if isinstance(doc, dict) else doc
+    if not isinstance(rows, list):
+        raise SourceError("nse-api", "the FII/DII answer is not a list", "NSE changed the feed, or this is a bot wall")
+    by = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        cat = flow_category(r.get("category"))
+        try:
+            day = parse_date(r.get("date"))
+        except DataError:
+            continue
+        buy, sell = num(r.get("buyValue")), num(r.get("sellValue"))
+        if cat is None or buy is None or sell is None:
+            continue
+        net = num(r.get("netValue"))
+        by[(day.isoformat(), cat)] = {"date": day.isoformat(), "category": cat, "buy_cr": buy, "sell_cr": sell,
+                                      "net_cr": buy - sell if net is None else net}
+    return [by[k] for k in sorted(by)]
+
+
+def read_flows(path):
+    """flows.csv -> rows ascending by date then category; a row that does not read is left out."""
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, newline="", encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            try:
+                datetime.date.fromisoformat(r["date"])
+                row = {"date": r["date"], "category": r["category"].strip(), "buy_cr": num(r.get("buy_cr")),
+                       "sell_cr": num(r.get("sell_cr")), "net_cr": num(r.get("net_cr"))}
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+            if row["category"] and row["net_cr"] is not None:
+                rows.append(row)
+    return sorted(rows, key=lambda r: (r["date"], r["category"]))
+
+
+def write_flows(data_dir, new_rows):
+    """Merge rows into flows.csv: one row per date and category, a later run for the same day replaces it.
+    Header date,category,buy_cr,sell_cr,net_cr, ISO dates, ascending. -> rows now in the file."""
+    by = dict(((r["date"], r["category"]), r) for r in read_flows(flows_path(data_dir)))
+    for r in new_rows:
+        by[(r["date"], r["category"])] = r
+    rows = [by[k] for k in sorted(by)]
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(FLOWS_HEADER)
+    for r in rows:
+        w.writerow([r["date"], r["category"], fmt(r["buy_cr"]), fmt(r["sell_cr"]), fmt(r["net_cr"])])
+    _atomic_write(flows_path(data_dir), buf.getvalue())
+    return rows
+
+
+def flow_sums(rows, windows=FLOW_WINDOWS):
+    """{category: {n: (net sum over the last n recorded sessions, first date, last date) or None}}."""
+    out = {}
+    for cat in sorted(set(r["category"] for r in rows)):
+        mine = [r for r in rows if r["category"] == cat]
+        out[cat] = dict((n, (sum(r["net_cr"] for r in mine[-n:]), mine[-n]["date"], mine[-1]["date"])
+                         if len(mine) >= n else None) for n in windows)
+    return out
+
+
+def crore(x):
+    return format(x, ",.2f")
+
+
+def cmd_flows(a):
+    now = parse_now(a.now)
+    wrote = ""
+    if not a.no_fetch:
+        rows = parse_flows(nse_api(Session(a.data), "/api/fiidiiTradeReact", FLOWS_REFERER))
+        if not rows:
+            raise DataError("NSE sent no FII/DII figures (empty answer: stale cookies, a bot wall, or none "
+                            "published yet); nothing written")
+        latest = rows[-1]["date"]
+        before = len(read_flows(flows_path(a.data)))
+        kept = write_flows(a.data, rows)
+        wrote = "Wrote %s (%+d row(s), %d kept, %s to %s)." % (
+            show_path(flows_path(a.data)), len(kept) - before, len(kept), kept[0]["date"], kept[-1]["date"])
+        print("FII/DII cash-market flows for %s (Rs crore, NSE provisional figures)" % latest)
+        for r in [x for x in rows if x["date"] == latest]:
+            print("  %-8s buy %12s  sell %12s  net %12s" % (
+                r["category"], crore(r["buy_cr"]), crore(r["sell_cr"]), crore(r["net_cr"])))
+        session = last_complete_session(now)
+        if latest < session.isoformat():
+            print("  note: NSE still shows %s; the figures for %s appear after the close." % (latest, session))
+    kept = read_flows(flows_path(a.data))
+    if not kept:
+        raise DataError("no flows cached: run flows without --no-fetch first")
+    if a.no_fetch:
+        print("FII/DII cash-market flows cached in %s (Rs crore)" % show_path(flows_path(a.data)))
+    for cat, got in flow_sums(kept).items():
+        bits = []
+        for n in FLOW_WINDOWS:
+            if got[n] is None:
+                bits.append("%d-session needs %d recorded days" % (n, n))
+            else:
+                bits.append("%d-session net %s (%s to %s)" % (n, crore(got[n][0]), got[n][1], got[n][2]))
+        print("  %-8s %s" % (cat, "; ".join(bits)))
+    days = len(set(r["date"] for r in kept))
+    if days < max(FLOW_WINDOWS):
+        print("  NSE shows only the latest day, so the sums build up as you run flows each day (%d day(s) "
+              "recorded)." % days)
+    if wrote:
+        print(wrote)
+    print("A context hint, not a signal: foreign and domestic institutions' net buying or selling says who "
+          "was active, not what price does next. Confirm with price and your own plan.")
+    return 0
+
+
 # ---------------------------------------------------------------- doctor
 
 def probes(now_ist):
@@ -3139,6 +3280,7 @@ def probes(now_ist):
         ("nse-index", "index", index_url(bd), "index"),
         ("nse-chain", "cal", NSE + "/api/option-chain-contract-info?symbol=NIFTY", "chain"),
         ("nse-reports", "cal", NSE + "/api/daily-reports?key=CM", "reports"),
+        ("nse-flows", "market", NSE + "/api/fiidiiTradeReact", "flows"),
         ("nsearchives", "price", bhav_urls(bd)[0], "bhav"),
         ("niftyindices", "list", NIFTY_LIST, "csv"),
         ("google-news", "news", GNEWS, "rss"),
@@ -3162,6 +3304,12 @@ def check_body(kind, code, body):
             return "priceInfo" in json.loads(body), ""
         except ValueError:
             return False, "not JSON (bot wall)"
+    if kind == "flows":
+        try:
+            doc = json.loads(body)
+        except ValueError:
+            return False, "not JSON (bot wall)"
+        return bool(parse_flows(doc)) if isinstance(doc, list) else False, "no FII/DII rows in the answer"
     if kind in ("holidays", "circulars", "actions", "reports", "chain"):
         try:
             doc = json.loads(body)
@@ -3201,9 +3349,9 @@ def cmd_doctor(a):
                 hdr["Range"] = "bytes=0-2047"
             if name == "nse-api":
                 hdr.update({"Accept": "application/json", "Referer": NSE + "/get-quotes/equity?symbol=RELIANCE"})
-            if check in ("holidays", "circulars", "actions", "reports", "chain"):
-                ref = {"actions": ACTIONS_REFERER, "reports": REPORTS_REFERER, "chain": CHAIN_REFERER}.get(
-                    check, CAL_REFERER)
+            if check in ("holidays", "circulars", "actions", "reports", "chain", "flows"):
+                ref = {"actions": ACTIONS_REFERER, "reports": REPORTS_REFERER, "chain": CHAIN_REFERER,
+                       "flows": FLOWS_REFERER}.get(check, CAL_REFERER)
                 hdr.update({"Accept": "application/json", "Referer": ref, "X-Requested-With": "XMLHttpRequest"})
             code, body = sess.get(url, hdr, timeout=a.timeout, gap=0, retries=0)   # a probe reports the first answer
             ok, why = check_body(check, code, body)
@@ -3409,6 +3557,9 @@ def main(argv=None):
     p.add_argument("symbols", nargs="*", help="default: every symbol with a delivery file")
     p.add_argument("--window", type=int, default=DELIVERY_WINDOW, help="sessions for the means (default 30)")
     p.add_argument("--no-fetch", action="store_true", help="use the cached delivery files only")
+    p = sub.add_parser("flows", help="FII/DII cash-market flows into flows.csv (a context hint)")
+    common(p)
+    p.add_argument("--no-fetch", action="store_true", help="summarise the cached flows.csv only")
     p = sub.add_parser("calendar", help="refresh the NSE holiday calendar (calendar.json)")
     common(p)
     p.add_argument("--refresh", action="store_true", help="refetch the holiday list and the circulars now")
@@ -3455,7 +3606,7 @@ def main(argv=None):
         return {"daily": cmd_daily, "intraday": cmd_intraday, "bands": cmd_bands, "import-kite": cmd_import_kite,
                 "import-csv": cmd_import_csv, "calendar": cmd_calendar, "delivery": cmd_delivery,
                 "actions": cmd_actions, "adjust": cmd_adjust, "index": cmd_index, "chain": cmd_chain,
-                "doctor": cmd_doctor, "record": cmd_record, "status": cmd_status}[a.cmd](a)
+                "flows": cmd_flows, "doctor": cmd_doctor, "record": cmd_record, "status": cmd_status}[a.cmd](a)
     except DataError as e:
         print("data.py: %s" % e, file=sys.stderr)
         return 1
