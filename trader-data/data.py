@@ -131,6 +131,8 @@ INDEX_DAYS = 30               # snapshot files fetched for an index with nothing
 INDEX_REFERER = NSE + "/reports-indices-historical-index-data"
 VIX_REFERER = NSE + "/reports-indices-historical-vix"
 VIX_NAME = "India VIX"
+INDEX_CHUNK_DAYS = 120        # one index/VIX history request spans this many calendar days (about 85 sessions)
+HISTORY_CAP = 100             # NSE sends at most this many rows a history request: a full chunk may be cut short
 VALUATION_INDEX = "NIFTY 50"
 PE_EXPENSIVE = 25.0           # Nifty 50 P/E at or above this is flagged expensive (eod2's rule of thumb)
 PE_CHEAP = 20.0               # at or below this, cheap
@@ -2761,7 +2763,7 @@ def history_records(doc):
 
 
 def parse_index_history(doc):
-    """historicalOR/indicesHistory or vixhistory answer (newest first) -> rows ascending. NSE sends no
+    """historicalOR/indicesHistory or vixhistory answer (either order, upper-case months) -> rows ascending. NSE sends no
     volume, P/E, P/B or yield here, so those cells stay empty."""
     rows = {}
     for r in history_records(doc):
@@ -2777,13 +2779,25 @@ def parse_index_history(doc):
     return [rows[k] for k in sorted(rows)]
 
 
-def fetch_index_history(sess, name, lo, hi):
+def fetch_index_history(sess, name, lo, hi, notes=None):
+    """Index or VIX levels for lo..hi. NSE cuts every answer at HISTORY_CAP rows, so a chunk that comes
+    back that full is split in two and asked again; a single day that still fills it is reported in
+    `notes`, never accepted silently."""
     lo_s, hi_s = lo.strftime("%d-%m-%Y"), hi.strftime("%d-%m-%Y")
     if index_slug(name) == index_slug(VIX_NAME):
         doc = nse_api(sess, "/api/historicalOR/vixhistory?from=%s&to=%s" % (lo_s, hi_s), VIX_REFERER)
     else:
         doc = nse_api(sess, "/api/historicalOR/indicesHistory?indexType=%s&from=%s&to=%s" % (
             urllib.parse.quote(str(name).upper()), lo_s, hi_s), INDEX_REFERER)
+    if len(history_records(doc)) < HISTORY_CAP:
+        return parse_index_history(doc)
+    if lo < hi:
+        mid = lo + (hi - lo) // 2
+        return merge_index(fetch_index_history(sess, name, lo, mid, notes),
+                           fetch_index_history(sess, name, mid + datetime.timedelta(days=1), hi, notes))
+    if notes is not None:
+        notes.append("%s history for %s came back with %d rows, NSE's cap; rows may be missing" % (
+            name, lo, HISTORY_CAP))
     return parse_index_history(doc)
 
 
@@ -2886,8 +2900,8 @@ def cmd_index(a):
             if dates and hi <= start + datetime.timedelta(days=7):
                 continue    # the cache already reaches back that far
             try:
-                for c0, c1 in chunk_range(start, hi):
-                    got[slug] += fetch_index_history(sess, name, c0, c1)
+                for c0, c1 in chunk_range(start, hi, INDEX_CHUNK_DAYS):
+                    got[slug] += fetch_index_history(sess, name, c0, c1, notes)
             except (SourceError, DataError) as e:
                 rc = 1
                 notes.append("%s history: %s" % (name, e))

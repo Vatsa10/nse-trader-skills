@@ -6,6 +6,7 @@ import http.cookiejar
 import io
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -1938,6 +1939,17 @@ class IndexParse(unittest.TestCase):
         self.assertEqual(data.parse_index_history({"data": []}), [])
         self.assertEqual(data.parse_index_history({}), [])
 
+    def test_history_live_shapes(self):
+        # real captures: {"data": [...]}, upper-case months; indices come newest first, the VIX oldest first
+        idx = data.parse_index_history(json.loads(fx("nse-index-history-live.json")))
+        self.assertEqual([(r["date"], r["close"]) for r in idx], [
+            ("2026-10-26", 22753.2), ("2026-10-27", 22749.75), ("2026-10-28", 22698.85), ("2026-10-29", 22936.75)])
+        self.assertEqual((idx[-1]["open"], idx[-1]["high"], idx[-1]["low"]), (22690.65, 22961.95, 22656.75))
+        vix = data.parse_index_history(json.loads(fx("nse-vix-history-live.json")))
+        self.assertEqual([(r["date"], r["close"]) for r in vix], [
+            ("2026-10-26", 17.16), ("2026-10-27", 16.4), ("2026-10-28", 16.25), ("2026-10-29", 15.12)])
+        self.assertEqual((vix[0]["open"], vix[0]["high"], vix[0]["low"]), (16.86, 18.0025, 16.86))
+
     def test_valuation_rule_of_thumb(self):
         v = data.pe_verdict
         self.assertEqual((data.PE_EXPENSIVE, data.PE_CHEAP, data.PE_MIN_ROWS), (25.0, 20.0, 250))
@@ -2074,16 +2086,17 @@ class IndexCommand(Net):
         self.assertEqual(code, 1)
         self.assertIn("not the index snapshot", out)
 
-    def test_history_backfill_in_yearly_chunks(self):
+    def test_history_backfill_in_short_chunks(self):
         f = self.archive()
         f = self.net([("historicalOR/indicesHistory", 200, fx("nse-index-history-NIFTY50.json")),
                       ("historicalOR/vixhistory", 200, fx("nse-vix-history.json"))] + f.rules)
         code, out, _ = self.run_d("index", "NIFTY 50", "--days", "2", "--years", "1", "--now", self.NOW)
         self.assertEqual(code, 0, out)
         hist = f.urls("indicesHistory")
-        self.assertEqual(len(hist), 1)
-        self.assertIn("indexType=NIFTY%2050&from=23-10-2025&to=21-10-2026", hist[0])          # up to the first cached day
-        self.assertIn("from=23-10-2025&to=21-10-2026", f.urls("vixhistory")[0])
+        self.assertEqual(len(hist), 4)                          # 364 days up to the first cached day, 120 a request
+        self.assertIn("indexType=NIFTY%2050&from=23-10-2025&to=19-02-2026", hist[0])
+        self.assertIn("&to=21-10-2026", hist[-1])
+        self.assertIn("from=23-10-2025&to=19-02-2026", f.urls("vixhistory")[0])
         rows = data.read_index(data.index_path(self.dd, "NIFTY 50"))
         self.assertEqual([r["date"] for r in rows], ["2026-10-19", "2026-10-21", "2026-10-22", "2026-10-23"])
         self.assertEqual([r["pe"] for r in rows], [None, None, 24.8, 25.0])        # history has no P/E, the archive does
@@ -2093,14 +2106,69 @@ class IndexCommand(Net):
                          [("2026-10-19", 13.1), ("2026-10-21", 13.2), ("2026-10-22", 13.4), ("2026-10-23", 12.95)])
         self.assertEqual(self.csv_text("India VIX").splitlines()[1], "2026-10-19,13.2,13.4,12.9,13.1,,,,")
 
-    def test_a_long_backfill_is_chunked_by_year(self):
+    def test_a_long_backfill_is_chunked(self):
         f = self.net([("indicesHistory", 200, b'{"data": {"indexCloseOnlineRecords": []}}'),
                       ("vixhistory", 200, b'{"data": []}'), ("ind_close_all", 404, b""),
                       ("www.nseindia.com/", 200, b"home")])
         code, out, _ = self.run_d("index", "NIFTY 50", "--years", "3", "--now", self.NOW)
         hist = f.urls("indicesHistory")
-        self.assertEqual(len(hist), 4)                                              # 3 years and a day: 4 yearly chunks
+        self.assertEqual(len(hist), 10)                                             # 1097 days in chunks of 120
         self.assertIn("&to=23-10-2026", hist[-1])
+
+    def serve_history(self, tag, cap=data.HISTORY_CAP):
+        """A fake of NSE's history endpoint: every trading day in the asked range in the real answer shape
+        (upper-case month, newest first), cut off at `cap` rows the way NSE does."""
+        live = json.loads(fx("nse-%s-history-live.json" % tag))["data"][0]
+
+        def serve(url):
+            lo, hi = [datetime.datetime.strptime(re.search(k + r"=([\d-]+)", url).group(1), "%d-%m-%Y").date()
+                      for k in ("from", "to")]
+            recs = []
+            for d in reversed(data.trading_days(lo, hi)):
+                r = dict(live)
+                r["EOD_TIMESTAMP"] = d.strftime("%d-%b-%Y").upper()
+                r["EOD_CLOSE_INDEX_VAL"] = 20000.0 + d.toordinal() - 739000
+                recs.append(r)
+            return 200, json.dumps({"data": recs[:cap]}).encode()
+        return serve
+
+    def test_a_one_year_backfill_gets_every_session(self):
+        f = self.net([("indicesHistory", None, self.serve_history("index")),
+                      ("vixhistory", None, self.serve_history("vix")),
+                      ("ind_close_all", 404, b""), ("www.nseindia.com/", 200, b"home")])
+        code, out, _ = self.run_d("index", "NIFTY 50", "--years", "1", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        want = [d.isoformat() for d in data.trading_days(datetime.date(2025, 10, 23), datetime.date(2026, 10, 23))]
+        self.assertGreater(len(want), 200)                                          # far more than one 100 row answer
+        self.assertGreaterEqual(len(f.urls("indicesHistory")), 3)
+        self.assertGreaterEqual(len(f.urls("vixhistory")), 3)
+        for name in ("NIFTY 50", "India VIX"):
+            got = [r["date"] for r in data.read_index(data.index_path(self.dd, name))]
+            self.assertEqual(got, want, name)
+
+    def test_a_full_chunk_is_split_again(self):
+        self.addCleanup(setattr, data, "INDEX_CHUNK_DAYS", data.INDEX_CHUNK_DAYS)
+        data.INDEX_CHUNK_DAYS = 400                                                 # one request would be cut at 100 rows
+        f = self.net([("indicesHistory", None, self.serve_history("index")),
+                      ("vixhistory", None, self.serve_history("vix")),
+                      ("ind_close_all", 404, b""), ("www.nseindia.com/", 200, b"home")])
+        code, out, _ = self.run_d("index", "NIFTY 50", "--years", "1", "--now", self.NOW)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("NSE's cap", out)
+        want = [d.isoformat() for d in data.trading_days(datetime.date(2025, 10, 23), datetime.date(2026, 10, 23))]
+        self.assertEqual([r["date"] for r in data.read_index(data.index_path(self.dd, "NIFTY 50"))], want)
+        self.assertGreater(len(f.urls("indicesHistory")), 3)
+
+    def test_a_day_that_still_fills_the_cap_is_reported(self):
+        full = json.loads(fx("nse-index-history-live.json"))["data"][0]
+        recs = [dict(full, EOD_TIMESTAMP="%02d-OCT-2026" % (i % 28 + 1)) for i in range(100)]
+        self.net([("indicesHistory", 200, json.dumps({"data": recs}).encode()), ("www.nseindia.com/", 200, b"home")])
+        notes = []
+        rows = data.fetch_index_history(data.Session(self.dd), "NIFTY 50", datetime.date(2026, 10, 5),
+                                        datetime.date(2026, 10, 5), notes)
+        self.assertEqual(len(rows), 28)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("NSE's cap", notes[0])
 
     def test_history_failure_is_reported_and_keeps_the_archive_rows(self):
         self.archive()
