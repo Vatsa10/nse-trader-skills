@@ -23,7 +23,10 @@ description: >-
   200-day averages, net new highs, advance-decline line, McClellan oscillator)
   that adds a one-line regime note to every scan, and a delivery spike tag
   (institutional-size trades with high delivery) from the delivery files
-  trader-data keeps. Free Yahoo data
+  trader-data keeps. Prints the day's FII/DII cash-market flows (fii dii net
+  buying and selling) and the pre-open session's advances and declines, and
+  stamps each opening-range or intraday-pattern hit with its pre-open gap,
+  when trader-data has saved them. Free Yahoo data
   (SYMBOL.NS), bar by bar, with the trader-data cache as the fallback when
   Yahoo or NSE block the download. Use when the user says "scan the market", "find
   me setups", "what is breaking out on NSE", "opening range breakouts", "scan
@@ -35,7 +38,8 @@ description: >-
   "double bottoms", "intraday double bottom", "intraday flag", "chart patterns", "pole and flag", "inverse head and
   shoulders", "stocks coiling under resistance", "market breadth", "is the
   market healthy", "McClellan", "relative strength vs Nifty", "delivery
-  spike", "high delivery volume", "institutional buying", or at the start
+  spike", "high delivery volume", "institutional buying", "fii dii", "FII
+  selling", "pre-open gap", "gap up at the open", or at the start
   of a trading day before /trader-news.
 argument-hint: "[universe | daily | orb | longterm | patterns | breadth] [--at HH:MM] [--cache] [--trend-filter] [--intraday]"
 ---
@@ -95,11 +99,36 @@ scanner asks Yahoo for `SYMBOL.NS` (with `&` sent as `%26`) and drops a
 | `trader/data/index/nifty-50.csv` | read by `longterm` as the relative-strength benchmark when it exists (written by trader-data: `date,open,high,low,close,volume,pe,pb,div_yield`); else `trader/data/daily/NIFTYBEES.adj.csv`, else `NIFTYBEES.csv`; none means `mansfield_rs` is null, with a note |
 | `trader/data/delivery/<SYMBOL>.csv` | read by `daily --cache` and `longterm` when it exists (written by trader-data): `date,volume,trades,deliv_qty,deliv_pct,qty_per_trade,series`, an empty field is missing. No file means no `delivery_spike` tag and `dq` null |
 | `trader/data/breadth.csv` | written by `breadth`: `date,pct_50,pct_200,net_new_highs,ad_line,mcclellan_osc,net_adv_ratio,fast_ema,slow_ema`. When it exists every scan prints one regime line from its newest row (and puts it in the file as `regime`) |
+| `trader/data/flows.csv` | read by `daily`, `orb` and `patterns` when it exists (written by trader-data): `date,category,buy_cr,sell_cr,net_cr`, ISO dates ascending, category `FII/FPI` or `DII`, rupee crore. Missing, corrupt or empty means no line and no `flows` key |
+| `trader/data/preopen.json` | read by `orb` and `patterns --intraday` when it exists (written by trader-data): `date`, `advances`, `declines`, `unchanged` and `stocks[]` with `symbol`, `iep`, `change_pct`. Used only when its `date` is the scan's session day |
 | `trader/data/calendar.json` | read for the trading calendar when it exists (written by trader-data): `years`, `holidays`, `special_sessions`. Missing or unreadable means the built-in 2026 table |
 | `nifty500-snapshot.csv` (+ `.json`) | bundled with this skill: the Nifty 500 list as of 2026-07-13, the last fallback |
 | `trader/watchlist.json` (patterns) | written by `patterns`: `mode: "patterns"`, per hit `pattern`, `state`, `level`, `stop`, `risk_pct`, `target`, `anchor_date`, `pivots`, `vol_x`, `vol_dry`, `first_seen`. It replaces the file the other scans wrote |
 | `trader/watchlist.json` (patterns --intraday) | written by `patterns --intraday`: `mode: "patterns-intraday"`, per hit `pattern` (`intraday_double_bottom` or `intraday_flag`), `setups`, `state`, `level`, `stop`, `risk_pct`, `target`, `at`, `anchor_time`, `pivots`. `entry.py watchlist --setup level` reads `level` unchanged |
 | `trader/longterm.json` | written by `longterm`: same shape as the watchlist, `mode: "longterm"`, per hit the 200-day average, 52-week high and low and the distance from each, and the swing fields (`swing_trend`, `swing_coc`, `swing_event`, `swing_bars_since`) |
+
+## Market context: FII / DII flows and the pre-open
+
+Two files trader-data keeps add context to the scans (the scanner works
+without them, and a missing or corrupt file is no line and never an error).
+
+- **Flows.** `daily`, `orb` and `patterns` print one header line from
+  `trader/data/flows.csv`, like `FII/FPI net -943.60 cr, DII net +1,924.41 cr
+  on 2026-10-29 (5-session FII net -2,543.60 cr, DII net +5,024.41 cr).` The
+  figures are the newest date's net rupee crore per category and the sum over
+  the last 5 dates in the file (fewer when the file has fewer; one date has no
+  running part). The same numbers go in the watchlist document as `flows`
+  (`date`, `fii_net_cr`, `dii_net_cr`, `sessions`, `fii_net_cr_5d`,
+  `dii_net_cr_5d`). Say what it is: a day's institutional cash flow, context
+  and not a signal, and the file's last date may not be today.
+- **Pre-open.** `orb` and `patterns --intraday` read
+  `trader/data/preopen.json`. When its `date` equals the session day being
+  scanned, the header prints `Pre-open 2026-10-19: 1,402 advances, 812
+  declines, 103 unchanged.`, the document gets `preopen` (`date`,
+  `advances`, `declines`, `unchanged`), and each hit whose symbol is in the
+  file gets `preopen_gap_pct` (the file's `change_pct`) and `preopen_iep` (the
+  indicative equilibrium price). A file from another day is ignored. A
+  pre-open gap is the call auction's indicative price, not a traded price.
 
 ## The universe
 

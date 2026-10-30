@@ -165,6 +165,12 @@ orb take a folder of <SYMBOL>.json v8 chart files or spark responses, or one
 file that is a spark response, a v8 chart, or a bundle {"RELIANCE": <v8 json>, ...}.
 .json.gz is fine.
 
+Market context (trader-data files; missing or corrupt = no line, no crash): daily, orb and patterns print one
+line from trader/data/flows.csv ("FII/FPI net -943.60 cr, DII net +1,924.41 cr on 2026-10-29 (5-session ...)")
+and put a `flows` object in the watchlist. orb and patterns --intraday read trader/data/preopen.json: when its
+date is the session day they print the pre-open advances and declines and add preopen_gap_pct (change_pct) and
+preopen_iep to each matching hit.
+
 A scan is a list of charts that match a rule, not a list of stocks to buy.
 Exit code 0 when the scan found something, 1 when it did not or could not run.
 """
@@ -2116,6 +2122,131 @@ def regime_note(data_dir=None):
         (", McClellan %+.1f" % mc) if mc is not None else "")
 
 
+# ---------------------------------------------------------------- flows and pre-open (trader-data files)
+
+FLOWS_WINDOW = 5   # sessions in the FII / DII running total
+FLOWS_COLUMNS = ("date", "category", "net_cr")
+FLOW_CATEGORY = {"FII/FPI": "fii", "FII": "fii", "FPI": "fii", "DII": "dii"}
+
+
+def _num(v):
+    """A number from a JSON or CSV field, else None (booleans and NaN are not numbers)."""
+    if isinstance(v, bool):
+        return None
+    try:
+        x = float(str(v).replace(",", "").strip() if isinstance(v, str) else v)
+    except (TypeError, ValueError):
+        return None
+    return x if x == x and abs(x) != float("inf") else None
+
+
+def read_flows(data_dir=None):
+    """trader/data/flows.csv (trader-data: date,category,buy_cr,sell_cr,net_cr; FII/FPI and DII, rupee crore) ->
+    {"date", "fii_net_cr", "dii_net_cr", "sessions", "fii_net_cr_5d", "dii_net_cr_5d"} for the newest date and the
+    running total over the last FLOWS_WINDOW dates in the file, or None when the file is missing, has no usable
+    row or is not the shape this tool knows. A bad row is skipped; the later row for a date and category wins."""
+    path = os.path.join(data_dir or DATA_DIR, "flows.csv")
+    got = {}
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            rd = csv.DictReader(fh)
+            if not rd.fieldnames or any(k not in [(f or "").strip() for f in rd.fieldnames] for k in FLOWS_COLUMNS):
+                return None
+            for r in rd:
+                r = {(k or "").strip(): v for k, v in r.items()}
+                cat = FLOW_CATEGORY.get(str(r.get("category") or "").strip().upper())
+                net = _num(r.get("net_cr"))
+                if net is None:
+                    buy, sell = _num(r.get("buy_cr")), _num(r.get("sell_cr"))
+                    net = buy - sell if buy is not None and sell is not None else None
+                try:
+                    d = datetime.date.fromisoformat(str(r.get("date") or "").strip())
+                except ValueError:
+                    continue
+                if cat and net is not None:
+                    got[(d, cat)] = net
+    except (OSError, ValueError, csv.Error, UnicodeDecodeError):
+        return None
+    if not got:
+        return None
+    dates = sorted({d for d, _ in got})
+    last, window = dates[-1], dates[-FLOWS_WINDOW:]
+
+    def total(cat):
+        vals = [got[(d, cat)] for d in window if (d, cat) in got]
+        return round(sum(vals), 2) if vals else None
+    out = {"date": last.isoformat(), "fii_net_cr": got.get((last, "fii")), "dii_net_cr": got.get((last, "dii")),
+           "sessions": len(window)}
+    out["fii_net_cr_5d"], out["dii_net_cr_5d"] = total("fii"), total("dii")
+    return out
+
+
+def flows_line(f):
+    """'FII/FPI net -943.60 cr, DII net +1,924.41 cr on 2026-10-29 (5-session FII net ..., DII net ...).'"""
+    def part(name, v):
+        return ["%s net %s cr" % (name, format(v, "+,.2f"))] if v is not None else []
+    head = part("FII/FPI", f["fii_net_cr"]) + part("DII", f["dii_net_cr"])
+    if not head:
+        return ""
+    line = "%s on %s" % (", ".join(head), f["date"])
+    if f["sessions"] > 1:
+        tail = part("FII", f["fii_net_cr_5d"]) + part("DII", f["dii_net_cr_5d"])
+        if tail:
+            line += " (%d-session %s)" % (f["sessions"], ", ".join(tail))
+    return line + "."
+
+
+def read_preopen(data_dir=None):
+    """trader/data/preopen.json (trader-data: the pre-open session's indicative prices) -> {"date", "advances",
+    "declines", "unchanged", "stocks": {SYMBOL: {"iep", "change_pct"}}}, or None when the file is missing, corrupt or
+    has no ISO date."""
+    try:
+        with open(os.path.join(data_dir or DATA_DIR, "preopen.json"), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        d = datetime.date.fromisoformat(str(doc.get("date")))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    stocks = {}
+    for s in (doc.get("stocks") if isinstance(doc.get("stocks"), list) else []):
+        if isinstance(s, dict) and s.get("symbol"):
+            stocks[str(s["symbol"]).strip().upper()] = {"iep": _num(s.get("iep")), "change_pct": _num(s.get("change_pct"))}
+    return {"date": d, "advances": _num(doc.get("advances")), "declines": _num(doc.get("declines")),
+            "unchanged": _num(doc.get("unchanged")), "stocks": stocks}
+
+
+def preopen_for(day, data_dir=None):
+    """The pre-open file when its date is the scan's session day, else None."""
+    po = read_preopen(data_dir)
+    return po if po and po["date"] == day else None
+
+
+def preopen_line(po):
+    parts = [("%s %s" % (indian(po[k]), word)) for k, word in (("advances", "advances"), ("declines", "declines"),
+                                                               ("unchanged", "unchanged")) if po[k] is not None]
+    return ("Pre-open %s: %s." % (po["date"].isoformat(), ", ".join(parts))) if parts else ""
+
+
+def add_preopen(hits, po):
+    """Stamp each hit whose symbol is in the pre-open file with preopen_gap_pct (the file's change_pct) and
+    preopen_iep. A hit with no match, or a missing number, gets no field."""
+    for h in hits:
+        s = po["stocks"].get(h["symbol"]) if po else None
+        if s and s["change_pct"] is not None:
+            h["preopen_gap_pct"] = s["change_pct"]
+        if s and s["iep"] is not None:
+            h["preopen_iep"] = s["iep"]
+    return hits
+
+
+def add_context(doc, data_dir):
+    """Put the FII / DII flows into a watchlist document and return the header lines to print."""
+    f = read_flows(data_dir)
+    line = flows_line(f) if f else ""
+    if line:
+        doc["flows"] = f
+    return line
+
+
 # ---------------------------------------------------------------- long-term screen
 
 LT_SCREENS = [
@@ -2348,6 +2479,7 @@ def cmd_daily(a):
     regime = regime_note(DATA_DIR)
     if regime:
         doc["regime"] = regime
+    flows_text = add_context(doc, DATA_DIR)
     if not a.no_write:
         write_json(a.out, doc)
     if a.json:
@@ -2360,6 +2492,8 @@ def cmd_daily(a):
          "yahoo+cache": "Yahoo spark + trader-data cache"}[source]))
     if regime:
         print(regime)
+    if flows_text:
+        print(flows_text)
     note_out(a, cnote)
     print("Fetched %s of %s charts%s. %s passed the liquidity filter (₹%s+ and %s+ shares)%s; "
           "%s scanned." % (indian(counts["fetched"]), indian(len(symbols)),
@@ -2516,6 +2650,12 @@ def cmd_orb(a):
     regime = regime_note(a.data_dir or DATA_DIR)
     if regime:
         doc["regime"] = regime
+    flows_text = add_context(doc, a.data_dir or DATA_DIR)
+    po = preopen_for(day, a.data_dir or DATA_DIR)
+    if po:
+        add_preopen(hits, po)
+        doc["preopen"] = {"date": po["date"].isoformat(), "advances": po["advances"],
+                          "declines": po["declines"], "unchanged": po["unchanged"]}
     if not a.no_write:
         write_json(a.out, doc)
     if a.json:
@@ -2527,6 +2667,10 @@ def cmd_orb(a):
              {"cache": "trader-data cache", "yahoo+cache": "Yahoo + trader-data cache"}.get(source, "Yahoo")))
     if regime:
         print(regime)
+    if flows_text:
+        print(flows_text)
+    if po and preopen_line(po):
+        print(preopen_line(po))
     print("Fetched %s of %s charts%s; %s usable%s; %s candidates, %s confirmed with real highs and lows."
           % (indian(counts["fetched"]), indian(len(symbols)),
              (" (%s failed or had no data)" % indian(nfailed)) if nfailed else "",
@@ -2710,6 +2854,12 @@ def cmd_patterns_intraday(a):
     regime = regime_note(a.data_dir or DATA_DIR)
     if regime:
         doc["regime"] = regime
+    flows_text = add_context(doc, a.data_dir or DATA_DIR)
+    po = preopen_for(day, a.data_dir or DATA_DIR)
+    if po:
+        add_preopen(hits, po)
+        doc["preopen"] = {"date": po["date"].isoformat(), "advances": po["advances"],
+                          "declines": po["declines"], "unchanged": po["unchanged"]}
     if not a.no_write:
         write_json(a.out, doc)
     if a.json:
@@ -2721,6 +2871,10 @@ def cmd_patterns_intraday(a):
              {"cache": "trader-data cache", "yahoo+cache": "Yahoo + trader-data cache"}.get(source, "Yahoo")))
     if regime:
         print(regime)
+    if flows_text:
+        print(flows_text)
+    if po and preopen_line(po):
+        print(preopen_line(po))
     print("Fetched %s of %s charts%s; %s usable%s; %s read with real highs and lows."
           % (indian(counts["fetched"]), indian(len(symbols)),
              (" (%s failed or had no data)" % indian(nfailed)) if nfailed else "",
@@ -2791,6 +2945,7 @@ def cmd_patterns(a):
     regime = regime_note(data_dir)
     if regime:
         doc["regime"] = regime
+    flows_text = add_context(doc, data_dir)
     if not a.no_write:
         write_json(a.out, doc)
     if a.json:
@@ -2800,6 +2955,8 @@ def cmd_patterns(a):
         last_date.isoformat() if last_date else "nothing"))
     if regime:
         print(regime)
+    if flows_text:
+        print(flows_text)
     note_out(a, cnote)
     if stale:
         print("Note: the newest close is %s, more than 5 days old: refresh with `python3 trader-data/data.py "

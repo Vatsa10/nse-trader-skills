@@ -1529,6 +1529,14 @@ class PatternsCli(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("trader-data/data.py daily", err)
 
+    def test_the_flows_line_and_object(self):
+        put_flows(FLOWS_OK)
+        code, text, _ = run(["patterns", "--now", "2026-12-01 08:30", "--json", "--no-write"])
+        doc = json.loads(text)
+        self.assertEqual(doc["flows"]["date"], "2026-10-29")
+        code, text, _ = run(["patterns", "--now", "2026-12-01 08:30", "--no-write"])
+        self.assertIn(FLOWS_LINE, text)
+
 
 def flat_rows(closes, start=D(2026, 1, 5)):
     """High = low = close, one calendar day apart: hand-countable breadth."""
@@ -2140,6 +2148,149 @@ class IntradayPatternsCli(unittest.TestCase):
     def test_daily_patterns_keep_their_defaults(self):
         code, _, err = run(["patterns", "--symbols", "NOPE", "--no-write"])
         self.assertIn("no daily cache", err)
+
+
+class MarketContext(unittest.TestCase):
+    """trader/data/flows.csv and trader/data/preopen.json (written by trader-data): a header line and fields;
+    a missing or corrupt file is no line and no crash."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        os.chdir(self.d)
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def test_flows_parse(self):
+        put_flows(FLOWS_OK)
+        f = scan.read_flows()
+        self.assertEqual(f, {"date": "2026-10-29", "fii_net_cr": -943.6, "dii_net_cr": 1924.41, "sessions": 5,
+                             "fii_net_cr_5d": -2543.6, "dii_net_cr_5d": 5024.41})
+        self.assertEqual(scan.flows_line(f), FLOWS_LINE)
+
+    def test_flows_one_date_and_one_category(self):
+        put_flows("date,category,buy_cr,sell_cr,net_cr\n2026-10-29,DII,100.00,50.50,49.50\n")
+        f = scan.read_flows()
+        self.assertEqual(scan.flows_line(f), "DII net +49.50 cr on 2026-10-29.")
+        self.assertIsNone(f["fii_net_cr"])
+
+    def test_flows_missing_or_corrupt_is_nothing(self):
+        self.assertIsNone(scan.read_flows())                                  # no file
+        for text in ("", "date,category\n2026-10-29,DII\n", "not,a,flows,file\nx,y,z,w\n", "\x00\x01\x02",
+                     "date,category,buy_cr,sell_cr,net_cr\nsoon,DII,1,2,3\n2026-10-29,GOV,1,2,3\n"
+                     "2026-10-29,DII,a,b,c\n"):
+            put_flows(text)
+            self.assertIsNone(scan.read_flows(), repr(text))
+
+    def test_flows_bad_rows_are_skipped(self):
+        put_flows("date,category,buy_cr,sell_cr,net_cr\njunk,DII,1,2,3\n2026-10-28,FII/FPI,10,20,-10\n"
+                  "2026-10-29,DII,,,\n2026-10-29,FII/FPI,1,2,-1.5\n")
+        f = scan.read_flows()
+        self.assertEqual((f["date"], f["fii_net_cr"], f["dii_net_cr"], f["fii_net_cr_5d"]), ("2026-10-29", -1.5, None, -11.5))
+
+    def test_daily_orb_and_the_json_carry_flows(self):
+        put_flows(FLOWS_OK)
+        code, text, _ = run(["daily", "--offline", DAILY, "--now", "2026-10-19 08:45", "--min-price", "0",
+                             "--min-volume", "0", "--no-write"])
+        self.assertIn(FLOWS_LINE, text)
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--no-write"])
+        self.assertIn(FLOWS_LINE, text)
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--json",
+                             "--no-write"])
+        self.assertEqual(json.loads(text)["flows"]["dii_net_cr"], 1924.41)
+        run(["daily", "--offline", DAILY, "--now", "2026-10-19 08:45", "--min-price", "0", "--min-volume", "0"])
+        with open(os.path.join("trader", "watchlist.json"), encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["flows"]["fii_net_cr"], -943.6)
+
+    def test_no_flows_file_no_line_no_key(self):
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--json",
+                             "--no-write"])
+        self.assertNotIn("flows", json.loads(text))
+        put_flows("garbage")
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--no-write"])
+        self.assertNotIn("FII/FPI", text)
+
+    def test_preopen_read(self):
+        put_preopen(preopen_doc("2026-10-19"))
+        po = scan.read_preopen()
+        self.assertEqual(po["date"], D(2026, 10, 19))
+        self.assertEqual(po["stocks"]["RELIANCE"], {"iep": 361.5, "change_pct": 1.25})
+        self.assertEqual(scan.preopen_line(po), "Pre-open 2026-10-19: 1,402 advances, 812 declines, 103 unchanged.")
+        for text in ("", "{not json", "[1]", '{"date": "soon"}', '{"stocks": []}'):
+            put_preopen(text)
+            self.assertIsNone(scan.read_preopen(), repr(text))
+        os.remove(os.path.join("trader", "data", "preopen.json"))
+        self.assertIsNone(scan.read_preopen())
+
+    def test_orb_hits_get_the_gap_when_the_dates_match(self):
+        put_preopen(preopen_doc("2026-10-19"))
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--json",
+                             "--no-write"])
+        doc = json.loads(text)
+        rel = [h for h in doc["hits"] if h["symbol"] == "RELIANCE"][0]
+        self.assertEqual((rel["preopen_gap_pct"], rel["preopen_iep"]), (1.25, 361.5))
+        self.assertTrue(all("preopen_gap_pct" not in h for h in doc["hits"] if h["symbol"] != "RELIANCE"))
+        self.assertEqual(doc["preopen"]["advances"], 1402)
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--no-write"])
+        self.assertIn("Pre-open 2026-10-19: 1,402 advances, 812 declines, 103 unchanged.", text)
+
+    def test_a_pre_open_from_another_day_is_ignored(self):
+        put_preopen(preopen_doc("2026-10-16"))
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--json",
+                             "--no-write"])
+        doc = json.loads(text)
+        self.assertNotIn("preopen", doc)
+        self.assertTrue(all("preopen_gap_pct" not in h and "preopen_iep" not in h for h in doc["hits"]))
+        code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-10-19 10:00", "--min-price", "0", "--no-write"])
+        self.assertNotIn("Pre-open", text)
+
+    def test_intraday_pattern_hits_get_the_gap(self):
+        put_preopen(preopen_doc("2026-10-19", {"symbol": "DBPOS", "iep": 104.0, "change_pct": -0.4}))
+        code, text, _ = run(["patterns", "--intraday", "--offline", IPAT, "--at", "10:45", "--json", "--no-write"])
+        by = {h["symbol"]: h for h in json.loads(text)["hits"]}
+        self.assertEqual((by["DBPOS"]["preopen_gap_pct"], by["DBPOS"]["preopen_iep"]), (-0.4, 104.0))
+        self.assertNotIn("preopen_gap_pct", by["FLPOS"])
+        code, text, _ = run(["patterns", "--intraday", "--offline", IPAT, "--at", "10:45", "--no-write"])
+        self.assertIn("Pre-open 2026-10-19", text)
+
+    def test_a_string_gap_or_a_missing_number_does_not_crash(self):
+        put_preopen(preopen_doc("2026-10-19", {"symbol": "RELIANCE", "iep": "361.5", "change_pct": None}))
+        po = scan.read_preopen()
+        hits = scan.add_preopen([{"symbol": "RELIANCE"}], po)
+        self.assertEqual(hits, [{"symbol": "RELIANCE", "preopen_iep": 361.5}])
+
+
+FLOWS_OK = ("date,category,buy_cr,sell_cr,net_cr\n"
+            "2026-10-23,FII/FPI,9000.00,10000.00,-1000.00\n2026-10-23,DII,8000.00,7000.00,1000.00\n"
+            "2026-10-26,FII/FPI,9000.00,9500.00,-500.00\n2026-10-26,DII,8000.00,7500.00,500.00\n"
+            "2026-10-27,FII/FPI,9000.00,9100.00,-100.00\n2026-10-27,DII,8000.00,7400.00,600.00\n"
+            "2026-10-28,FII/FPI,9000.00,9000.00,0.00\n2026-10-28,DII,8000.00,7000.00,1000.00\n"
+            "2026-10-29,FII/FPI,9000.00,9943.60,-943.60\n2026-10-29,DII,9000.00,7075.59,1924.41\n")
+FLOWS_LINE = ("FII/FPI net -943.60 cr, DII net +1,924.41 cr on 2026-10-29 "
+              "(5-session FII net -2,543.60 cr, DII net +5,024.41 cr).")
+
+
+def put_flows(text):
+    os.makedirs(os.path.join("trader", "data"), exist_ok=True)
+    with open(os.path.join("trader", "data", "flows.csv"), "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def preopen_doc(date, *extra):
+    stocks = [{"symbol": "RELIANCE", "series": "EQ", "iep": 361.5, "prev_close": 357.04, "change_pct": 1.25,
+               "final_qty": 1000, "total_buy_qty": 5000, "total_sell_qty": 4000, "turnover": 361500.0}]
+    stocks.extend(extra)
+    return json.dumps({"key": "NIFTY 50", "timestamp": date + " 09:08:00", "date": date,
+                       "fetched_at": date + "T03:40:00Z", "advances": 1402, "declines": 812, "unchanged": 103,
+                       "stocks": stocks})
+
+
+def put_preopen(text):
+    os.makedirs(os.path.join("trader", "data"), exist_ok=True)
+    with open(os.path.join("trader", "data", "preopen.json"), "w", encoding="utf-8") as fh:
+        fh.write(text)
 
 
 CAL = os.path.join(SDIR, "calendar-2027.json")
