@@ -133,12 +133,13 @@ class Time(unittest.TestCase):
 
     def test_nse_calendar(self):
         self.assertEqual(scan.trading_day(D(2026, 10, 20)), (False, "NSE holiday: Dussehra"))
-        self.assertEqual(scan.trading_day(D(2026, 11, 10)), (False, "NSE holiday: Diwali Balipratipada"))
+        self.assertEqual(scan.trading_day(D(2026, 11, 10)), (False, "NSE holiday: Diwali-Balipratipada"))
         self.assertEqual(scan.trading_day(D(2026, 10, 19)), (True, ""))
         self.assertEqual(scan.session(D(2026, 12, 24)), (datetime.time(9, 15), datetime.time(15, 30)))
         self.assertIsNone(scan.session(D(2026, 11, 8)))            # Muhurat Sunday: treated as closed
         self.assertIn("nseindia.com", scan.calendar_note(D(2027, 1, 4)))
         self.assertEqual(scan.calendar_note(D(2026, 1, 5)), "")
+        self.assertEqual(scan.calendar_note(D(2024, 6, 3)), "")                  # 2024 and 2025 are built in now
 
 
 class Spark(unittest.TestCase):
@@ -2307,11 +2308,13 @@ class Calendar(unittest.TestCase):
     def tearDown(self):
         os.chdir(self.cwd)
         shutil.rmtree(self.d)
+        scan.apply_calendar()      # back to the built-in tables (the file is read at import and on apply_calendar)
 
     def put(self, text):
         os.makedirs(os.path.join("trader", "data"), exist_ok=True)
         with open(os.path.join("trader", "data", "calendar.json"), "w", encoding="utf-8") as fh:
             fh.write(text)
+        scan.apply_calendar()
 
     def put_fixture(self):
         with open(CAL, encoding="utf-8") as fh:
@@ -2320,7 +2323,9 @@ class Calendar(unittest.TestCase):
     def test_without_the_file_the_built_in_table_answers(self):
         self.assertEqual(scan.trading_day(D(2026, 10, 20)), (False, "NSE holiday: Dussehra"))
         self.assertEqual(scan.trading_day(D(2027, 1, 26)), (True, ""))          # not in the 2026 table
-        self.assertIn("holiday list covers 2026 only", scan.calendar_note(D(2027, 1, 4)))
+        self.assertIn("holiday list covers 2024, 2025, 2026 only", scan.calendar_note(D(2027, 1, 4)))
+        self.assertEqual(scan.trading_day(D(2025, 10, 22)), (False, "NSE holiday: Diwali-Balipratipada"))   # 2025 too
+        self.assertEqual(scan.trading_day(D(2026, 2, 1)), (True, ""))            # the Budget Sunday special session
 
     def test_the_file_covers_2027(self):
         self.put_fixture()
@@ -2333,10 +2338,18 @@ class Calendar(unittest.TestCase):
         self.assertIsNone(scan.session(D(2027, 1, 26)))
 
     def test_a_special_session_is_open_even_on_a_sunday(self):
-        self.put_fixture()
-        self.assertEqual(scan.trading_day(D(2027, 10, 31)), (True, ""))         # Diwali Laxmi Pujan, a Sunday
+        self.put(json.dumps({"years": [2027], "special_sessions": {"2027-10-31": "Union Budget (Sunday)"}}))
+        self.assertEqual(scan.trading_day(D(2027, 10, 31)), (True, ""))
         self.assertIsNotNone(scan.session(D(2027, 10, 31)))
         self.assertEqual(scan.trading_day(D(2027, 10, 30)), (False, "weekend"))
+
+    def test_a_muhurat_session_is_closed_for_the_regular_market(self):
+        self.put_fixture()                                                      # lists Diwali Laxmi Pujan, a Sunday
+        ok, why = scan.trading_day(D(2027, 10, 31))
+        self.assertFalse(ok)
+        self.assertIn("no normal 09:15-15:30 market", why)
+        self.assertIsNone(scan.session(D(2027, 10, 31)))
+        self.assertIsNone(scan.session(D(2026, 11, 8)))                         # the built-in Muhurat Sunday
 
     def test_a_covered_year_beats_the_built_in_table(self):
         # years lists 2026 and no holidays: the built-in Dussehra holiday is not in the file, so the day is open
@@ -2358,6 +2371,7 @@ class Calendar(unittest.TestCase):
             self.put(text)
             self.assertEqual(scan.trading_day(D(2026, 10, 20)), (False, "NSE holiday: Dussehra"), text)
             self.assertIn("2026 only", scan.calendar_note(D(2027, 1, 4)))
+            self.assertEqual(scan.trading_day(D(2027, 1, 26)), (True, ""))
 
     def test_the_orb_window_follows_the_calendar(self):
         self.put(json.dumps({"years": [2026], "holidays": {"2026-10-19": "Test closure"}}))

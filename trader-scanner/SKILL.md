@@ -101,7 +101,7 @@ scanner asks Yahoo for `SYMBOL.NS` (with `&` sent as `%26`) and drops a
 | `trader/data/breadth.csv` | written by `breadth`: `date,pct_50,pct_200,net_new_highs,ad_line,mcclellan_osc,net_adv_ratio,fast_ema,slow_ema`. When it exists every scan prints one regime line from its newest row (and puts it in the file as `regime`) |
 | `trader/data/flows.csv` | read by `daily`, `orb` and `patterns` when it exists (written by trader-data): `date,category,buy_cr,sell_cr,net_cr`, ISO dates ascending, category `FII/FPI` or `DII`, rupee crore. Missing, corrupt or empty means no line and no `flows` key |
 | `trader/data/preopen.json` | read by `orb` and `patterns --intraday` when it exists (written by trader-data): `date`, `advances`, `declines`, `unchanged` and `stocks[]` with `symbol`, `iep`, `change_pct`. Used only when its `date` is the scan's session day |
-| `trader/data/calendar.json` | read for the trading calendar when it exists (written by trader-data): `years`, `holidays`, `special_sessions`. Missing or unreadable means the built-in 2026 table |
+| `trader/data/calendar.json` | read for the trading calendar when it exists (written by trader-data): `years`, `holidays`, `special_sessions`. Missing or unreadable means the built-in 2024 to 2026 tables |
 | `nifty500-snapshot.csv` (+ `.json`) | bundled with this skill: the Nifty 500 list as of 2026-07-13, the last fallback |
 | `trader/watchlist.json` (patterns) | written by `patterns`: `mode: "patterns"`, per hit `pattern`, `state`, `level`, `stop`, `risk_pct`, `target`, `anchor_date`, `pivots`, `vol_x`, `vol_dry`, `first_seen`. It replaces the file the other scans wrote |
 | `trader/watchlist.json` (patterns --intraday) | written by `patterns --intraday`: `mode: "patterns-intraday"`, per hit `pattern` (`intraday_double_bottom` or `intraday_flag`), `setups`, `state`, `level`, `stop`, `risk_pct`, `target`, `at`, `anchor_time`, `pivots`. `entry.py watchlist --setup level` reads `level` unchanged |
@@ -414,15 +414,17 @@ cache, under 41 daily bars, or no trend yet stays in the list, marked
   Say which data the scan used: Yahoo, the cache, or both.
 - Partial results are said as partial: "Fetched 480 of 500 charts (20 failed
   or had no data)". Never round a partial scan up to "the whole market".
-- Times are IST (UTC+05:30, no daylight saving). The trading calendar is
-  `trader/data/calendar.json` when it exists and parses (trader-data writes
-  it): a date in `special_sessions` is open, a weekend is closed, a date in
-  `holidays` is closed, a year listed in `years` is otherwise open. NSE
-  equity holidays are also built in for 2026 only; with no calendar file, or
-  for a year neither has, the scanner warns "holiday list covers 2026 only:
-  check nseindia.com". NSE has no early closes. The Diwali Muhurat session
-  (a Sunday, timings by circular) is treated as closed unless the calendar
-  lists it as a special session.
+- Times are IST (UTC+05:30, no daylight saving). The trading calendar is the
+  "nse calendar" block that every script in this pack carries byte for byte:
+  NSE equity holidays and special sessions built in for 2024 to 2026, with
+  `trader/data/calendar.json` (trader-data writes it) laid on top when it
+  exists and parses, read once at start: for a year the file lists in `years`,
+  its `holidays` replace the built-in ones; a date in `special_sessions` is
+  open (a Muhurat or Laxmi Pujan one is closed for the regular market), a
+  weekend is closed. For a year neither covers, the scanner warns "holiday list
+  covers 2024, 2025, 2026 only: check nseindia.com". NSE has no early
+  closes. The Diwali Muhurat session (an hour in the evening, timings by
+  circular) is treated as closed for the 09:15 to 15:30 scans.
 - Circuit limits: NSE stocks have daily price bands (2, 5, 10 or 20 %). A
   breakout into the upper circuit may not be fillable; say so.
 
