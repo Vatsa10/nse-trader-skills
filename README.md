@@ -80,14 +80,40 @@ Or just ask Claude: "should I buy IOC for the long term?" and it runs these.
 ## Intraday and swing workflow
 
 ```
+python3 trader-data/data.py preopen                     # 09:08 onwards: gaps and the order imbalance
+python3 trader-data/data.py flows                       # yesterday's FII/DII net (builds history daily)
 python3 trader-data/data.py chain NIFTY                 # sentiment context: PCR, OI walls, VIX
 python3 trader-scanner/scan.py daily --cache            # pre-market setups, with level and swing stop
 python3 trader-scanner/scan.py patterns                 # chart patterns from the daily cache
 python3 trader-news/news.py                             # deals and "results soon" first
 python3 trader-scanner/scan.py orb --trend-filter       # after 09:35, only stocks in a daily uptrend
+python3 trader-scanner/scan.py patterns --intraday      # after 10:15: double bottom and flag on 5-minute bars
 python3 trader-entry/entry.py watchlist --setup level   # the moment a level breaks
 python3 trader-exit/exit.py plan                        # then timemachine, budget, risk, broker
 ```
+
+## Using it in Claude
+
+Ask in plain words and Claude picks the skills: "should I buy RELIANCE for
+the long term?", "scan for setups and build my watchlist", "any results
+this week on my holdings?".
+
+- **Decisions:** `/trader-thesis RELIANCE` gathers everything the other
+  skills recorded into one brief, has five isolated agents argue it (bear
+  analyst, risk manager, FII/DII flows, value-trap hunter, 3am stop-out...),
+  and ends with a verdict and the one fact that would change it.
+- **Interactive reports:** `/trader-report` builds `trader/report.html`, one
+  self-contained page with charts and sortable, filterable tables. Where
+  Claude has the Artifact tool (Claude Code, claude.ai) ask it to publish
+  the report: you get a private claude.ai page you can open on any device
+  and share from its Share menu, and rebuilding updates the same page.
+  `--public` leaves out holdings, plans and orders for a page you hand around.
+- **Other skills:** Claude Code loads every installed skill side by side.
+  The general [adhd](https://github.com/UditAkhourii/adhd) brainstorming
+  skill (MIT, whose method trader-thesis adapts) suits open strategy
+  questions; trader-thesis is the concrete "this stock, this trade" version.
+- **Windows:** the tools print the rupee sign and work on a plain Windows
+  console or pipe, and try IPv4 first on networks that drop IPv6.
 
 ## How the old limitations are handled
 
