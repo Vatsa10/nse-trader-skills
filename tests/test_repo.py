@@ -22,6 +22,9 @@ SWING_COPIES = [("trader-scanner", "scan.py"), ("trader-backtest", "backtest.py"
 CALENDAR_COPIES = [("trader-alerts", "alerts.py"), ("trader-data", "data.py"), ("trader-scanner", "scan.py"),
                    ("trader-entry", "entry.py"), ("trader-exit", "exit.py"), ("trader-risk", "check.py"),
                    ("trader-timemachine", "timemachine.py"), ("trader-news", "news.py")]
+ONLINE_COPIES = [("trader-alerts", "alerts.py"), ("trader-data", "data.py"), ("trader-entry", "entry.py"),
+                 ("trader-exit", "exit.py"), ("trader-invest", "invest.py"), ("trader-news", "news.py"),
+                 ("trader-scanner", "scan.py"), ("trader-timemachine", "timemachine.py")]
 V1_ONLY = ["trader-copycat", "trader-screener", "trader-tax", "trader-rebalance"]
 
 
@@ -177,6 +180,40 @@ class Repo(unittest.TestCase):
         with open(os.path.join(ROOT, "reference", "specs", "nse_calendar.py"), encoding="utf-8") as fh:
             spec = fh.read()
         self.assertEqual(spec[spec.find(marks[0]):spec.find(marks[1])], next(iter(blocks.values())))
+
+    def test_every_online_script_tries_ipv4_first(self):
+        # networks that hand out IPv6 for NSE and Yahoo but drop it made each request wait out its timeout
+        marks = ("# --- ipv4 first:", "# --- end ipv4 first ---")
+        with open(os.path.join(ROOT, "reference", "specs", "ipv4_first.py"), encoding="utf-8") as fh:
+            spec = fh.read()
+        want = spec[spec.find(marks[0]):spec.find(marks[1])]
+        for s, f in ONLINE_COPIES:
+            with open(os.path.join(ROOT, s, f), encoding="utf-8") as fh:
+                text = fh.read()
+            self.assertEqual(text[text.find(marks[0]):text.find(marks[1])], want, "%s/%s" % (s, f))
+        for s in SKILLS:   # and no other script goes online without it
+            for f in os.listdir(os.path.join(ROOT, s)):
+                if f.endswith(".py") and (s, f) not in ONLINE_COPIES:
+                    with open(os.path.join(ROOT, s, f), encoding="utf-8") as fh:
+                        self.assertNotIn("urllib.request", fh.read(), "%s/%s goes online: add the ipv4 block" % (s, f))
+
+    def test_the_ipv4_block_orders_addresses(self):
+        import socket
+        v6 = (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2600::1", 443, 0, 0))
+        v4 = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.2.3.4", 443))
+        ns = {}
+        saved = socket.getaddrinfo
+        try:
+            socket.getaddrinfo = lambda *a, **k: [v6, v4]
+            with open(os.path.join(ROOT, "reference", "specs", "ipv4_first.py"), encoding="utf-8") as fh:
+                exec(fh.read(), ns)
+            self.assertEqual(socket.getaddrinfo("x", 443), [v4, v6])     # IPv4 first, IPv6 kept as a fallback
+            patched = socket.getaddrinfo
+            with open(os.path.join(ROOT, "reference", "specs", "ipv4_first.py"), encoding="utf-8") as fh:
+                exec(fh.read(), {})
+            self.assertIs(socket.getaddrinfo, patched)                   # loading twice does not wrap twice
+        finally:
+            socket.getaddrinfo = saved
 
 
 if __name__ == "__main__":
