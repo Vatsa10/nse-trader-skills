@@ -1,0 +1,24 @@
+{
+  "symbol": "IOC",
+  "mode": "longterm",
+  "date": "2026-10-30",
+  "brief": "Should I buy IOC for the long term? Brief trader/thesis/IOC-brief.json, daily bars to 2026-10-29, no FII/DII flows file.",
+  "bull_case": [
+    {"point": "Cheap on every valuation measure, even on mid-cycle earnings", "evidence": "fundamentals.pe 5.44 (2026-10-29)", "rupee_impact": "yield 6.36% is about 318 rupees a year on 5,000"}
+  ],
+  "bear_case": [
+    {"point": "Profit swings with crude and fuel pricing", "evidence": "latest_quarter Q1FY27 net profit -2661 cr", "rupee_impact": "a 20% fall costs 1,000 rupees on 5,000"}
+  ],
+  "traps": [
+    {"idea": "A 5x PE means cheap", "reason": "it sits on peak FY26 profit of a cyclical PSU"}
+  ],
+  "verdict": {"call": "wait", "conviction": "medium", "changes_if": "Q2FY27 results show a return to profit", "rationale": "The numbers are cheap but the earnings base is unstable."},
+  "watch": [
+    {"what": "Q2FY27 results", "when": "by 2026-11-14"},
+    {"what": "200-DMA", "when": "pct_vs_200dma from the brief"}
+  ],
+  "handoff": {"skill": "trader-invest", "command": "invest.py plan IOC --amount 5000", "note": "Only if you decide to buy, then trader-risk."},
+  "deepened": [
+    {"idea": "Wait for results", "must_be_true": "Q2 profit is positive", "load_bearing_risk": "crude spike", "trigger": "results date", "first_step": "set an alert for 2026-11-14"}
+  ]
+}
